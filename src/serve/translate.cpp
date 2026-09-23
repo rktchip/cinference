@@ -1,8 +1,10 @@
 #include "serve/translate.h"
+#include "serve/generation_service.h"
 #include "serve/request_json.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -340,6 +342,158 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
         }
     }
     return options;
+}
+
+// Response formatting: route model thinking spans out of content. See
+// translate.h for the contract. The serve pump decodes raw tokens, so Qwen
+// thinking markers can reach the formatters inside the content text; the
+// helpers below split them back into the reasoning channel. They mirror the
+// engine output decoder (single reasoning-to-content transition, no
+// re-entry): only a reasoning-first stream splits.
+
+namespace {
+
+constexpr std::string_view kThinkOpen  = "<think>";
+constexpr std::string_view kThinkClose = "</think>";
+
+// Longest suffix of text that is a proper prefix of marker (0 when none).
+// Partial close bytes stay buffered so a split tag never leaks into content.
+std::size_t think_marker_hold(std::string_view text, std::string_view marker) {
+    const std::size_t max_hold = std::min(text.size(), marker.size() - 1);
+    for (std::size_t hold = max_hold; hold != 0; --hold) {
+        if (text.substr(text.size() - hold) == marker.substr(0, hold)) { return hold; }
+    }
+    return 0;
+}
+
+bool think_ascii_space(char byte) {
+    switch (byte) {
+    case ' ':
+    case '\t':
+    case '\n':
+    case '\r':
+    case '\v':
+    case '\f':
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+SplitThinkingResult split_thinking_spans(std::string_view text, bool starts_in_reasoning) {
+    SplitThinkingResult result;
+    if (!starts_in_reasoning) {
+        result.content = std::string(text);
+        return result;
+    }
+    const std::string raw(text);
+    const std::size_t close = raw.find(kThinkClose);
+    if (close == std::string::npos) {
+        result.reasoning = raw;
+        if (result.reasoning.starts_with(kThinkOpen)) {
+            result.reasoning.erase(0, kThinkOpen.size());
+        }
+        return result;
+    }
+    result.reasoning = raw.substr(0, close);
+    if (result.reasoning.starts_with(kThinkOpen)) {
+        result.reasoning.erase(0, kThinkOpen.size());
+    }
+    // Mirror the engine decoder: whitespace right after the close marker
+    // is template padding, not model content.
+    std::size_t lead = close + kThinkClose.size();
+    while (lead < raw.size() && think_ascii_space(raw[lead])) { ++lead; }
+    result.content = raw.substr(lead);
+    return result;
+}
+
+void apply_thinking_split(GenerationOutcome& outcome, bool starts_in_reasoning) {
+    SplitThinkingResult split = split_thinking_spans(outcome.text, starts_in_reasoning);
+    if (split.reasoning.empty() && split.content == outcome.text) { return; }
+    outcome.reasoning += split.reasoning;
+    outcome.text = std::move(split.content);
+}
+
+ThinkingSpanSplitter::ThinkingSpanSplitter(bool starts_in_reasoning)
+    : in_reasoning_(starts_in_reasoning), seeded_reasoning_first_(starts_in_reasoning) {}
+
+void ThinkingSpanSplitter::emit_reasoning(std::vector<Segment>& out, std::string_view bytes) {
+    if (bytes.empty()) { return; }
+    if (!out.empty() && out.back().channel == ninfer::OutputChannel::Reasoning) {
+        out.back().text.append(bytes);
+    } else {
+        out.push_back(Segment{ninfer::OutputChannel::Reasoning, std::string(bytes)});
+    }
+}
+
+void ThinkingSpanSplitter::emit_content(std::vector<Segment>& out, std::string_view bytes) {
+    std::string text(bytes);
+    if (strip_ws_) {
+        std::size_t lead = 0;
+        while (lead < text.size() && think_ascii_space(text[lead])) { ++lead; }
+        text.erase(0, lead);
+        if (text.empty()) { return; }
+        strip_ws_ = false;
+    }
+    if (text.empty()) { return; }
+    if (!out.empty() && out.back().channel == ninfer::OutputChannel::Content) {
+        out.back().text += text;
+    } else {
+        out.push_back(Segment{ninfer::OutputChannel::Content, std::move(text)});
+    }
+}
+
+std::vector<ThinkingSpanSplitter::Segment> ThinkingSpanSplitter::feed(std::string_view chunk) {
+    std::vector<Segment> out;
+    pending_.append(chunk);
+    for (;;) {
+        if (in_reasoning_) {
+            if (first_) {
+                if (pending_.size() < kThinkOpen.size() &&
+                    kThinkOpen.starts_with(pending_)) {
+                    return out;
+                }
+                if (pending_.starts_with(kThinkOpen)) { pending_.erase(0, kThinkOpen.size()); }
+                first_ = false;
+            }
+            const std::size_t found = pending_.find(kThinkClose);
+            if (found == std::string::npos) {
+                const std::size_t hold = think_marker_hold(pending_, kThinkClose);
+                emit_reasoning(out, std::string_view(pending_).substr(0, pending_.size() - hold));
+                pending_.erase(0, pending_.size() - hold);
+                return out;
+            }
+            emit_reasoning(out, std::string_view(pending_).substr(0, found));
+            pending_.erase(0, found + kThinkClose.size());
+            in_reasoning_ = false;
+            if (seeded_reasoning_first_ && !closed_once_) {
+                closed_once_ = true;
+                strip_ws_    = true;
+            }
+            continue;
+        }
+        // Content never re-enters reasoning: after the first close (or from
+        // the start in content-first mode) everything is literal content.
+        emit_content(out, pending_);
+        pending_.clear();
+        return out;
+    }
+}
+
+std::vector<ThinkingSpanSplitter::Segment> ThinkingSpanSplitter::finish() {
+    std::vector<Segment> out;
+    if (in_reasoning_) {
+        if (first_ && pending_.starts_with(kThinkOpen)) { pending_.erase(0, kThinkOpen.size()); }
+        first_ = false;
+        emit_reasoning(out, pending_);
+    } else {
+        first_ = false;
+        emit_content(out, pending_);
+    }
+    pending_.clear();
+    return out;
 }
 
 } // namespace ninfer::serve

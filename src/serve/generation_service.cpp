@@ -507,6 +507,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     const std::shared_ptr<ServeRequestState> state = prepared.stream_state;
     if (state == nullptr) { throw std::logic_error("PreparedRequest has no stream state"); }
     const std::uint64_t own_req = prepared.req_id;
+    // TTFT clock: first published content token for the owning request.
+    // Stamped at the first non-empty content publish (or first decoded
+    // content piece when no streaming sink is attached), so
+    // outcome.metrics.ttft_seconds and the req-done log line are real.
+    Clock::time_point first_token_at{};
+    bool have_first_token = false;
     // Register the live sink BEFORE draining the inbox (the drain below may
     // admit this request). Decoded text produced before registration is
     // buffered in the state and flushed here in order, so no token misses
@@ -524,6 +530,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                 delta.channel = ninfer::OutputChannel::Content;
                 delta.text    = piece;
                 public_sink->publish(std::move(delta));
+                if (!have_first_token) {
+                    first_token_at = Clock::now();
+                    have_first_token = true;
+                }
             }
         }
     }
@@ -603,6 +613,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                 delta.text    = std::move(deposit);
                 live->publish(std::move(delta));
             }
+            if (!have_first_token && target->req_id == own_req && !piece.empty()) {
+                first_token_at = Clock::now();
+                have_first_token = true;
+            }
         }
         if (!plan.empty()) {
             // A prefill-only step decodes nothing while the prompt advances:
@@ -633,6 +647,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     // The pump observes no terminal event yet, so the reason stays None.
     outcome.finish_reason           = ninfer::FinishReason::None;
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+    if (have_first_token) {
+        outcome.metrics.ttft_seconds = std::chrono::duration<double>(first_token_at -
+            prepared.lifetime->started).count();
+    } else {
+        outcome.metrics.ttft_seconds = 0.0;
+    }
     outcome.metrics.total_seconds   = prepared.prepare_seconds;
     return outcome;
 }

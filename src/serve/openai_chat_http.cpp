@@ -3,6 +3,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/translate.h"
 
 #include <atomic>
 #include <cstddef>
@@ -90,7 +91,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         }
         lifecycle->done(outcome);
         try {
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
+            // The serve pump decodes raw tokens, so thinking markers can arrive
+            // inside the content text. Split them into the reasoning channel
+            // here so think spans never leak into HTTP content.
+            GenerationOutcome display = outcome;
+            apply_thinking_split(display, prepared.enable_thinking);
+            set_owned_json_content(res, make_chat_completion_response(identity, display),
                                    prepared.lifetime);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
@@ -107,6 +113,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         const bool return_progress   = request.return_progress;
         const bool timings_per_token = request.timings_per_token;
+        const bool starts_in_reasoning = prepared.enable_thinking;
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
                                                           timings_per_token, return_progress);
@@ -114,8 +121,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle, return_progress,
-             timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, return_progress, timings_per_token,
+             starts_in_reasoning](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -153,7 +160,27 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
 
                 GenerationOutcome outcome;
+                ThinkingSpanSplitter think_splitter(starts_in_reasoning);
+                std::string streamed_reasoning;
+                std::string streamed_content;
+                bool think_content_started = false;
                 try {
+                    auto route_think_segment = [&](ThinkingSpanSplitter::Segment& segment) {
+                        if (segment.text.empty()) { return; }
+                        if (segment.channel == ninfer::OutputChannel::Reasoning &&
+                            !think_content_started) {
+                            streamed_reasoning += segment.text;
+                            render_and_write(transport, [&, text = segment.text] {
+                                return encoder->reasoning_delta(text);
+                            });
+                        } else {
+                            think_content_started = true;
+                            streamed_content += segment.text;
+                            render_and_write(transport, [&, text = segment.text] {
+                                return encoder->content_delta(text);
+                            });
+                        }
+                    };
                     StreamSink output;
                     output.on_start = [&](const ninfer::GenerationStart& start) {
                         encoder->note_start(start);
@@ -174,14 +201,20 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         };
                     }
                     output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
+                        for (ThinkingSpanSplitter::Segment segment : think_splitter.feed(text)) {
+                            route_think_segment(segment);
+                        }
                     };
                     output.on_reasoning = [&](const std::string& text) {
+                        streamed_reasoning += text;
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);
+                    for (ThinkingSpanSplitter::Segment segment : think_splitter.finish()) {
+                        route_think_segment(segment);
+                    }
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -210,7 +243,21 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 lifecycle->done(outcome);
                 std::vector<std::string> terminal;
                 try {
-                    terminal = encoder->finish(outcome);
+                    GenerationOutcome display = outcome;
+                    const SplitThinkingResult split =
+                        split_thinking_spans(display.text, starts_in_reasoning);
+                    const std::string canonical_reasoning = display.reasoning + split.reasoning;
+                    if (canonical_reasoning.starts_with(streamed_reasoning) &&
+                        split.content.starts_with(streamed_content)) {
+                        display.reasoning = canonical_reasoning;
+                        display.text      = std::move(split.content);
+                    } else {
+                        // A late thinking span was demoted into content mid-stream;
+                        // keep the already-streamed bytes as the terminal truth.
+                        display.reasoning = streamed_reasoning;
+                        display.text      = streamed_content;
+                    }
+                    terminal = encoder->finish(display);
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));

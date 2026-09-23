@@ -228,6 +228,13 @@ public:
             }
             pending_.push_back(request);
         }
+        // CLI submit/wait path owns its stepping: the worker batch-mode branch performs
+        // admission/maintenance only (serve steps via the hook-loop pump + run_batch_step),
+        // so opt into the legacy single-lane step loop here. Serve never reaches
+        // EngineCore::submit (Engine::submit throws in serve mode), so this cannot reroute
+        // serve traffic. Without this the worker admits the request then idles while
+        // wait_for_request parks on request->cv forever.
+        legacy_single_lane_.store(true, std::memory_order_relaxed);
         request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
