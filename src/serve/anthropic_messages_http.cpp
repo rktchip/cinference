@@ -63,6 +63,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
+    // S2 HTTP path: one prepare (tokenize + media only) and one run
+    // (hooks.on_new_request, then wait on that req_id) per HTTP request. All
+    // requests share the process-lifetime GenerationService loop, so two
+    // different prompts stream through the one scheduler + Engine.
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation,

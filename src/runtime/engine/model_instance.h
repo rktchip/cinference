@@ -21,6 +21,12 @@ struct ModelInstance {
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
+    // EXL3 serve-startup backing (single slot): owns the WeightParents and
+    // device uploads the Model's BoundWeight views borrow. Null on the
+    // artifact path (the MaterializedArtifact inside Model owns them there).
+    // Assigned by construct_model right after construction, before Parameters
+    // or Program dereference the views.
+    std::shared_ptr<void> exl3_backing;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     ~ModelInstance();

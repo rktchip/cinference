@@ -21,6 +21,13 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# MSVC pulls windows.h (via NVTX3) whose min/max function macros break
+# std::min/std::max/numeric_limits::max. Kill the macros globally; the
+# parenthesized (std::min)(...) call sites keep working either way.
+# Linux builds are untouched by this branch.
+if(MSVC)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling

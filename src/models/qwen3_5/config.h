@@ -1,5 +1,6 @@
 #pragma once
 
+#include "artifact/schema.h"
 #include "models/load_options.h"
 #include "models/registry.h"
 
@@ -146,5 +147,13 @@ struct Config {
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+
+// EXL3 serve-startup path (single slot): parses the text backbone from an
+// already-shaped artifact-schema JSON object (same required/optional members
+// as the .ninfer text component config), without an artifact Directory. The
+// caller shapes HF config.json's text_config into that schema (architectures
+// from the checkpoint root, no extra members). Vision/draft/MTP stay unset;
+// the EXL3 builder serves the text backbone only.
+[[nodiscard]] Config parse_text_config(const artifact::Json& text_config, bool mtp = false);
 
 } // namespace ninfer::models::qwen3_5

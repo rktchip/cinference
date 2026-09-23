@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/execution/mtp_spec_gate.h"
+#include "batch/scheduler.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
@@ -65,6 +67,27 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                    cudaMemcpyDeviceToDevice, state.execution.device.stream));
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
     }
+}
+
+// S7 decode-only speculation wiring for the batched verify path.
+//
+// The RUN arm of the S7 predicate (RUN <=> has_decode && !has_prefill, fully
+// documented in models/qwen3_5/execution/mtp_spec_gate.h) is this TU's
+// mtp_decode_batch / capture_mtp_decode_batch pair: target_verify_accept over
+// the K+1-wide verify window followed by the MTP draft chain at the S7 window
+// kMtpSpecDecodeDrafts (MTP-3). The SKIP arm never enters this TU: mixed
+// prefill+decode steps run the ordinary target-only decode path, because
+// k == 0 is outside mtp_decode_batch_body's domain (it throws on k == 0) and
+// ragged prefill rows cannot join the uniform K+1 verify width. No
+// DFlash/DFlash2 backend is consulted here, and the 10-wide frame-domain
+// maximum (kMtpDecodeMaximumDrafts) remains a validation bound only - the S7
+// window resolves to 3 on RUN and 0 (skip) otherwise.
+MtpSpeculationRoute SelectMtpSpeculationForPlan(const batch::StepPlan& plan) noexcept {
+    return SelectMtpSpeculationForStep(plan);
+}
+
+std::uint32_t MtpDraftWindowForPlan(const batch::StepPlan& plan) noexcept {
+    return MtpSpecDraftWindow(SelectMtpSpeculationForPlan(plan));
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,

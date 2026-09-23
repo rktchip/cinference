@@ -2,6 +2,8 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
+#include "ops/launcher/residual_add.h"
+#include "ops/linear/exl3/exl3_op.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -137,6 +139,17 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): dispatch temp plus the
+        // dense dispatch scratch, mirroring the dispatch below.
+        if (output_rows != 5120 || (input_rows != 17408 && input_rows != 6144)) {
+            throw std::invalid_argument("linear_add workspace: unsupported EXL3 profile");
+        }
+        return static_cast<std::size_t>(5120) * static_cast<std::size_t>(max_tokens) *
+                   sizeof(std::uint16_t) +
+               detail::exl3_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                            min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -240,6 +253,26 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): dense down/output
+        // side-cars (mlp/down, attention/output, gdn/output). The GEMM lands
+        // in a workspace temp, then folds into the residual.
+        const bool supported_shape = w.layout == QuantLayout::Contiguous && w.ndim == 2 &&
+                                     w.n == 5120 && (w.k == 17408 || w.k == 6144) &&
+                                     w.payload != nullptr;
+        if (!supported_shape) {
+            throw std::invalid_argument("linear_add: unsupported EXL3 weight");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+            throw std::invalid_argument("linear_add: EXL3 requires 16-byte x/residual alignment");
+        }
+        auto scope   = ws.scope();
+        Tensor delta = ws.alloc(DType::BF16, {w.n, t});
+        detail::exl3_dispatch(x, w, delta, policy, &ws, stream);
+        detail::residual_add_launch(delta, residual_out, stream);
         return;
     }
 

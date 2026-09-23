@@ -1,21 +1,44 @@
 #include "ninfer/engine.h"
 
+#include "batch/cinference_hooks.h"
+#include "batch/scheduler.h"
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/step_forward.h"
+#include "batch/batch.h"
+#include "core/arena.h"
+#include "core/layout.h"
+#include "core/linear_attention_state.h"
+#include "core/paged_kv_cache.h"
+#include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/state/decoder_state.h"
+#include "ninfer/ops/sampling.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -144,6 +167,482 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+// Serve forward residency (single slot, Engine-owned): the persistent
+// TextContext plus device KV/GDN plus workspace plus RoundState behind
+// Engine::run_batch_step. The scheduler owns page ids and admission; this
+// context owns one private physical page range and one GDN slot per serve
+// lane and reads the dispatch rows only. No fused attention, no MTP, no
+// second generate loop: one TextContext forward per step, EXL3 linears
+// through the existing wrappers, sampling via sample_decode_rows.
+class ServeForwardContext {
+public:
+    ServeForwardContext(DeviceContext& device,
+                        const models::qwen3_5::execution::Parameters& parameters,
+                        const EngineOptions& options)
+        : device_(device), parameters_(parameters) {
+        using models::qwen3_5::execution::dimension;
+        static_assert(sizeof(TokenId) == sizeof(std::int32_t), "TokenId must be I32");
+        const auto& text_config = parameters_.model.config().text;
+        if (!text_config.attention || !text_config.rope_parameters) {
+            throw std::logic_error("serve forward requires text attention and rope config");
+        }
+        if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+            throw std::invalid_argument("serve forward max_concurrency is invalid");
+        }
+        if (options.max_context == 0 || options.prefill_chunk == 0) {
+            throw std::invalid_argument("serve forward needs max_context and prefill_chunk");
+        }
+        max_seqs_    = options.max_concurrency;
+        max_context_ = options.max_context;
+        hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
+        max_tokens_  = options.prefill_chunk + max_seqs_;
+        max_blocks_  = (max_context_ + 15U) / 16U;
+        pages_per_slot_ =
+            1U + (max_context_ - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+        if (static_cast<std::uint64_t>(max_blocks_) >
+            static_cast<std::uint64_t>(pages_per_slot_) *
+                static_cast<std::uint64_t>(kPagedKVPageSize / 16)) {
+            throw std::logic_error("serve forward block stride exceeds the lane page range");
+        }
+        const std::uint32_t physical_pages = max_seqs_ * pages_per_slot_;
+
+        LayoutBuilder kv_builder;
+        const models::qwen3_5::DecoderStateLayout kv_layout =
+            models::qwen3_5::plan_decoder_state(
+                kv_builder,
+                models::qwen3_5::DecoderStateSpec{
+                    .full_attention_layers     = text_config.full_attention_layers,
+                    .mtp_layers                = 0,
+                    .capacity                  = max_context_,
+                    .kv_heads                  = dimension(text_config.attention->num_key_value_heads),
+                    .attention_head_dim        = dimension(text_config.attention->head_dim),
+                    .kv_storage                = options.kv_cache,
+                    .enable_mtp                = false,
+                    .kv_table_rows             = static_cast<std::int32_t>(max_seqs_),
+                    .text_physical_page_groups = physical_pages,
+                    .mtp_physical_page_groups  = 0,
+                });
+        kv_store_ = DeviceBuffer(kv_builder.finish(256));
+        kv_       = std::make_unique<models::qwen3_5::PagedKVCache>(
+            DeviceSpan{kv_store_.p, kv_store_.bytes}, kv_layout.text_kv);
+
+        const std::uint32_t gdn_layers = text_config.linear_attention_layers;
+        LayoutBuilder pool_builder;
+        const LinearAttentionStatePoolLayout pool_layout =
+            plan_linear_attention_state_pool(
+                pool_builder,
+                LinearAttentionStatePoolSpec{
+                    .layers         = gdn_layers,
+                    .conv_channels  = text_config.gdn ? static_cast<std::int32_t>(
+                        dimension(text_config.gdn->conv_channels())) : 0,
+                    .conv_width     = text_config.gdn ? static_cast<std::int32_t>(
+                        dimension(text_config.gdn->linear_conv_kernel_dim)) - 1 : 0,
+                    .value_heads    = text_config.gdn ? static_cast<std::int32_t>(
+                        dimension(text_config.gdn->linear_num_value_heads)) : 0,
+                    .value_head_dim = text_config.gdn ? static_cast<std::int32_t>(
+                        dimension(text_config.gdn->linear_value_head_dim)) : 0,
+                    .key_head_dim   = text_config.gdn ? static_cast<std::int32_t>(
+                        dimension(text_config.gdn->linear_key_head_dim)) : 0,
+                    .slot_count     = static_cast<std::int32_t>(max_seqs_),
+                    .conv_dtype     = DType::BF16,
+                });
+        pool_store_ = DeviceBuffer(pool_builder.finish(256));
+        pool_       = std::make_unique<LinearAttentionStatePool>(
+            DeviceSpan{pool_store_.p, pool_store_.bytes}, pool_layout);
+
+        LayoutBuilder round_builder;
+        models::qwen3_5::RoundStateLayout round_layout =
+            models::qwen3_5::begin_round_state_layout(
+                round_builder,
+                models::qwen3_5::RoundStateSpec{
+                    .hidden          = static_cast<std::int32_t>(hidden_),
+                    .output_rows     = 1,
+                    .batch_capacity  = max_seqs_,
+                    .draft_window    = 0,
+                    .backend         = SpeculativeBackend::None,
+                    .causal_scoring  = false,
+                });
+        models::qwen3_5::complete_round_state_layout(round_builder, round_layout);
+        round_store_ = DeviceBuffer(round_builder.finish(256));
+        io_          = std::make_unique<models::qwen3_5::RoundState>(
+            DeviceSpan{round_store_.p, round_store_.bytes}, round_layout);
+
+        models::qwen3_5::SequencePlanner planner =
+            models::qwen3_5::make_sequence_planner(parameters_, device_, options);
+        models::qwen3_5::SequencePlan seq_plan =
+            std::move(planner).finalize(physical_pages);
+        const std::size_t ws_bytes =
+            seq_plan.workspace_capacity_bytes() + (static_cast<std::size_t>(96) << 20);
+        if (ws_bytes == 0) { throw std::logic_error("serve forward workspace plan is empty"); }
+        work_ = std::make_unique<DeviceArena>(ws_bytes);
+
+        auto align_up = [](std::size_t bytes) { return (bytes + 255U) & ~static_cast<std::size_t>(255U); };
+        std::size_t off = 0;
+        ids_ = off; off += align_up(static_cast<std::size_t>(max_tokens_) * 4U);
+        cpos_ = off; off += align_up(static_cast<std::size_t>(max_tokens_) * 4U);
+        rpos_ = off; off += align_up(static_cast<std::size_t>(max_tokens_) * 4U);
+        rows_ = off; off += align_up(static_cast<std::size_t>(max_seqs_) * 4U);
+        gsrc_ = off; off += align_up(static_cast<std::size_t>(max_seqs_) * 4U);
+        gdst_ = off; off += align_up(static_cast<std::size_t>(max_seqs_) * 4U);
+        hidden_off_ = off;
+        off += align_up(static_cast<std::size_t>(hidden_) * max_tokens_ * 2U);
+        prefill_hidden_ = off;
+        off += align_up(static_cast<std::size_t>(hidden_) * 2U);
+        offsets_ = off;
+        off += align_up(static_cast<std::size_t>(max_seqs_ + 1U) * 4U);
+        tables_ = off;
+        off += align_up(static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U);
+        scratch_ = DeviceBuffer(off);
+        CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(scratch_.p) + tables_, 0,
+                                   static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U,
+                                   device_.stream));
+
+        std::optional<DeviceKVPageReservation> reservation =
+            kv_->page_pool().reserve(physical_pages);
+        if (!reservation) { throw std::runtime_error("serve forward KV page reservation failed"); }
+        reservation_ = std::move(*reservation);
+        page_leases_.reserve(physical_pages);
+        kv_->page_pool().materialize(reservation_, physical_pages, page_leases_);
+        std::vector<DeviceKVPageHandle> all_pages;
+        all_pages.reserve(physical_pages);
+        for (const auto& lease : page_leases_) { all_pages.push_back(lease.handle()); }
+        kv_->page_pool().zero_pages(all_pages, device_.stream);
+        {
+            // Construction invariant for the per-step table gather below.
+            const std::size_t npages = all_pages.size();
+            if (kv_->page_pool().contiguous_run_count(
+                    std::span<const DeviceKVPageHandle>(all_pages.data(), npages)) != 1) {
+                throw std::logic_error("serve forward KV pages are not dense in lane order");
+            }
+        }
+        for (std::uint32_t r = 0; r < max_seqs_; ++r) {
+            row_leases_.push_back(kv_->execution_tables().acquire(static_cast<std::int32_t>(r)));
+            std::vector<DeviceKVPageHandle> slot_pages;
+            slot_pages.reserve(pages_per_slot_);
+            for (std::uint32_t l = 0; l < pages_per_slot_; ++l) {
+                slot_pages.push_back(page_leases_[r * pages_per_slot_ + l].handle());
+            }
+            kv_->execution_tables().publish(row_leases_.back().handle(), 0,
+                                            std::span(slot_pages.data(), slot_pages.size()),
+                                            device_.stream);
+        }
+
+        Tensor prefill_hidden_tensor(static_cast<char*>(scratch_.p) + prefill_hidden_,
+                                     DType::BF16,
+                                     {static_cast<std::int32_t>(hidden_), 1});
+        card_ = std::make_unique<models::qwen3_5::execution::TextContext>(
+            device_, parameters_, *work_, models::qwen3_5::PagedKVCacheView{}, *pool_, *io_,
+            prefill_hidden_tensor, options.prefill_chunk, 0,
+            models::qwen3_5::PagedKVCacheView{}, kv_.get(), nullptr);
+        envelope_ = ops::CausalAttentionExecutionEnvelope{1, max_context_};
+        {
+            // Explicit T=0 sampling config: temperature 0 resolves to greedy.
+            ops::SamplingConfig explicit_argmax;
+            explicit_argmax.temperature = 0.0F;
+            explicit_argmax.top_k = 20;
+            explicit_argmax.top_p = 1.0F;
+            explicit_argmax.min_p = 0.0F;
+            explicit_argmax.presence_penalty = 0.0F;
+            explicit_argmax.frequency_penalty = 0.0F;
+            explicit_argmax.seed = 0;
+            explicit_argmax.token_counts = nullptr;
+            sampling_store_ = DeviceBuffer(sizeof(ops::SamplingConfig));
+            sampling_store_.copy_from_host(&explicit_argmax, sizeof(explicit_argmax));
+            serve_sampling_ = static_cast<const ops::SamplingConfig*>(sampling_store_.p);
+            card_->set_sampling(serve_sampling_);
+        }
+        slots_.resize(max_seqs_);
+        device_.synchronize();
+    }
+
+    runtime::StepDecodedPairs step(const batch::StepPlan& plan,
+                                   const batch::StepDispatch& dispatch) {
+        // Same pins as run_step_forward: M == prefill + n_decode, rows == M,
+        // and an empty plan never runs.
+        runtime::validate_mixed_step_m(plan, dispatch);
+        const std::uint32_t m = runtime::step_activation_rows(dispatch);
+        if (m == 0) { throw std::logic_error("step_forward: empty plan never runs a forward"); }
+        if (parameters_.text.layers.empty()) {
+            throw std::invalid_argument("step_forward: num_layers must be positive");
+        }
+        const batch::RaggedBatch& batch = dispatch.batch;
+        const std::size_t num_seqs      = batch.num_seqs();
+        const std::size_t n_dec         = plan.decode_seq_ids.size();
+        const std::size_t n_pref        = plan.prefill.size();
+        if (m > max_tokens_) { throw std::logic_error("serve forward step exceeds token budget"); }
+        if (num_seqs > max_seqs_) { throw std::logic_error("serve forward step exceeds lane budget"); }
+        if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
+            // DIAGNOSTIC ONLY: clear shared workspace per step to test for
+            // read-before-write contamination across requests.
+            CUDA_CHECK(cudaMemsetAsync(work_->base(), 0, work_->capacity(), device_.stream));
+        }
+
+        // Lane assignment: one persistent (KV range, GDN slot) per seq id.
+        // Fresh lanes zero their pages and slot on the step stream, ordered
+        // before the forward below.
+        std::vector<std::int32_t> row_slot(num_seqs, -1);
+        for (std::size_t s = 0; s < num_seqs; ++s) {
+            const std::uint64_t seq_id = batch.seq_ids[s];
+            std::int32_t found         = -1;
+            for (std::uint32_t q = 0; q < max_seqs_; ++q) {
+                if (slots_[q].in_use && slots_[q].seq_id == seq_id) {
+                    found = static_cast<std::int32_t>(q);
+                    break;
+                }
+            }
+            if (found < 0) {
+                for (std::uint32_t q = 0; q < max_seqs_; ++q) {
+                    if (!slots_[q].in_use) {
+                        found = static_cast<std::int32_t>(q);
+                        break;
+                    }
+                }
+                if (found < 0) {
+                    // Admit-time reclaim of a dead lane: absent from this
+                    // batch and decode-ended. Live decode seqs ride every
+                    // step, so absence means finished.
+                    for (std::uint32_t q = 0; q < max_seqs_; ++q) {
+                        if (slots_[q].touched_as_prefill) { continue; }
+                        bool alive = false;
+                        for (std::size_t s = 0; s < num_seqs; ++s) {
+                            if (batch.seq_ids[s] == slots_[q].seq_id) {
+                                alive = true;
+                                break;
+                            }
+                        }
+                        if (!alive) {
+                            found = static_cast<std::int32_t>(q);
+                            break;
+                        }
+                    }
+                }
+                if (found < 0) { throw std::logic_error("serve forward has no free lane"); }
+                ServeSlot& slot         = slots_[static_cast<std::size_t>(found)];
+                slot.in_use             = true;
+                slot.seq_id             = seq_id;
+                slot.next_pos           = 0;
+                slot.touched_as_prefill = false;
+                std::vector<DeviceKVPageHandle> pages;
+                pages.reserve(pages_per_slot_);
+                for (std::uint32_t l = 0; l < pages_per_slot_; ++l) {
+                    pages.push_back(
+                        page_leases_[static_cast<std::size_t>(found) * pages_per_slot_ + l]
+                            .handle());
+                }
+                kv_->page_pool().zero_pages(pages, device_.stream);
+                pool_->zero_slot(found, device_.stream);
+            }
+            row_slot[s] = found;
+        }
+
+        // Absolute positions per flat token; the per-lane next_pos cursor is
+        // the only cross-step state (scheduler slices arrive in order).
+        std::vector<std::int32_t> pos(m, 0);
+        for (std::size_t s = 0; s < n_pref; ++s) {
+            const batch::PrefillSlice& slice = plan.prefill[s];
+            if (slice.seq_id != batch.seq_ids[s]) {
+                throw std::logic_error("serve forward prefill row mismatch");
+            }
+            ServeSlot& slot = slots_[static_cast<std::size_t>(row_slot[s])];
+            if (slice.offset != slot.next_pos) {
+                throw std::logic_error("serve forward lost position track");
+            }
+            if (slice.count == 0 ||
+                static_cast<std::uint64_t>(slice.offset) + slice.count > max_context_) {
+                throw std::logic_error("serve forward prefill slice is out of range");
+            }
+            const std::uint32_t begin = batch.seq_offsets[s];
+            for (std::uint32_t k = 0; k < slice.count; ++k) {
+                pos[begin + k] = static_cast<std::int32_t>(slot.next_pos + k);
+            }
+            slot.next_pos += slice.count;
+            slot.touched_as_prefill = true;
+        }
+        for (std::size_t i = 0; i < n_dec; ++i) {
+            const std::size_t s = n_pref + i;
+            if (plan.decode_seq_ids[i] != batch.seq_ids[s]) {
+                throw std::logic_error("serve forward decode row mismatch");
+            }
+            ServeSlot& slot = slots_[static_cast<std::size_t>(row_slot[s])];
+            if (slot.next_pos >= max_context_) {
+                throw std::logic_error("serve forward decode position is out of range");
+            }
+            pos[batch.seq_offsets[s]] = static_cast<std::int32_t>(slot.next_pos);
+            slot.next_pos += 1;
+            slot.touched_as_prefill = false;
+        }
+        std::vector<std::int32_t> rows(num_seqs, 0);
+        for (std::size_t s = 0; s < num_seqs; ++s) { rows[s] = row_slot[s]; }
+        std::vector<std::int32_t> gslots(n_dec, 0);
+        for (std::size_t i = 0; i < n_dec; ++i) { gslots[i] = row_slot[n_pref + i]; }
+        for (std::size_t s = 0; s < num_seqs; ++s) {
+            if (row_slot[s] < 0) {
+                throw std::logic_error("serve forward left a ragged row unbound");
+            }
+            for (std::size_t t = s + 1; t < num_seqs; ++t) {
+                if (row_slot[s] == row_slot[t]) {
+                    throw std::logic_error("serve forward aliased two ragged rows to one lane");
+                }
+            }
+        }
+
+        cudaStream_t stream = device_.stream;
+        char* base          = static_cast<char*>(scratch_.p);
+        CUDA_CHECK(cudaMemcpyAsync(base + ids_, batch.tokens.data(),
+                                   static_cast<std::size_t>(m) * sizeof(TokenId),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(base + cpos_, pos.data(),
+                                   static_cast<std::size_t>(m) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(base + rpos_, pos.data(),
+                                   static_cast<std::size_t>(m) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(base + rows_, rows.data(),
+                                   num_seqs * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   stream));
+        if (n_dec > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(base + gsrc_, gslots.data(),
+                                       n_dec * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       stream));
+            CUDA_CHECK(cudaMemcpyAsync(base + gdst_, gslots.data(),
+                                       n_dec * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       stream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(base + offsets_, batch.seq_offsets.data(),
+                                   (num_seqs + 1U) * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        {
+            // Per-step block-table gather: device tables must match this
+            // steps plan every step, never the startup zeros. Lane L owns
+            // pages [L * pages_per_slot_, (L + 1) * pages_per_slot_) and a
+            // 64-token page holds four 16-token logical blocks.
+            host_tables_.assign(num_seqs * max_blocks_, -1);
+            for (std::size_t s = 0; s < num_seqs; ++s) {
+                const std::uint32_t lane = static_cast<std::uint32_t>(row_slot[s]);
+                for (std::uint32_t b = 0; b < max_blocks_; ++b) {
+                    host_tables_[s * max_blocks_ + b] = static_cast<std::int32_t>(
+                        lane * pages_per_slot_ + b / (kPagedKVPageSize / 16));
+                }
+                if (batch.seq_offsets[s + 1] == batch.seq_offsets[s]) {
+                    throw std::logic_error("serve forward step has an empty ragged row");
+                }
+                if (lane > 0 && host_tables_[s * max_blocks_] == 0) {
+                    throw std::logic_error(
+                        "serve forward block tables were not refreshed for this step");
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(base + tables_, host_tables_.data(),
+                                       host_tables_.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+
+        batch::DeviceRaggedBatch view;
+        view.tokens        = reinterpret_cast<TokenId*>(base + ids_);
+        view.seq_offsets   = reinterpret_cast<std::uint32_t*>(base + offsets_);
+        view.block_tables  = reinterpret_cast<std::int32_t*>(base + tables_);
+        view.num_seqs      = static_cast<std::uint32_t>(num_seqs);
+        view.total_tokens  = m;
+        view.max_blocks    = max_blocks_;
+
+        const std::int32_t T    = static_cast<std::int32_t>(m);
+        const std::int32_t nseq = static_cast<std::int32_t>(num_seqs);
+        const std::int32_t ndec = static_cast<std::int32_t>(n_dec);
+        models::qwen3_5::execution::TextContext::ServeStepTensors tensors{
+            .ids                      = Tensor(base + ids_, DType::I32, {T}),
+            .cache_positions          = Tensor(base + cpos_, DType::I32, {T}),
+            .rope_positions           = Tensor(base + rpos_, DType::I32, {T}),
+            .kv_table_rows            = Tensor(base + rows_, DType::I32, {nseq}),
+            .decode_source_slots      = ndec > 0 ? Tensor(base + gsrc_, DType::I32, {ndec})
+                                                 : Tensor{},
+            .decode_destination_slots = ndec > 0 ? Tensor(base + gdst_, DType::I32, {ndec})
+                                                 : Tensor{},
+            .hidden                   = Tensor(base + hidden_off_, DType::BF16,
+                                               {static_cast<std::int32_t>(hidden_), T}),
+        };
+        card_->set_sampling(serve_sampling_);
+        if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
+            std::fprintf(stderr, "[serve-step] seqs=%zu m=%u prefill=%zu decode=%zu\n",
+                         num_seqs, m, n_pref, n_dec);
+            for (std::size_t s = 0; s < num_seqs; ++s) {
+                const std::uint32_t b0 = batch.seq_offsets[s];
+                const std::uint32_t b1 = batch.seq_offsets[s + 1];
+                std::fprintf(stderr,
+                             "[serve-step] row=%zu seq=%llu lane=%d span=%u tok0=%d tokN=%d pos0=%d posN=%d\n",
+                             s, (unsigned long long)batch.seq_ids[s], row_slot[s], b1 - b0,
+                             batch.tokens[b0], batch.tokens[b1 - 1], pos[b0], pos[b1 - 1]);
+            }
+            std::fflush(stderr);
+        }
+        auto decoded = card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
+                                                 row_slot.data(), tensors, envelope_);
+        if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
+            for (std::size_t d = 0; d < decoded.size(); ++d) {
+                std::fprintf(stderr, "[serve-step] decoded seq=%llu tok=%d\n",
+                             (unsigned long long)decoded[d].first, (int)decoded[d].second);
+            }
+            std::fflush(stderr);
+        }
+        // Lanes whose seq left the batch after decoding are done; lanes that
+        // vanish mid-prefill are starved (chunk budget), not done: keep them.
+        for (ServeSlot& slot : slots_) {
+            if (!slot.in_use) { continue; }
+            bool seen = false;
+            for (std::size_t s = 0; s < num_seqs; ++s) {
+                if (batch.seq_ids[s] == slot.seq_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && !slot.touched_as_prefill) { slot.in_use = false; }
+        }
+        return decoded;
+    }
+
+private:
+    struct ServeSlot {
+        bool in_use             = false;
+        std::uint64_t seq_id    = 0;
+        std::uint32_t next_pos  = 0;
+        bool touched_as_prefill = false;
+    };
+
+    DeviceContext& device_;
+    const models::qwen3_5::execution::Parameters& parameters_;
+    std::uint32_t max_seqs_       = 0;
+    std::uint32_t max_context_    = 0;
+    std::uint32_t hidden_         = 0;
+    std::uint32_t max_tokens_     = 0;
+    std::uint32_t max_blocks_     = 0;
+    std::uint32_t pages_per_slot_ = 0;
+    DeviceBuffer kv_store_;
+    DeviceBuffer pool_store_;
+    DeviceBuffer round_store_;
+    std::unique_ptr<DeviceArena> work_;
+    DeviceBuffer scratch_;
+    DeviceBuffer sampling_store_;
+    const ops::SamplingConfig* serve_sampling_ = nullptr;
+    std::vector<std::int32_t> host_tables_;
+    std::size_t ids_            = 0;
+    std::size_t cpos_           = 0;
+    std::size_t rpos_           = 0;
+    std::size_t rows_           = 0;
+    std::size_t gsrc_           = 0;
+    std::size_t gdst_           = 0;
+    std::size_t hidden_off_     = 0;
+    std::size_t prefill_hidden_ = 0;
+    std::size_t offsets_        = 0;
+    std::size_t tables_         = 0;
+    std::unique_ptr<models::qwen3_5::PagedKVCache> kv_;
+    std::unique_ptr<LinearAttentionStatePool> pool_;
+    std::unique_ptr<models::qwen3_5::RoundState> io_;
+    std::unique_ptr<models::qwen3_5::execution::TextContext> card_;
+    DeviceKVPageReservation reservation_;
+    std::vector<DeviceKVPageLease> page_leases_;
+    std::vector<KVExecutionRowLease> row_leases_;
+    ops::CausalAttentionExecutionEnvelope envelope_{0, 0};
+    std::vector<ServeSlot> slots_;
+};
+
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
@@ -183,6 +682,14 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    // Serve mode: set by GenerationService. While true, submit() throws so
+    // the serve path cannot accidentally use per-client generate loops.
+    bool serve_mode = false;
+    // Serve forward residency (single slot, Engine-owned): built lazily on
+    // the first run_batch_step call. The scheduler owns page ids; GDN slots
+    // ride the dispatch rows only.
+    std::unique_ptr<ServeForwardContext> serve_forward;
+    std::once_flag serve_forward_once;
 };
 
 Engine::Engine(EngineOptions options) {
@@ -282,6 +789,14 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 GenerationObservationOptions observation,
                                 std::chrono::steady_clock::time_point pending_deadline) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    // Committee A+B single scheduler: the serve path admits via hook_loop
+    // EngineHooks::on_new_request and steps via Engine::run_batch_step. A
+    // serve-mode submit is a programming error (second generate loop), so it
+    // throws here. CLI never sets serve mode, keeping generate() usable.
+    if (impl_->serve_mode) {
+        throw std::logic_error("Engine::submit is disabled in serve mode: admit via hook_loop "
+                               "EngineHooks::on_new_request and step via Engine::run_batch_step");
+    }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
     }
@@ -353,6 +868,50 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
     return submit(std::move(prompt), std::move(options), consumer_mode, {})
         .wait(sink, cancellation);
+}
+
+void Engine::set_serve_mode(bool serve) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    impl_->serve_mode = serve;
+}
+
+std::vector<TokenId> Engine::prompt_token_ids(const PreparedPrompt& prompt) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    const models::qwen3_5::PreparedPromptData& data =
+        models::qwen3_5::PreparedPromptAccess::view(prompt.impl_->value);
+    return data.token_ids;
+}
+
+std::string Engine::decode_tokens(std::span<const TokenId> ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.decode_tokens(ids);
+}
+
+ResolvedSamplingParameters Engine::resolved_sampling(const PreparedPrompt& prompt,
+                                                     const RequestOptions& options) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    runtime::ResolvedRequestOptions resolved = resolve_request_options(
+        impl_->sampling_defaults, prompt.impl_->sampling_mode, options);
+    return resolved.execution.sampling;
+}
+
+std::vector<std::pair<std::uint64_t, TokenId>>
+Engine::run_batch_step(const batch::StepPlan& plan, const batch::StepDispatch& dispatch) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    // Production forward (single slot, Engine-owned): embed dispatch tokens
+    // at m == tokens.size(), per-layer production
+    // causal_softmax_attention_ragged over the batch device view, EXL3 linear
+    // per layer through the existing wrappers, then
+    // TextContext::sample_decode_rows for decode rows only. The scheduler
+    // owns page ids; the hook loop owns no TextContext/KV/GDN bytes.
+    std::call_once(impl_->serve_forward_once, [&] {
+        impl_->device.bind_to_current_thread();
+        impl_->serve_forward = std::make_unique<ServeForwardContext>(
+            impl_->device, impl_->active->parameters, impl_->options);
+    });
+    return impl_->serve_forward->step(plan, dispatch);
 }
 
 const EngineOptions& Engine::options() const {

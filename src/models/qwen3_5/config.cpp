@@ -63,7 +63,8 @@ AttentionConfig attention(const Json& value) {
 }
 
 RopeConfig rope(const Json& value, std::uint32_t head_dim) {
-    require_members(value, {"rope_theta", "partial_rotary_factor", "mrope_section"}, {},
+    require_members(value, {"rope_theta", "partial_rotary_factor", "mrope_section"},
+                    {"mrope_interleaved", "rope_type"},
                     "text RoPE");
     RopeConfig out;
     out.rope_theta            = positive_float(value, "rope_theta");
@@ -297,6 +298,17 @@ std::uint64_t VisionConfig::patch_width() const {
 std::uint64_t VisionConfig::merger_width() const {
     return artifact::checked_mul(std::uint64_t(spatial_merge_size) * spatial_merge_size,
                                  hidden_size, "merger width");
+}
+
+Config parse_text_config(const artifact::Json& text_config, bool mtp) {
+    try {
+        Config out;
+        out.mtp  = mtp;
+        out.text = text(text_config, mtp);
+        return out;
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Qwen3.5 text config: ") + error.what());
+    }
 }
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {

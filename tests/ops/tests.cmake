@@ -104,6 +104,23 @@ ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
 
+# S5 proofs: EXL3 dequant front-end (host-only, bit-exact vs recorded 1.5.1
+# vectors) and the M47 fused-launch counter (host asserts, GPU part GATED).
+# Standalone TUs: no library dependencies.
+ninfer_add_op_test(ninfer_exl3_dequant_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_dequant.cc")
+
+ninfer_add_op_test(ninfer_exl3_launch_m47_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_launch_m47.cc")
+
+# S3b proof: EXL3 binder name-map + fusion plan (host-only, no device).
+# Standalone TU: no library dependencies.
+ninfer_add_op_test(ninfer_exl3_bind_namemap_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_bind_namemap.cc")
+
+ninfer_add_op_test(ninfer_exl3_out_dtype_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_exl3_out_dtype.cc")
+
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)

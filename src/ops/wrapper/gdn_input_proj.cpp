@@ -5,6 +5,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
+#include "ops/linear/exl3/exl3_op.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -327,6 +328,40 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
+    // EXL3 serve-startup path (single slot): qkv and z are separate
+    // side-cars (z rides in qdata per load/exl3_weights.h), served with two
+    // dispatches straight into the caller outputs -- no temp needed, both
+    // shapes match their side-car exactly.
+    if (weight.qtype == QType::EXL3) {
+        constexpr std::int32_t kHidden  = 5120;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        const std::int32_t cols         = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        if (weight.layout != QuantLayout::Contiguous || weight.ndim != 2 ||
+            weight.n != kQkvRows || weight.k != kHidden || weight.payload == nullptr ||
+            weight.qdata == nullptr) {
+            throw std::invalid_argument("exl3 gdn_input_proj: unsupported qkv/z weights");
+        }
+        if (workspace == nullptr) {
+            throw std::invalid_argument("exl3 gdn_input_proj requires caller workspace");
+        }
+        Weight z_weight;
+        z_weight.payload = weight.qdata;
+        z_weight.qtype   = QType::EXL3;
+        z_weight.layout  = QuantLayout::Contiguous;
+        z_weight.ndim    = 2;
+        z_weight.n = z_weight.shape[0] = z_weight.padded_shape[0] = kZRows;
+        z_weight.k = z_weight.shape[1] = z_weight.padded_shape[1] = kHidden;
+        detail::exl3_dispatch(x, weight, qkv, policy, workspace, stream);
+        detail::exl3_dispatch(x, z_weight, z, policy, workspace, stream);
+        return;
+    }
+
     constexpr std::int32_t kHidden  = 2048;
     constexpr std::int32_t kQkvRows = 8192;
     constexpr std::int32_t kZRows   = 4096;
@@ -503,6 +538,43 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
+    // EXL3 serve-startup path (single slot): project through the
+    // single-parent EXL3 arm, then run the shared convolution snapshot.
+    // Always composes (no fused conv schedule for EXL3).
+    if (weight.qtype == QType::EXL3) {
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry       = require_snapshot_input(x, kHidden);
+        if (weight.layout != QuantLayout::Contiguous || weight.ndim != 2 ||
+            weight.n != kChannels || weight.k != kHidden || weight.payload == nullptr ||
+            weight.qdata == nullptr) {
+            throw std::invalid_argument(
+                "exl3 gdn_input_proj_conv_snapshot: unsupported weight");
+        }
+        require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                  snapshot_base_slots, kChannels, geometry);
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "z");
+        compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                 snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows,
+                                 kValueRows, geometry, workspace, stream,
+                                 [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                                     gdn_input_proj(x_flat, weight, projected, z_flat, policy,
+                                                    workspace, stream);
+                                 });
+        return;
+    }
+
     constexpr std::int32_t kHidden    = 2048;
     constexpr std::int32_t kQueryRows = 2048;
     constexpr std::int32_t kKeyRows   = 2048;
@@ -652,6 +724,43 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
+    // EXL3 serve-startup path (single slot): project through the
+    // single-parent EXL3 arm, then run the shared convolution record.
+    // Always composes (no fused conv schedule for EXL3).
+    if (weight.qtype == QType::EXL3) {
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry       = require_record_input(x, kHidden);
+        if (weight.layout != QuantLayout::Contiguous || weight.ndim != 2 ||
+            weight.n != kChannels || weight.k != kHidden || weight.payload == nullptr ||
+            weight.qdata == nullptr) {
+            throw std::invalid_argument("exl3 gdn_input_proj_conv_record: unsupported weight");
+        }
+        require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                kChannels, geometry);
+        require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "conv record");
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "z");
+        compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                       conv_record, query, key, value, z, geometry, workspace, stream,
+                       [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                           gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace,
+                                          stream);
+                       });
+        return;
+    }
+
     constexpr std::int32_t kHidden    = 2048;
     constexpr std::int32_t kQueryRows = 2048;
     constexpr std::int32_t kKeyRows   = 2048;
@@ -742,6 +851,17 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
         return 0;
     }
+    if (parent_qtype == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): two dense dispatch
+        // scratches (qkv + z), mirroring dispatch_single_parent.
+        if (parent_rows != 10240 || input_rows != 5120) {
+            throw std::invalid_argument("gdn_input_proj workspace: unsupported EXL3 profile");
+        }
+        return detail::exl3_linear_workspace_capacity_bytes(10240, input_rows, policy, min_tokens,
+                                                            max_tokens) +
+               detail::exl3_linear_workspace_capacity_bytes(6144, input_rows, policy, min_tokens,
+                                                            max_tokens);
+    }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
 
@@ -802,6 +922,20 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (parent_qtype == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): always composes project +
+        // conv launch, mirroring dispatch_single_parent_snapshot.
+        if (parent_rows != 10240 || input_rows != 5120) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_snapshot workspace: unsupported EXL3 profile");
+        }
+        constexpr std::int32_t kChannels     = 10240;
+        const std::int32_t aggregate_columns = batch_size * max_width;
+        const std::size_t projection_workspace =
+            gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                                    1, aggregate_columns);
+        return composed_snapshot_capacity(kChannels, aggregate_columns, projection_workspace);
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {
@@ -851,6 +985,17 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
+    if (parent_qtype == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): always composes project +
+        // conv launch, mirroring dispatch_single_parent_record.
+        if (parent_rows != 10240 || input_rows != 5120) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_record workspace: unsupported EXL3 profile");
+        }
+        const std::int32_t aggregate_columns = batch_size * max_width;
+        return gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
+                                                       policy, 1, aggregate_columns);
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {

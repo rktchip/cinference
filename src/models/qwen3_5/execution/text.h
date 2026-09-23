@@ -1,6 +1,8 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
+#include "batch/batch.h"
+
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -20,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -100,6 +103,15 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    // E2 ragged serve-batch binding: device gather output plus the host
+    // offsets mirror. Set for batch-mode steps (flat T live tokens); cleared
+    // for single-request paths. Never reads host block tables.
+    void set_ragged_batch(const batch::DeviceRaggedBatch* view,
+                          const std::uint32_t* host_seq_offsets) noexcept {
+        active_ragged_batch_   = view;
+        active_ragged_offsets_ = host_seq_offsets;
+    }
+    void clear_ragged_batch() noexcept { set_ragged_batch(nullptr, nullptr); }
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -131,6 +143,41 @@ public:
                                const Tensor& linear_state_destination_slots,
                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                Tensor& logits);
+    // Slot C: sample decode rows only. hidden is the post-final-norm flat-T
+    // hidden matrix [H, T]; plan/batch give the ragged layout (prefill slices
+    // first in plan order, then one 1-token row per decode seq). Prefill rows
+    // are never sampled: only columns [prefill_tokens, prefill_tokens+n_dec)
+    // are projected and sampled, one token per plan.decode_seq_ids entry.
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, TokenId>>
+    sample_decode_rows(const Tensor& hidden, const batch::StepPlan& plan,
+                       const batch::RaggedBatch& batch, cudaStream_t stream);
+    // Slot B: production ragged serve forward for one StepPlan. All step
+    // tensors are Engine-owned device buffers (this method allocates nothing
+    // persistent): ids/positions are flat-T I32, kv_table_rows is
+    // I32[num_seqs] over the owning cache execution rows, hidden is BF16
+    // [H, T] scratch that sample_decode_rows consumes below. row_slots
+    // carries one persistent GDN state slot per ragged row (prefill rows
+    // first in plan order, then one 1-token row per decode seq). The ragged
+    // device view plus the host offsets mirror bind the flat-T path in
+    // attn_mix; GDN layers run one Prefill-phase update per prefill row plus
+    // one width-1 Verify batch over the decode suffix (Verify GDN is
+    // uniform-only). Returns sample_decode_rows(...) for decode rows only.
+    struct ServeStepTensors {
+        Tensor ids;                       // I32 [T]
+        Tensor cache_positions;           // I32 [T]
+        Tensor rope_positions;            // I32 [T]
+        Tensor kv_table_rows;             // I32 [num_seqs]
+        Tensor decode_source_slots;       // I32 [n_dec]; empty when n_dec == 0
+        Tensor decode_destination_slots;  // I32 [n_dec]; empty when n_dec == 0
+        Tensor hidden;                    // BF16 [H, T]
+    };
+
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, TokenId>>
+    forward_serve_step(const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+                       const batch::DeviceRaggedBatch& ragged,
+                       const std::uint32_t* host_seq_offsets, const std::int32_t* row_slots,
+                       ServeStepTensors& tensors,
+                       ops::CausalAttentionExecutionEnvelope envelope);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
@@ -229,6 +276,10 @@ private:
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
+    // E2 ragged serve-batch binding (see set_ragged_batch): when non-null,
+    // attn_mix takes the flat-T ragged path and never the uniform [W,B] path.
+    const batch::DeviceRaggedBatch* active_ragged_batch_   = nullptr;
+    const std::uint32_t* active_ragged_offsets_            = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
     std::int32_t rope_delta_                                                       = 0;

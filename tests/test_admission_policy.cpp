@@ -1,5 +1,7 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/scheduler.h"
+#include "batch/request.h"
+#include "batch/scheduler.h"
 
 #include <algorithm>
 #include <array>
@@ -209,6 +211,73 @@ int main() {
     failures += check(control.size == 1 && control.row_stride == 3 &&
                           control.tokens == slots[0]->output.control && control.sequences[0] == 23,
                       "ControlReady membership changed the exact control span");
+
+    // FIFO head-of-line blocking (batch RequestScheduler: strict FIFO admission).
+    // A head that can never admit (prompt blocks exceed the per-seq cap) holds
+    // every waiter behind it; aborting the head releases the queue.
+    {
+        ninfer::batch::RequestScheduler fifo(4, 64, 8, 8);
+        const auto prompt = [](int base, std::size_t count) {
+            std::vector<ninfer::TokenId> tokens(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                tokens[i] = static_cast<ninfer::TokenId>(base + static_cast<int>(i));
+            }
+            return tokens;
+        };
+        // 200-token prompt needs ceil(201/16) = 13 blocks > max 8: unadmittable.
+        const std::uint64_t huge =
+            fifo.submit(ninfer::batch::Request(0, prompt(1, 200), 1));
+        const std::uint64_t small =
+            fifo.submit(ninfer::batch::Request(0, prompt(500, 8), 1));
+        const ninfer::batch::StepPlan blocked = fifo.schedule_step();
+        failures += check(blocked.empty() && fifo.running() == 0 && fifo.waiting() == 2,
+                          "blocked FIFO head did not hold later waiters");
+        failures += check(fifo.abort(huge), "blocked FIFO head could not abort");
+        const ninfer::batch::StepPlan released = fifo.schedule_step();
+        failures += check(!released.empty() && fifo.running() == 1 &&
+                              fifo.find_request(huge) == nullptr &&
+                              fifo.find_request(small) != nullptr,
+                          "waiter did not admit after the blocked head aborted");
+    }
+
+    // Page-exhaust reject: a request whose prompt blocks exceed the free pages
+    // stays waiting; the running set is untouched and no slice references it.
+    {
+        ninfer::batch::RequestScheduler pages(4, /*total_pages=*/2, /*max_blocks=*/8,
+                                              /*chunk=*/8);
+        const auto prompt = [](int base, std::size_t count) {
+            std::vector<ninfer::TokenId> tokens(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                tokens[i] = static_cast<ninfer::TokenId>(base + static_cast<int>(i));
+            }
+            return tokens;
+        };
+        const std::uint64_t a = pages.submit(ninfer::batch::Request(0, prompt(1, 8), 1));
+        (void)pages.schedule_step(); // admits A (1 block), 1 page left
+        failures += check(pages.running() == 1 && pages.pool().free_pages() == 1,
+                          "first request did not take exactly one page");
+        // 100-token prompt needs ceil(101/16) = 7 blocks > 1 free page.
+        const std::uint64_t b = pages.submit(ninfer::batch::Request(0, prompt(300, 100), 1));
+        const ninfer::batch::StepPlan plan = pages.schedule_step();
+        failures += check(pages.running() == 1 && pages.waiting() == 1 &&
+                              pages.find_request(b) != nullptr &&
+                              pages.pool().free_pages() == 1,
+                          "page-exhausted request was admitted or leaked pages");
+        const ninfer::batch::Request* req_b = pages.find_request(b);
+        failures += check(req_b != nullptr && !req_b->seqs.empty() &&
+                              pages.find_request(a) != nullptr,
+                          "page-exhausted request lost its sequence");
+        if (req_b != nullptr && !req_b->seqs.empty()) {
+            const std::uint64_t seq_b = req_b->seqs.front().seq_id;
+            for (const auto& slice : plan.prefill) {
+                failures += check(slice.seq_id != seq_b,
+                                  "page-exhausted request leaked into a prefill slice");
+            }
+            failures += check(std::find(plan.decode_seq_ids.begin(), plan.decode_seq_ids.end(),
+                                        seq_b) == plan.decode_seq_ids.end(),
+                              "page-exhausted request leaked into decode");
+        }
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -3,11 +3,20 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <span>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ninfer {
+
+namespace batch {
+struct StepPlan;
+struct StepDispatch;
+} // namespace batch
 
 class PreparedPrompt {
 public:
@@ -100,6 +109,32 @@ public:
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
+
+    // Serve batch step (Committee A+B, single scheduler): one StepPlan ->
+    // one production forward over the dispatch ragged batch (embed at
+    // m == tokens.size(), causal_softmax_attention_ragged over the batch
+    // device view, EXL3 linear per layer, sample_decode_rows for decode rows
+    // only) through the Engine-owned single-slot forward context. Hook loop
+    // owns no TextContext/KV/GDN bytes; the scheduler owns page ids; Engine
+    // reads dispatch only.
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, TokenId>>
+    run_batch_step(const batch::StepPlan& plan, const batch::StepDispatch& dispatch);
+
+    // Serve helpers: prompt ids for scheduler admission (no Engine queue),
+    // plus host-side detokenization for pump-published deltas. The full
+    // thinking/reasoning/stop-string/tool-call policy stays in OutputSession
+    // (EngineCore path); this is the minimal pump text path.
+    [[nodiscard]] std::vector<TokenId> prompt_token_ids(const PreparedPrompt& prompt) const;
+    [[nodiscard]] std::string decode_tokens(std::span<const TokenId> ids) const;
+    [[nodiscard]] ResolvedSamplingParameters resolved_sampling(const PreparedPrompt& prompt,
+                                                               const RequestOptions& options) const;
+
+    // Serve mode guard: GenerationService sets this at construction. While
+    // set, submit() throws (serve admits via hook_loop EngineHooks::
+    // on_new_request and steps via run_batch_step; per-client generate
+    // loops are banned on the serve path). CLI never sets it, so generate()
+    // keeps working there.
+    void set_serve_mode(bool serve);
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

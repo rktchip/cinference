@@ -1,0 +1,5 @@
+src/batch/cinference_hooks.h:27
+src/batch/cinference_hooks.h:37
+src/batch/scheduler.h:21
+src/runtime/engine/engine_core.h:1543
+src/runtime/engine/scheduler.h:257

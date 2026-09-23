@@ -8,6 +8,9 @@
 #include <limits>
 #include <optional>
 #include <span>
+#ifdef _MSC_VER
+#include <intrin.h> // _umul128: exact 64x64->128 multiply (no unsigned __int128 on MSVC)
+#endif
 
 namespace ninfer::runtime {
 
@@ -36,15 +39,41 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
+    const unsigned long long p = prefix_tokens;
+    const unsigned long long s = suffix_tokens;
+#ifdef _MSC_VER
+    // MSVC has no unsigned __int128: _umul128 is exact for 64x64->128, and the
+    // observable result is identical (both paths clamp to u64 max below).
+    unsigned long long hi_lin = 0, hi_tri = 0;
+    const unsigned long long lo_lin = _umul128(p, s, &hi_lin);
+    // triangular = s*(s+1)/2 factored so neither factor product overflows 64
+    // before _umul128 sees it; s == u64max saturates (true value >> 2^64).
+    const bool tri_sat = (s == ~0ULL);
+    const unsigned long long fa = tri_sat ? 0ULL : ((s & 1ULL) ? s : s / 2ULL);
+    const unsigned long long fb = tri_sat ? 0ULL : ((s & 1ULL) ? (s + 1ULL) / 2ULL : s + 1ULL);
+    const unsigned long long lo_tri = tri_sat ? ~0ULL : _umul128(fa, fb, &hi_tri);
+    if (tri_sat) { hi_tri = 1ULL; }
+    const unsigned long long lo_sum = lo_lin + lo_tri;
+    const unsigned long long carry = (lo_sum < lo_lin ? 1ULL : 0ULL);
+    const unsigned long long hi_base = hi_lin + hi_tri;
+    const bool wrap1 = (hi_base < hi_lin); // 128-bit hi itself exceeds 64 bits
+    const unsigned long long hi_sum = hi_base + carry;
+    const bool wrap2 = (hi_sum < hi_base);
+    // True sum >= 2^64 iff the 128-bit high part is nonzero (wraps included).
+    const bool hi_nonzero = (hi_sum != 0ULL) || wrap1 || wrap2;
+    result.attention_pairs =
+        hi_nonzero ? ((std::numeric_limits<std::uint64_t>::max))() : static_cast<std::uint64_t>(lo_sum);
+#else
     const unsigned __int128 suffix      = suffix_tokens;
     const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
     const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
     constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
     const unsigned __int128 attention =
         triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
+    result.attention_pairs = attention > ((std::numeric_limits<std::uint64_t>::max))()
+                                 ? ((std::numeric_limits<std::uint64_t>::max))()
                                  : static_cast<std::uint64_t>(attention);
+#endif
     return result;
 }
 
@@ -161,7 +190,7 @@ struct LogicalOwnerKey {
 
 struct CatalogCapability {
     LogicalOwnerKey owner;
-    std::uint32_t slot       = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t slot       = ((std::numeric_limits<std::uint32_t>::max))();
     std::uint64_t generation = 0;
 
     [[nodiscard]] friend constexpr bool operator==(CatalogCapability,
@@ -169,14 +198,14 @@ struct CatalogCapability {
 };
 
 struct PlanningOwnerId {
-    std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t value = ((std::numeric_limits<std::uint32_t>::max))();
 
     [[nodiscard]] friend constexpr bool operator==(PlanningOwnerId,
                                                    PlanningOwnerId) noexcept = default;
 };
 
 struct PlanningCandidateId {
-    std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t value = ((std::numeric_limits<std::uint32_t>::max))();
 
     [[nodiscard]] friend constexpr bool operator==(PlanningCandidateId,
                                                    PlanningCandidateId) noexcept = default;

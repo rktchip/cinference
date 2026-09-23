@@ -245,6 +245,25 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
+    if (g.format == QType::EXL3) {
+        // EXL3 serve-startup path (single slot): the parent's data pointer
+        // borrows the process-store side-car (Exl3Weight, device trellis +
+        // suh/svh uploaded at Engine construction); there is no byte image
+        // to slice. Only whole-side-car views are servable: a partial region
+        // would silently serve the wrong rows, so it throws here instead.
+        if (region.begin != 0 ||
+            region.end - region.begin != weight_element_count(view.shape)) {
+            throw std::invalid_argument("EXL3 native Weight requires the whole side-car");
+        }
+        Weight out;
+        out.payload = region.parent->data;
+        out.qtype   = QType::EXL3;
+        out.layout  = QuantLayout::Contiguous;
+        out.ndim    = 2;
+        out.n = out.shape[0] = out.padded_shape[0] = dimension(view.shape[0]);
+        out.k = out.shape[1] = out.padded_shape[1] = dimension(view.shape[1]);
+        return out;
+    }
     Weight out;
     out.payload          = region.parent->data;
     out.payload_bytes    = g.bytes;

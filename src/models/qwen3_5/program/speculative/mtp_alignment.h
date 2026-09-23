@@ -24,7 +24,7 @@ struct MtpAlignmentWindow {
     if (columns == 0 || chunk_begin >= prompt_tokens || columns > prompt_tokens - chunk_begin) {
         throw std::invalid_argument("MTP alignment window is outside the prompt");
     }
-    if (chunk_begin == std::numeric_limits<std::uint32_t>::max()) {
+    if (chunk_begin == (std::numeric_limits<std::uint32_t>::max)()) {
         throw std::overflow_error("MTP shifted embedding position exceeds uint32");
     }
     return MtpAlignmentWindow{

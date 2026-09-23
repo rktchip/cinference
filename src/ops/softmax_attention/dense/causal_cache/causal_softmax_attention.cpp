@@ -5,6 +5,8 @@
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include "batch/batch.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -486,6 +488,128 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, stream);
+}
+
+void causal_softmax_attention_ragged(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& kv_table_rows, const batch::DeviceRaggedBatch& ragged,
+    const std::uint32_t* host_seq_offsets, AttentionHeadGeometry geometry, float scale,
+    PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "causal_softmax_attention_ragged";
+    // Serve batch path: the BatchDeviceBuffers gather output is mandatory.
+    // Null device tables are a fatal binding error, never a host-table
+    // fallback (the host compact matrix is empty on the device-gather path).
+    // Serve startup owns the fatal gate RequireDeviceBuffersForServe; this Op
+    // never calls it and never touches host tables.
+    if (ragged.seq_offsets == nullptr || ragged.block_tables == nullptr ||
+        host_seq_offsets == nullptr) {
+        throw std::invalid_argument(
+            std::string(op) + ": ragged serve batch requires device seq_offsets + block_tables");
+    }
+    require_causal_geometry(geometry, op);
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16 || v.dtype != DType::BF16 ||
+        out.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(op) + ": q/k/v/out must be BF16");
+    }
+    if (positions.dtype != DType::I32 || kv_table_rows.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": positions and KV table rows must be I32");
+    }
+    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
+        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
+    }
+    const std::uint32_t num_seqs   = ragged.num_seqs;
+    const std::uint32_t total      = ragged.total_tokens;
+    const std::uint32_t max_blocks = ragged.max_blocks;
+    if (num_seqs == 0 || num_seqs > static_cast<std::uint32_t>(kMaximumBatchSize) || total == 0 ||
+        max_blocks == 0) {
+        throw std::invalid_argument(std::string(op) + ": ragged descriptor is empty or oversized");
+    }
+    const std::int32_t q_heads  = geometry.query_heads;
+    const std::int32_t kv_heads = geometry.kv_heads;
+    const std::int32_t tokens   = q.ne[2];
+    if (tokens <= 0 || static_cast<std::uint32_t>(tokens) != total || q.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": flat q must be [D,Hq,T] with T == total");
+    }
+    require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
+    require_shape(k, kHeadDim, kv_heads, tokens, 1, op, "k");
+    require_shape(v, kHeadDim, kv_heads, tokens, 1, op, "v");
+    require_shape(positions, tokens, 1, 1, 1, op, "positions");
+    require_shape(kv_table_rows, static_cast<std::int32_t>(num_seqs), 1, 1, 1, op,
+                  "KV table rows");
+    require_shape(out, kHeadDim, q_heads, tokens, 1, op, "out");
+    require_contiguous_nonnull(q, op, "q");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    require_contiguous_nonnull(positions, op, "positions");
+    require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
+    require_contiguous_nonnull(out, op, "out");
+    if (cache.num_kv_heads != kv_heads) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
+    }
+    // Host span proof over the offsets mirror (no device copy, no host tables).
+    // This is the host counterpart of the device row search in
+    // batch::DeviceResolveRaggedToken (batch/batch.h): offsets[0]==0,
+    // non-decreasing, offsets[num_seqs]==T, and every row spans >= 1 live
+    // token, so each flat token resolves to exactly one row. Prefill rows span
+    // many tokens, decode rows exactly one: never uniform [W,B].
+    if (host_seq_offsets[0] != 0) {
+        throw std::invalid_argument(std::string(op) + ": seq offsets must start at 0");
+    }
+    std::uint32_t longest_span = 0;
+    for (std::uint32_t s = 0; s < num_seqs; ++s) {
+        const std::uint32_t begin = host_seq_offsets[s];
+        const std::uint32_t end   = host_seq_offsets[s + 1];
+        if (end < begin || end > total) {
+            throw std::invalid_argument(std::string(op) + ": seq offsets are not a partition");
+        }
+        const std::uint32_t span = end - begin;
+        if (span == 0) {
+            throw std::invalid_argument(std::string(op) + ": every ragged row spans >= 1 token");
+        }
+        longest_span = std::max(longest_span, span);
+    }
+    // Gathered-table header consistency (no dereference): the widest row must
+    // fit the gathered stride, and the widest span must fit the envelope, so a
+    // predictable failure can never strand a half-executed step.
+    if ((static_cast<std::uint64_t>(longest_span) + batch::kBatchPageTokens - 1) /
+            batch::kBatchPageTokens >
+        max_blocks) {
+        throw std::invalid_argument(std::string(op) + ": longest span exceeds gathered stride");
+    }
+    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    if (static_cast<std::uint64_t>(max_blocks) * batch::kBatchPageTokens > capacity) {
+        throw std::invalid_argument(std::string(op) + ": gathered stride exceeds cache capacity");
+    }
+    if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > capacity ||
+        envelope.max_visible_keys < longest_span) {
+        throw std::invalid_argument(std::string(op) + ": invalid execution envelope or span");
+    }
+    // Dispatch: exact-width per-row slices through the proven batch-1 path. No
+    // padding, no inert tails, no [W,B] reshape: each slice is dense over its
+    // own live span with all columns live (empty valid_columns). Row order
+    // matches the gathered device matrix row order, so this is numerically the
+    // fused ragged kernel with per-row launches; the fused kernel (reading
+    // view.seq_offsets + view.block_tables on-device via
+    // batch::DeviceResolveRaggedToken) is a launch-shape optimization, never a
+    // numerical change. Absolute positions ride the flat positions slice, so
+    // each row appends exactly its own K/V before it is observed.
+    for (std::uint32_t s = 0; s < num_seqs; ++s) {
+        const std::int32_t begin = static_cast<std::int32_t>(host_seq_offsets[s]);
+        const std::int32_t span  = static_cast<std::int32_t>(host_seq_offsets[s + 1]) -
+                                  static_cast<std::int32_t>(host_seq_offsets[s]);
+        const Tensor row_q         = q.slice(2, begin, span);
+        const Tensor row_k         = k.slice(2, begin, span);
+        const Tensor row_v         = v.slice(2, begin, span);
+        const Tensor row_positions = positions.slice(0, begin, span);
+        const Tensor row_table     = kv_table_rows.slice(0, static_cast<std::int32_t>(s), 1);
+        Tensor row_out             = out.slice(2, begin, span);
+        const Tensor dense_columns;
+        causal_softmax_attention(row_q, row_k, row_v, row_positions, dense_columns, row_table,
+                                 geometry, scale, cache, envelope, workspace, row_out, stream);
+    }
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,

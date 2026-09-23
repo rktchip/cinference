@@ -10,8 +10,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -20,6 +22,8 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+struct ServeRequestState;
+class ServeHookLoop;
 
 struct GenerationMetrics {
     double prepare_seconds         = 0.0;
@@ -79,7 +83,16 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
-    ninfer::GenerationHandle generation;
+    // Committee A+B single-scheduler admission (no Engine queue). The owning
+    // prompt reaches the Engine ONLY through engine_->prepare (tokenize, no
+    // enqueue); scheduler membership comes from hook_loop submit_inbox (ONE
+    // RequestScheduler), and run() pumps schedule -> dispatch ->
+    // Engine::run_batch_step -> on_step_done. No GenerationHandle exists on
+    // this path (serve-mode Engine::submit throws). Single-use: consumed
+    // exactly once by run().
+    std::shared_ptr<ServeRequestState> stream_state;
+    std::uint64_t req_id         = 0;
+    std::uint32_t max_new_tokens = 0;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
@@ -95,8 +108,21 @@ struct PreparedRequest {
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    // Defined in generation_service.cpp: ServeHookLoop is complete there.
+    ~GenerationService();
+
+    GenerationService(const GenerationService&)            = delete;
+    GenerationService& operator=(const GenerationService&) = delete;
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+
+    // Process-lifetime S1 loop binding (one RequestScheduler plus its
+    // EngineHooks, sized from ServeOptions). Shared by every HTTP request on
+    // this process: prepare() mutates no scheduler state and run() consumes
+    // only its own single-use PreparedRequest, so two different prompts
+    // admitted here stream through the one loop.
+    [[nodiscard]] ServeHookLoop& hook_loop() noexcept { return *hook_loop_; }
+    [[nodiscard]] const ServeHookLoop& hook_loop() const noexcept { return *hook_loop_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.
@@ -118,6 +144,11 @@ public:
         return engine_->sampling_defaults();
     }
 
+    // Tokenize and handle media only; mutates no scheduler state. Admission
+    // passes through hook_loop() first (throw_if_pages_exhausted, Overloaded
+    // -> HTTP 429) and then submits to the Engine; the returned request keeps
+    // its ingress/response lifetime reservation until the HTTP response is
+    // released and is consumed exactly once by run().
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           ninfer::GenerationObservationOptions observation = {},
@@ -126,10 +157,17 @@ public:
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
-    // Consumes prepared.generation. A PreparedRequest is single-use.
+    // Consumes prepared.stream_state. A PreparedRequest is single-use.
+    // S1 run path: the owning prompt passed the hook_loop admission gate at
+    // submit time; run() pumps schedule_step -> dispatch_step -> on_step_done
+    // itself and publishes decoded tokens per seq_id to the sink with no
+    // full-answer buffer. The enqueue-only handle is released unconsumed so
+    // this pump is the single driver.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    // One warmup pass per process lifetime (EXL3 weights already loaded once
+    // by Engine construction). Re-entry is a no-op via ensure_warmed_once.
     void warmup();
 
 private:
@@ -154,6 +192,19 @@ private:
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // Process-lifetime S1 loop binding. Built once in the constructor next to
+    // the EXL3-loaded Engine; never rebuilt per request.
+    std::unique_ptr<ServeHookLoop> hook_loop_;
+    // Slot A pump mutex: serializes the run() schedule_step -> dispatch_step
+    // -> on_step_done triplet so two HTTP threads sharing this scheduler
+    // cannot double-schedule one step. Dedicated to the pump; never
+    // warmup_mutex_ (that one guards only the once-gate in ServeHookLoop).
+    std::mutex pump_mutex_;
+    // Slot A idle backoff: signaled by the prepare/submit path after every
+    // engine_->submit so an idle pump wakes the moment new work arrives.
+    // Mutable: prepare_impl() notifies from a const path.
+    mutable std::mutex idle_mutex_;
+    mutable std::condition_variable idle_cv_;
 };
 
 } // namespace ninfer::serve

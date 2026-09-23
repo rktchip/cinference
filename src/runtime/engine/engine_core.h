@@ -267,6 +267,19 @@ public:
         } catch (...) {}
     }
 
+    // B2 lane flag: explicit opt-in for the legacy single-lane step loop
+    // (CLI single-request compat). Default false = batch mode: steps run
+    // through batch::EngineHooks::dispatch_step (one StepPlan -> one
+    // RaggedBatch -> one forward, m = tokens.size()) and this core never
+    // calls Scheduler::set_prefill_lane on the batch path.
+    void set_legacy_single_lane(bool enable) noexcept {
+        legacy_single_lane_.store(enable, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool legacy_single_lane() const noexcept {
+        return legacy_single_lane_.load(std::memory_order_relaxed);
+    }
+
 private:
     enum class HostWorkClass : std::uint8_t {
         Decode,
@@ -1540,7 +1553,16 @@ private:
                     slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
                     materializing_.reset();
-                    scheduler_.set_prefill_lane(lane);
+                    // B2 lane gate: batch-mode steps route via
+                    // batch::EngineHooks::dispatch_step (one StepPlan -> one
+                    // RaggedBatch -> one forward, m = tokens.size()) and must
+                    // never claim the legacy single staged-prefill lane. Only
+                    // the explicit legacy_single_lane path (CLI single-request
+                    // compat) may own it, so dispatch_step stays the sole
+                    // batch-path route.
+                    if (legacy_single_lane_.load(std::memory_order_relaxed)) {
+                        scheduler_.set_prefill_lane(lane);
+                    }
                     request_admission_check();
                     publish_runtime_stats();
                     return AdmissionProgress::ControlProgress;
@@ -1935,6 +1957,46 @@ private:
         publish_runtime_stats();
     }
 
+    // B2 legacy lane: the old single-lane step loop, kept compiled for CLI
+    // single-request compat. Batch-mode steps must never enter here; they run
+    // through batch::EngineHooks::dispatch_step (one StepPlan -> one
+    // RaggedBatch -> one forward, m = tokens.size()). Runs only when
+    // set_legacy_single_lane(true) opted in (see worker_loop gate below).
+    // Returns true when a Prefill/Decode unit ran (caller skips the idle
+    // wait, as the old loop did); false on Wait so the caller idles.
+    [[nodiscard]] bool step_legacy_single_lane(
+        const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+        HostPhaseMeasurement& boundary, bool& previous_unit_was_decode) {
+        RoundMembership membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+
+        bool prefill_runnable = false;
+        if (const auto lane = scheduler_.prefill_lane(); lane) {
+            if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
+                throw std::logic_error("prefill owner has no active Engine request");
+            }
+            prefill_runnable = !slots_[*lane]->capture_pending;
+        }
+        const ExecutionAction action = scheduler_.choose_execution(
+            !membership.empty(), prefill_runnable, previous_unit_was_decode);
+        if (action == ExecutionAction::Prefill) {
+            set_host_work_class(HostWorkClass::Prefill);
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            run_prefill_step(cancelled_at_unit_start);
+            previous_unit_was_decode = false;
+            return true;
+        }
+        if (action == ExecutionAction::Decode) {
+            set_host_work_class(HostWorkClass::Decode, membership.lane_span());
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            run_decode_round(membership, cancelled_at_unit_start);
+            previous_unit_was_decode = true;
+            return true;
+        }
+        set_host_work_class(HostWorkClass::Control);
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        return false;
+    }
+
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
         for (;;) {
@@ -1996,31 +2058,27 @@ private:
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
-                bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
-                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
-                        throw std::logic_error("prefill owner has no active Engine request");
+                // B2 lane gate: batch mode (default) never enters the legacy
+                // single-lane loop; steps are driven by ServeHookLoop via
+                // batch::EngineHooks::dispatch_step (one StepPlan -> one
+                // RaggedBatch, m = tokens.size()) plus runtime::
+                // run_step_forward (one forward for ANY plan mix, exactly one
+                // attn_ragged + one exl3_dispatch per layer, decoded pairs
+                // out via slot-C sample_decode_rows). The worker performs
+                // admission/transaction maintenance only and never calls
+                // Scheduler::set_prefill_lane on the batch path; rows are
+                // never reshaped to [W,B]. The old loop stays compiled in
+                // step_legacy_single_lane for CLI single-request compat and
+                // runs only after set_legacy_single_lane(true).
+                if (legacy_single_lane_.load(std::memory_order_relaxed)) {
+                    if (step_legacy_single_lane(cancelled_at_unit_start, boundary,
+                                                previous_unit_was_decode)) {
+                        continue;
                     }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
-                }
-                const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
-                if (action == ExecutionAction::Prefill) {
-                    set_host_work_class(HostWorkClass::Prefill);
+                } else {
+                    set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
-                    previous_unit_was_decode = false;
-                    continue;
                 }
-                if (action == ExecutionAction::Decode) {
-                    set_host_work_class(HostWorkClass::Decode, membership.lane_span());
-                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_decode_round(membership, cancelled_at_unit_start);
-                    previous_unit_was_decode = true;
-                    continue;
-                }
-                set_host_work_class(HostWorkClass::Control);
-                finish_engine_phase(boundary, EngineHostPhase::Boundary);
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
@@ -2065,6 +2123,10 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    // B2 lane flag: false (default) = batch mode, steps run through
+    // batch::EngineHooks::dispatch_step and set_prefill_lane is never called
+    // on the batch path; true = legacy single-lane loop (CLI compat only).
+    std::atomic<bool> legacy_single_lane_{false};
     std::thread worker_;
 };
 

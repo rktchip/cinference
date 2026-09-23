@@ -3,6 +3,8 @@
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/launcher/silu_and_mul.h"
+#include "ops/linear/exl3/exl3_op.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
@@ -55,6 +57,14 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::EXL3 && gate_up_rows == 34816 && input_rows == 5120) {
+        // EXL3 serve-startup path (single slot): fused gate_up temp plus
+        // the fused dispatch scratch, mirroring the dispatch below.
+        return static_cast<std::size_t>(34816) * static_cast<std::size_t>(max_tokens) *
+                   sizeof(std::uint16_t) +
+               detail::exl3_linear_workspace_capacity_bytes(gate_up_rows, input_rows, policy,
+                                                            min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -104,7 +114,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
+    const bool exl3_weight  = large_shape && gate_up_weight.qtype == QType::EXL3 &&
+                              gate_up_weight.layout == QuantLayout::Contiguous &&
+                              gate_up_weight.ndim == 2 && gate_up_weight.payload != nullptr;
+    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !exl3_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
@@ -117,6 +130,20 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
+    }
+
+    // EXL3 serve-startup path (single slot): the fused gate_up trellis is
+    // tiled, not row-sliceable, so the GEMM lands in a workspace temp and
+    // the SiLU-gated halves fold into out (same slices ffn.cpp uses on the
+    // MTP path).
+    if (exl3_weight) {
+        auto scope  = ws.scope();
+        Tensor full = ws.alloc(DType::BF16, {34816, t});
+        detail::exl3_dispatch(x, gate_up_weight, full, policy, &ws, stream);
+        Tensor gate = full.slice(0, 0, 17408);
+        Tensor up   = full.slice(0, 17408, 17408);
+        detail::silu_and_mul_launch(gate, up, out, stream);
         return;
     }
 

@@ -1,0 +1,17 @@
+# Vendored cuda-exl3 file record (criterion 7 vehicle).
+# Byte-copied from C:/src/cuda-exl3/src/cuda_exl3/csrc/ 2026-09-22.
+# PRISTINE = byte-identical to upstream; MODIFIED notes the seam change.
+# Re-verify: sha256sum -c VENDORED_SHA256.txt
+# exl3_common.cuh PRISTINE
+d0a2bfa9116f9b665be370efd8e3d5b631cc70eb71ca8e5528cc386d3862f244 *exl3_common.cuh
+# exl3_codebook.cuh PRISTINE
+e2ab085ce1a02a6c7dbeace6030939232ab4dc7bb65ab57574ec4fcbcaba6a40 *exl3_codebook.cuh
+# exl3_dq.cuh PRISTINE
+b779d1d04f346706b3db48f66fd35b87143e2ab27d531b6a954d3ccd8582ce37 *exl3_dq.cuh
+# exl3_had.cuh MODIFIED: had_hybrid_mul1/mul2 + 10 scale sites (pristine was dfa6f331)
+91eb9ae3ee0dcbf092f504c647632a05746b6133b80e2c43b46864396e96309e *exl3_had.cuh
+# exl3_gemm.cu MODIFIED: ATen stripped, raw rows, v3_capturing, de-inlined
+# pick_split, exl3_gemm_rows multi-shard entry (2026-09-22)
+9d7c9c5d11aa323e869dabfb9f04c221b81c40f90e62ca49231d47f0d5400ae5 *exl3_gemm.cu
+# exl3_hadamard.cu MODIFIED: ATen stripped, raw rows
+63255fac861851585d2842e40758f826be79a612c9e3d98472cdaeafa710a161 *exl3_hadamard.cu

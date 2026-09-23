@@ -1,0 +1,3 @@
+src/models/qwen3_5/execution/text.cpp:887
+src/models/qwen3_5/execution/text.cpp:910
+src/models/qwen3_5/execution/text.h:244

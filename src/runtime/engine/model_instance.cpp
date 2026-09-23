@@ -1,9 +1,11 @@
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/exl3_program.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "ops/linear/exl3/exl3_bind.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +21,8 @@ void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
-    if (options.artifact_path.extension() != ".ninfer") {
+    if (options.artifact_path.extension() != ".ninfer" &&
+        !ninfer::exl3::exl3_is_exl3_checkpoint_dir(options.artifact_path.string())) {
         throw std::invalid_argument("NInfer accepts only .ninfer artifacts");
     }
     if (options.max_context == 0) {
@@ -154,19 +157,56 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device) {
+    // EXL3 serve-startup branch (LINUX-ONLY deployment for device upload):
+    // an HF EXL3 checkpoint directory (quantization_config.json +
+    // model.safetensors.index.json + shards) is detected here, on the Engine
+    // construction path, before the .ninfer Reader runs. The binder name-map
+    // (ninfer::exl3::exl3_plan_fusion, src/ops/linear/exl3/exl3_bind.h) maps
+    // HF tensor_storage groups to logical .ninfer linears, fusing self_attn
+    // q/k/v into attention/qkv (groups=3) and mlp gate/up into mlp/gate_up
+    // (groups=2) so fused layers serve multi-group one-launch via the v3
+    // fused multi row; everything else (including K5 o_proj and K6 lm_head)
+    // stays dense groups=1 and routes via v3 as today. build_exl3_model
+    // (runtime/engine/exl3_program.cpp) loads the packed trellis/suh/svh +
+    // codebook-scalar side-cars into the process-lifetime Exl3EngineStore and
+    // binds the qwen3_5 text program against them (EXL3 linears by logical
+    // name, norms/biases/embedding resident from the safetensors shards);
+    // per-(m,K) routing stays in detail::exl3_dispatch and is not duplicated
+    // here. The shared tail below (frontend, planner, program) then runs
+    // unchanged: the Model carries the same BoundWeight/WeightId contract as
+    // the artifact path, with parameters.cpp resolving the fused Singles.
+    Exl3ModelBundle exl3_bundle;
+    const bool use_exl3 =
+        ninfer::exl3::exl3_is_exl3_checkpoint_dir(options.artifact_path.string());
+    if (use_exl3) {
+        exl3_bundle = build_exl3_model(options, device);
+    }
     validate_options(options);
     const auto start = Clock::now();
-    StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    artifact::Reader reader(options.artifact_path);
-    inspect.complete();
-    StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
-    binding.complete();
-    auto model =
-        models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
+    std::unique_ptr<models::qwen3_5::Model> model;
+    if (use_exl3) {
+        // Inspect/plan phases are satisfied inside build_exl3_model (store
+        // upload, config parse, shard binding); the scopes keep the observer
+        // timeline consistent with the artifact path.
+        StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
+        StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
+        model = std::move(exl3_bundle.model);
+        binding.complete();
+        inspect.complete();
+    } else {
+        StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
+        artifact::Reader reader(options.artifact_path);
+        inspect.complete();
+        StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
+        auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+        binding.complete();
+        model =
+            models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
+    }
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    instance->exl3_backing = std::move(exl3_bundle.backing);
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);

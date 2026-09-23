@@ -11,6 +11,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ninfer::batch {
+struct DeviceRaggedBatch;
+} // namespace ninfer::batch
+
 namespace ninfer::ops {
 
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
@@ -139,6 +143,41 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream);
+
+/**
+ * Ragged serve-batch form of causal_softmax_attention (E2 bind).
+ *
+ * q/k/v/out are contiguous BF16 FLAT token-major tensors: q/out [D,Hq,T],
+ * k/v [D,Hkv,T] with T == ragged.total_tokens (the exact live-token count,
+ * never padded). positions is contiguous device I32 [T] holding absolute
+ * positions in flat token order. kv_table_rows is contiguous device I32
+ * [num_seqs] with execution-table rows in ragged row order. No [W,B]
+ * dense/masked topology is required: row s spans the variable token range
+ * [offsets[s],offsets[s+1]) where offsets is the device-exclusive prefix sum
+ * in ragged.seq_offsets (prefill rows span many tokens, decode rows one).
+ *
+ * ragged carries the BatchDeviceBuffers gather output: ragged.seq_offsets
+ * ([num_seqs+1] device U32) and ragged.block_tables ([num_seqs x max_blocks]
+ * device I32, -1 padded). Both device pointers must be non-null; a null
+ * device table is a fatal binding error, never a host-table fallback: the
+ * host compact matrix does not exist on the device-gather path, and serve
+ * startup must have passed RequireDeviceBuffersForServe (owned by the serve
+ * swarm; this Op never calls it). host_seq_offsets is the host mirror of the
+ * offsets ([num_seqs+1] entries, offsets[0]==0) used for span validation
+ * without any device-to-host copy.
+ *
+ * Token-to-(sequence,page) resolution authority is batch::ResolveRaggedToken
+ * on the host mirror and batch::DeviceResolveRaggedToken on the device
+ * (batch/batch.h). Geometry, scale, cache, envelope, alias, and workspace
+ * rules match causal_softmax_attention; each row appends its K/V slice
+ * before it is observed, so the shared numerical oracle holds per row.
+ */
+void causal_softmax_attention_ragged(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& kv_table_rows, const batch::DeviceRaggedBatch& ragged,
+    const std::uint32_t* host_seq_offsets, AttentionHeadGeometry geometry, float scale,
+    PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/execution/ladder_trace.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
@@ -7,6 +8,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "ops/linear/exl3/exl3_op.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
@@ -42,6 +44,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -242,7 +247,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
       batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
-        prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        prefill_chunk_ > static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
@@ -709,6 +714,351 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     work_.reset();
 }
 
+std::vector<std::pair<std::uint64_t, TokenId>> TextContext::sample_decode_rows(
+    const Tensor& hidden, const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+    cudaStream_t stream) {
+    const std::size_t n_dec = plan.decode_seq_ids.size();
+    if (n_dec == 0) { return {}; }
+    if (lm_head_ == nullptr) {
+        throw std::logic_error("sample_decode_rows requires a bound lm_head");
+    }
+    if (n_dec > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())) {
+        throw std::invalid_argument("sample_decode_rows decode count overflows int32");
+    }
+    const std::size_t n_pref_seqs = plan.prefill.size();
+    const std::size_t num_seqs    = batch.num_seqs();
+    if (n_pref_seqs + n_dec != num_seqs) {
+        throw std::logic_error("sample_decode_rows plan/batch sequence count mismatch");
+    }
+    if (batch.seq_offsets.size() != num_seqs + 1 || batch.seq_ids.size() != num_seqs) {
+        throw std::logic_error("sample_decode_rows ragged offsets/ids are inconsistent");
+    }
+    if (batch.seq_offsets[0] != 0) {
+        throw std::logic_error("sample_decode_rows ragged offsets must start at 0");
+    }
+    // Prefill block first in plan order: row s must carry plan.prefill[s].
+    for (std::size_t s = 0; s < n_pref_seqs; ++s) {
+        if (batch.seq_ids[s] != plan.prefill[s].seq_id) {
+            throw std::logic_error("sample_decode_rows prefill row seq_id mismatch");
+        }
+        if (batch.seq_offsets[s + 1] < batch.seq_offsets[s] ||
+            batch.seq_offsets[s + 1] - batch.seq_offsets[s] != plan.prefill[s].count) {
+            throw std::logic_error("sample_decode_rows prefill row span mismatch");
+        }
+    }
+    const std::uint32_t prefill_tokens = batch.seq_offsets[n_pref_seqs];
+    // Decode rows follow: each is exactly one token and must carry the
+    // matching plan.decode_seq_ids entry. Prefill columns [0, prefill_tokens)
+    // are verified here and never projected or sampled below.
+    for (std::size_t i = 0; i < n_dec; ++i) {
+        const std::size_t s = n_pref_seqs + i;
+        if (batch.seq_ids[s] != plan.decode_seq_ids[i]) {
+            throw std::logic_error("sample_decode_rows decode row seq_id mismatch");
+        }
+        if (batch.seq_offsets[s + 1] != batch.seq_offsets[s] + 1) {
+            throw std::logic_error("sample_decode_rows decode row must span exactly one token");
+        }
+    }
+    if (batch.tokens.size() != batch.seq_offsets[num_seqs]) {
+        throw std::logic_error("sample_decode_rows ragged token count mismatch");
+    }
+    const std::uint64_t total_needed = static_cast<std::uint64_t>(prefill_tokens) + n_dec;
+    if (total_needed >
+        static_cast<std::uint64_t>((std::numeric_limits<std::int32_t>::max)())) {
+        throw std::invalid_argument("sample_decode_rows token range overflows int32");
+    }
+    const std::int32_t hidden_dim = dimension(config_.hidden_size);
+    if (hidden.dtype != DType::BF16 || hidden.ne[0] != hidden_dim || hidden.ne[2] != 1 ||
+        hidden.ne[3] != 1 || !hidden.is_contiguous() || hidden.data == nullptr ||
+        hidden.ne[1] < static_cast<std::int32_t>(total_needed)) {
+        throw std::invalid_argument("sample_decode_rows hidden must be contiguous BF16 [H,T]");
+    }
+
+    const std::int32_t first_col = static_cast<std::int32_t>(prefill_tokens);
+    const std::int32_t ndec_cols = static_cast<std::int32_t>(n_dec);
+    const std::int32_t vocab     = dimension(config_.vocab_size);
+    const std::int32_t domain    = dimension(parameters_.model.resources().public_token_count);
+    if (vocab <= 0 || domain <= 0 || domain > vocab) {
+        throw std::logic_error("sample_decode_rows vocabulary domain is invalid");
+    }
+
+    auto arena_scope = work_.scope();
+    // Decode-only window: prefill columns [0, prefill_tokens) are excluded by
+    // construction, never the old prefill tail (last-column) slice.
+    Tensor dec_h  = hidden.slice(1, first_col, ndec_cols);
+    Tensor logits = work_.alloc(DType::BF16, {vocab, ndec_cols});
+    project(dec_h, *lm_head_, logits, work_, stream);
+    ladder::ladder_dump(logits, "logits", -1, stream);
+    Tensor out = work_.alloc(DType::I32, {ndec_cols});
+    if (sampling_config_ != nullptr) {
+        // One B=1 sample per decode row against the shared device config.
+        // Logical positions are the flat decode-row indices: unique per row
+        // so shared-seed stochastic rows draw independently.
+        std::vector<std::int32_t> host_positions(n_dec);
+        for (std::size_t i = 0; i < n_dec; ++i) {
+            host_positions[i] = first_col + static_cast<std::int32_t>(i);
+        }
+        Tensor positions = work_.alloc(DType::I32, {ndec_cols});
+        copy_i32(host_positions.data(), positions, stream);
+        for (std::size_t i = 0; i < n_dec; ++i) {
+            const std::int32_t col = static_cast<std::int32_t>(i);
+            Tensor logits_row   = logits.slice(1, col, 1);
+            Tensor out_row      = out.slice(0, col, 1);
+            Tensor position_row = positions.slice(0, col, 1);
+            ops::sample(logits_row, out_row, domain, sampling_config_, position_row,
+                        ops::kSamplePurposeDecode, work_, stream);
+        }
+    } else {
+        ops::argmax(logits, out, domain, stream);
+    }
+    std::vector<TokenId> host_tokens(n_dec);
+    CUDA_CHECK(cudaMemcpyAsync(host_tokens.data(), out.data,
+                               n_dec * sizeof(TokenId), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // DIAGNOSTIC-ONLY trace (env-gated, no numeric effect): per-decode-row
+    // top-8 logits + distribution stats; optional full-domain u16 append to
+    // NINFER_LOGITS_DUMP_PATH for offline solo-vs-mixed maxAbs. Reads the
+    // already-projected logits; never writes device state.
+    if (std::getenv("NINFER_LOGITS_DUMP") != nullptr) {
+        const std::size_t dump_elems = static_cast<std::size_t>(vocab) * n_dec;
+        std::vector<std::uint16_t> dump_host(dump_elems);
+        CUDA_CHECK(cudaMemcpyAsync(dump_host.data(), logits.data,
+                                   dump_elems * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (std::size_t dump_i = 0; dump_i < n_dec; ++dump_i) {
+            const std::uint16_t* dump_col =
+                dump_host.data() + dump_i * static_cast<std::size_t>(vocab);
+            const std::size_t dump_srow = n_pref_seqs + dump_i;
+            const TokenId dump_in_tok = batch.tokens[batch.seq_offsets[dump_srow]];
+            int dump_top_id[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+            float dump_top_val[8];
+            for (int dump_k = 0; dump_k < 8; ++dump_k) {
+                dump_top_val[dump_k] = -std::numeric_limits<float>::infinity();
+            }
+            float dump_max = -std::numeric_limits<float>::infinity();
+            double dump_sum = 0.0;
+            long dump_nan = 0;
+            for (std::int32_t dump_v = 0; dump_v < domain; ++dump_v) {
+                const std::uint32_t dump_bits =
+                    static_cast<std::uint32_t>(dump_col[dump_v]) << 16;
+                float dump_x = 0.0F;
+                std::memcpy(&dump_x, &dump_bits, sizeof(dump_x));
+                if (dump_x != dump_x) { ++dump_nan; continue; }
+                dump_sum += static_cast<double>(dump_x);
+                if (dump_x > dump_max) { dump_max = dump_x; }
+                for (int dump_k = 0; dump_k < 8; ++dump_k) {
+                    if (dump_x > dump_top_val[dump_k] ||
+                        (dump_x == dump_top_val[dump_k] && dump_v < dump_top_id[dump_k])) {
+                        for (int dump_j = 7; dump_j > dump_k; --dump_j) {
+                            dump_top_val[dump_j] = dump_top_val[dump_j - 1];
+                            dump_top_id[dump_j] = dump_top_id[dump_j - 1];
+                        }
+                        dump_top_val[dump_k] = dump_x;
+                        dump_top_id[dump_k] = dump_v;
+                        break;
+                    }
+                }
+            }
+            double dump_lse_shift = 0.0;
+            for (std::int32_t dump_v = 0; dump_v < domain; ++dump_v) {
+                const std::uint32_t dump_bits =
+                    static_cast<std::uint32_t>(dump_col[dump_v]) << 16;
+                float dump_x = 0.0F;
+                std::memcpy(&dump_x, &dump_bits, sizeof(dump_x));
+                if (dump_x != dump_x) { continue; }
+                dump_lse_shift += std::exp(static_cast<double>(dump_x - dump_max));
+            }
+            const double dump_lse = static_cast<double>(dump_max) + std::log(dump_lse_shift);
+            const double dump_mean_logprob = dump_sum / static_cast<double>(domain) - dump_lse;
+            float dump_samp_logit = std::numeric_limits<float>::quiet_NaN();
+            if (host_tokens[dump_i] >= 0 && host_tokens[dump_i] < domain) {
+                const std::uint32_t dump_bits =
+                    static_cast<std::uint32_t>(dump_col[host_tokens[dump_i]]) << 16;
+                std::memcpy(&dump_samp_logit, &dump_bits, sizeof(dump_samp_logit));
+            }
+            std::fprintf(stderr,
+                         "[logits-dump] seq=%llu col=%zu in_tok=%d first_col=%d ndec=%d "
+                         "vocab=%d domain=%d tok=%d nan=%ld "
+                         "top8=%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f,%d:%.4f "
+                         "max=%.4f meanlogp=%.4f samplogit=%.4f\n",
+                         (unsigned long long)plan.decode_seq_ids[dump_i], dump_i,
+                         (int)dump_in_tok, first_col, ndec_cols, vocab, domain,
+                         (int)host_tokens[dump_i], dump_nan,
+                         dump_top_id[0], (double)dump_top_val[0],
+                         dump_top_id[1], (double)dump_top_val[1],
+                         dump_top_id[2], (double)dump_top_val[2],
+                         dump_top_id[3], (double)dump_top_val[3],
+                         dump_top_id[4], (double)dump_top_val[4],
+                         dump_top_id[5], (double)dump_top_val[5],
+                         dump_top_id[6], (double)dump_top_val[6],
+                         dump_top_id[7], (double)dump_top_val[7],
+                         (double)dump_max, dump_mean_logprob, (double)dump_samp_logit);
+            std::fflush(stderr);
+            const char* dump_path = std::getenv("NINFER_LOGITS_DUMP_PATH");
+            if (dump_path != nullptr && dump_path[0] != 0) {
+                std::FILE* dump_fp = std::fopen(dump_path, "ab");
+                if (dump_fp != nullptr) {
+                    std::fprintf(dump_fp, "SEQ %llu COL %zu INTOK %d FIRSTCOL %d NDEC %d DOMAIN %d TOK %d\n",
+                                 (unsigned long long)plan.decode_seq_ids[dump_i], dump_i,
+                                 (int)dump_in_tok, first_col, ndec_cols, domain,
+                                 (int)host_tokens[dump_i]);
+                    std::fwrite(dump_col, sizeof(std::uint16_t),
+                                static_cast<std::size_t>(domain), dump_fp);
+                    std::fclose(dump_fp);
+                } else {
+                    std::fprintf(stderr, "[logits-dump] WARN cannot append %s\n", dump_path);
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
+    std::vector<std::pair<std::uint64_t, TokenId>> decoded;
+    decoded.reserve(n_dec);
+    for (std::size_t i = 0; i < n_dec; ++i) {
+        decoded.emplace_back(plan.decode_seq_ids[i], host_tokens[i]);
+    }
+    return decoded;
+}
+
+std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
+    const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+    const batch::DeviceRaggedBatch& ragged, const std::uint32_t* host_seq_offsets,
+    const std::int32_t* row_slots, ServeStepTensors& tensors,
+    ops::CausalAttentionExecutionEnvelope envelope) {
+    const std::size_t n_dec    = plan.decode_seq_ids.size();
+    const std::size_t n_pref   = plan.prefill.size();
+    const std::size_t num_seqs = batch.num_seqs();
+    if (num_seqs == 0 || n_pref + n_dec != num_seqs) {
+        throw std::logic_error("forward_serve_step plan/batch sequence count mismatch");
+    }
+    const std::uint64_t total = batch.tokens.size();
+    if (total == 0 ||
+        total > static_cast<std::uint64_t>((std::numeric_limits<std::int32_t>::max)())) {
+        throw std::invalid_argument("forward_serve_step token count out of range");
+    }
+    if (host_seq_offsets == nullptr || row_slots == nullptr) {
+        throw std::invalid_argument("forward_serve_step requires host offsets and row slots");
+    }
+    for (std::size_t r = 0; r < num_seqs; ++r) {
+        if (row_slots[r] < 0) {
+            throw std::invalid_argument("forward_serve_step requires a bound slot per ragged row");
+        }
+    }
+    const std::int32_t T    = static_cast<std::int32_t>(total);
+    const std::int32_t nseq = static_cast<std::int32_t>(num_seqs);
+    const std::int32_t ndec = static_cast<std::int32_t>(n_dec);
+    require_tensor_shape(tensors.ids, DType::I32, {T}, "serve step ids");
+    require_tensor_shape(tensors.cache_positions, DType::I32, {T}, "serve step cache positions");
+    require_tensor_shape(tensors.rope_positions, DType::I32, {T}, "serve step rope positions");
+    require_tensor_shape(tensors.kv_table_rows, DType::I32, {nseq}, "serve step KV rows");
+    require_tensor_shape(tensors.hidden, DType::BF16, {dimension(config_.hidden_size), T},
+                         "serve step hidden");
+    if (ndec > 0) {
+        require_tensor_shape(tensors.decode_source_slots, DType::I32, {ndec},
+                             "serve step decode source slots");
+        require_tensor_shape(tensors.decode_destination_slots, DType::I32, {ndec},
+                             "serve step decode destination slots");
+    }
+    if (config_.layer_types.size() != parameters_.text.layers.size()) {
+        throw std::logic_error("forward_serve_step layer inventory is inconsistent");
+    }
+    const std::int32_t prefill_tokens = static_cast<std::int32_t>(host_seq_offsets[n_pref]);
+
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    set_ragged_batch(&ragged, host_seq_offsets);
+    {
+        ScopedPositions cache_binding(active_cache_positions_, tensors.cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, tensors.rope_positions);
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &tensors.kv_table_rows);
+
+        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), T});
+        ops::embedding(tensors.ids, *embed_, x, stream);
+        ladder::ladder_dump(x, "embed", -1, stream);
+        ladder::ladder_dump_raw(x, "bisect_embed", -1, stream);
+        for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+            const auto& block = parameters_.text.layers[layer];
+            const bool full   = config_.layer_types[layer] == MixerKind::FullAttention;
+            const auto compact = dimension(config_.compact_layer_indices[layer]);
+            try {
+                if (layer <= 1) {
+                    ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_in" : "bisect_b1_in",
+                                            static_cast<int>(layer), stream);
+                }
+                {
+                    auto scope = work_.scope();
+                    if (full) {
+                        attn_mix(block, x, compact, Phase::Verify);
+                    } else {
+                        // GDN rows: one Prefill-phase update per prefill row
+                        // over its slice with its persistent slot, then one
+                        // width-1 Verify batch over the decode suffix.
+                        if (n_pref > 0) {
+                            ScopedValue<std::int32_t> batch_off(active_sequence_batch_, 0);
+                            ScopedValue<std::int32_t> width_off(active_sequence_width_, 0);
+                            ScopedValue<const Tensor*> src_off(active_linear_state_source_slots_,
+                                                               nullptr);
+                            ScopedValue<const Tensor*> dst_off(
+                                active_linear_state_destination_slots_, nullptr);
+                            for (std::size_t r = 0; r < n_pref; ++r) {
+                                const std::int32_t begin =
+                                    static_cast<std::int32_t>(host_seq_offsets[r]);
+                                const std::int32_t span =
+                                    static_cast<std::int32_t>(host_seq_offsets[r + 1]) - begin;
+                                if (span <= 0) {
+                                    throw std::logic_error(
+                                        "forward_serve_step ragged row is empty");
+                                }
+                                set_linear_state_slots(row_slots[r], row_slots[r]);
+                                Tensor xs = x.slice(1, begin, span);
+                                gdn_mix(block, xs, compact, Phase::Prefill);
+                            }
+                        }
+                        if (ndec > 0) {
+                            ScopedValue<const Tensor*> src_on(active_linear_state_source_slots_,
+                                                              &tensors.decode_source_slots);
+                            ScopedValue<const Tensor*> dst_on(
+                                active_linear_state_destination_slots_,
+                                &tensors.decode_destination_slots);
+                            ScopedValue<std::int32_t> batch_on(active_sequence_batch_, ndec);
+                            ScopedValue<std::int32_t> width_on(active_sequence_width_, 1);
+                            Tensor xd = x.slice(1, prefill_tokens, ndec);
+                            gdn_mix(block, xd, compact, Phase::Verify);
+                        }
+                    }
+                }
+                if (layer <= 1) {
+                    ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_attn" : "bisect_b1_attn",
+                                            static_cast<int>(layer), stream);
+                }
+                {
+                    auto scope = work_.scope();
+                    mlp_tail(block, x, Phase::Verify,
+                             next_projection_hints(static_cast<int>(layer)));
+                    ladder::ladder_dump(x, full ? "layer-full" : "layer-gdn",
+                                        static_cast<int>(layer), stream);
+                    if (layer <= 1) {
+                        ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_out" : "bisect_b1_out",
+                                                static_cast<int>(layer), stream);
+                    }
+                }
+            } catch (const std::exception& error) {
+                throw std::runtime_error("text/serve/layers/" + std::to_string(layer) +
+                                         " columns=" + std::to_string(T) + ": " + error.what());
+            }
+        }
+        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, tensors.hidden, stream);
+        ladder::ladder_dump(tensors.hidden, "final_norm", -1, stream);
+        ladder::ladder_dump_raw(tensors.hidden, "bisect_final_norm", -1, stream);
+    }
+    clear_ragged_batch();
+    auto decoded = sample_decode_rows(tensors.hidden, plan, batch, stream);
+    work_.reset();
+    return decoded;
+}
+
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -861,7 +1211,64 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    // EXL3 fused-QKV scatter (mixed-step correctness): the single-parent
+    // EXL3 wrapper materializes a column-major [N,T] temp but copies row
+    // ranges out of it as if row-major, which is exact only at T==1. For
+    // the fused EXL3 single parent, dispatch the GEMM here and scatter the
+    // temp column-wise (2D D2D), exact at every T. All other parents keep
+    // the shared projection path unchanged.
+    if (const auto* fused_single = std::get_if<LinearParameters>(&p.projection)) {
+        if (fused_single->weight.qtype == QType::EXL3 &&
+            fused_single->weight.n ==
+                2 * dimension(config_.attention->query_width()) +
+                    2 * dimension(config_.attention->key_width()) &&
+            fused_single->weight.k == h.ne[0]) {
+            const std::int32_t qr = dimension(config_.attention->query_width());
+            const std::int32_t kr = dimension(config_.attention->key_width());
+            const std::int32_t nr = 2 * qr + 2 * kr;
+            auto proj_scope = work_.scope();
+            Tensor full = work_.alloc(DType::BF16, {nr, T});
+            ops::detail::exl3_dispatch(h, fused_single->weight, full, fused_single->policy,
+                                       &work_, s);
+            // Fused full-attention qkv scatter: checkpoint q_proj rows
+            // are per-head interleaved ([q-head h; gate-head h] per
+            // 2*head_dim group, matching oracle exllamav3
+            // deinterleave_qg), NOT [q; gate] halves. Scatter each head
+            // group into the contiguous q/gate flats; k/v halves follow
+            // unchanged.
+            const char* full_base = static_cast<const char*>(full.data);
+            const std::size_t src_pitch = static_cast<std::size_t>(nr) * 2U;
+            const std::int32_t hd = dimension(config_.attention->head_dim);
+            const std::int32_t nh = dimension(config_.attention->num_attention_heads);
+            if (hd <= 0 || nh <= 0 || qr != hd * nh) {
+                throw std::logic_error("text attn q/g interleave geometry mismatch");
+            }
+            auto copy_block = [&](void* dst_data, std::size_t dst_pitch, std::size_t dst_row,
+                                  std::size_t src_row, std::size_t rows) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    static_cast<char*>(dst_data) + dst_row * 2U, dst_pitch,
+                    full_base + src_row * 2U, src_pitch, rows * 2U,
+                    static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+            };
+            const std::size_t q_pitch  = static_cast<std::size_t>(qr) * 2U;
+            const std::size_t kv_pitch = static_cast<std::size_t>(kr) * 2U;
+            for (std::int32_t h = 0; h < nh; ++h) {
+                const std::size_t grp =
+                    static_cast<std::size_t>(h) * static_cast<std::size_t>(hd);
+                copy_block(q_flat.data, q_pitch, grp, grp * 2U, static_cast<std::size_t>(hd));
+                copy_block(gate_flat.data, q_pitch, grp, grp * 2U + static_cast<std::size_t>(hd),
+                           static_cast<std::size_t>(hd));
+            }
+            copy_block(k_flat.data, kv_pitch, 0, static_cast<std::size_t>(2 * qr),
+                       static_cast<std::size_t>(kr));
+            copy_block(v_flat.data, kv_pitch, 0, static_cast<std::size_t>(2 * qr + kr),
+                       static_cast<std::size_t>(kr));
+        } else {
+            attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+        }
+    } else {
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -882,7 +1289,33 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
+    if (active_ragged_batch_ != nullptr) {
+        // E2 serve batch path (ragged): flat T live tokens with variable spans
+        // per row. The uniform [W,B] reshape (width*batch==T) must NOT be
+        // required here: mixed prefill+decode steps are never uniform.
+        // kv_table_rows is device I32 [num_seqs] in ragged row order; the
+        // compact device tables (block_tables + seq_offsets) arrive via
+        // BatchDeviceBuffers, never via host tables (empty on this path).
+        const batch::DeviceRaggedBatch& ragged = *active_ragged_batch_;
+        if (ragged.block_tables == nullptr || ragged.seq_offsets == nullptr ||
+            active_ragged_offsets_ == nullptr) {
+            throw std::logic_error("Ragged serve attention requires device block_tables + "
+                                   "seq_offsets; host-only fallback is not allowed in serve");
+        }
+        if (ragged.total_tokens != static_cast<std::uint32_t>(T)) {
+            throw std::logic_error("Ragged serve batch binding does not match aggregate columns");
+        }
+        ops::causal_softmax_attention_ragged(
+            qn, kn, v, cache_positions, kv_table_rows, ragged, active_ragged_offsets_,
+            {dimension(config_.attention->head_dim),
+             dimension(config_.attention->num_attention_heads),
+             dimension(config_.attention->num_key_value_heads)},
+            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
+            s);
+    } else if (active_sequence_batch_ != 0) {
+        // Legacy uniform [W,B] path: single-request CLI compat and MTP verify
+        // (uniform draft width by construction). NOT the serve batch path.
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("Text sequence batch binding does not match aggregate columns");
@@ -910,6 +1343,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
             a_batch, s);
     } else {
+        // Legacy single-seq lane only (single-request CLI compat / prefill):
+        // ragged == null with more than one bound KV row is a multi-seq batch
+        // missing its ragged serve binding and must throw here, never silently
+        // run single dense attention over flat T.
+        if (kv_table_rows.ne[0] > 1) {
+            throw std::logic_error("Null-ragged multi-seq batch cannot run single dense "
+                                   "attention: missing ragged serve binding");
+        }
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
             {dimension(config_.attention->head_dim),
@@ -936,6 +1377,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor beta        = control.beta;
     gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
                      ctx_.execution_view());
+    ladder::ladder_dump_raw(h, "bisect_postnorm", gidx, s);
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1126,7 +1568,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
-    if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+    if (ids.size() > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
     }
     cudaStream_t s           = ctx_.stream;
@@ -1160,7 +1602,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
     // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
     if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
-        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        static_cast<std::uint64_t>((std::numeric_limits<std::int32_t>::max)())) {
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
     }
     const int base_i = static_cast<int>(base);
@@ -1176,7 +1618,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
     int t0 = 0;
     for (; t0 < T;) {
-        int len = std::min(chunk, T - t0);
+        int len = (std::min)(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
         work_.reset();
 

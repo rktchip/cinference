@@ -51,6 +51,16 @@ public:
         return backing_.stats();
     }
 
+    // EXL3 serve-startup path (single slot): builds a Model directly from an
+    // HF EXL3 checkpoint directory, with no .ninfer Reader. The caller owns
+    // every WeightParent behind bound views for the Model lifetime (the
+    // EXL3 side-cars additionally borrow the process store); backing carries
+    // the (possibly empty) materialization record for the load summary.
+    [[nodiscard]] static std::unique_ptr<Model>
+    create(Config config, LoadOptions options, ModelWeights weights,
+           std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+           artifact::MaterializedArtifact backing);
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);

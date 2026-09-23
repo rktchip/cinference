@@ -15,6 +15,9 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#ifdef _MSC_VER
+#include <intrin.h> // _umul128: exact 64x64->128 multiply (no __uint128_t on MSVC)
+#endif
 
 namespace ninfer::runtime {
 
@@ -924,9 +927,19 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
+#ifdef _MSC_VER
+            // MSVC has no __uint128_t: exact 64x64->128 compare via _umul128
+            // (high word first, then low). GCC/Clang path below is unchanged.
+            unsigned long long hi_left = 0, hi_right = 0;
+            const unsigned long long lo_left = _umul128(delta(cost), b, &hi_left);
+            const unsigned long long lo_right = _umul128(delta(prior), a, &hi_right);
+            if (hi_left != hi_right) { return hi_left < hi_right; }
+            if (lo_left != lo_right) { return lo_left < lo_right; }
+#else
             const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
             const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
             if (left != right) { return left < right; }
+#endif
         }
         return cost.key() < prior.key();
     }

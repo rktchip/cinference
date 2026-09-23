@@ -13,6 +13,7 @@ add_library(ninfer_serve STATIC
   anthropic_messages_http.cpp
   openai_responses_store.cpp
   translate.cpp
+  hook_loop.cpp
   generation_service.cpp
   request_events.cpp
   operational_log.cpp
@@ -24,4 +25,4 @@ add_library(ninfer_serve STATIC
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
   PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
-  PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart)
+  PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_batch CUDA::cudart)

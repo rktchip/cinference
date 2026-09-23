@@ -1,8 +1,10 @@
 #include "models/qwen3_5/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "models/qwen3_5/load/exl3_weights.h"
 
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,6 +24,55 @@ auto with_context(const std::string& context, Function&& function) {
 class Prepare {
 public:
     explicit Prepare(const Model& model) : model_(model) {}
+
+    // EXL3 fused Single for one logical linear (single slot): rewrites the
+    // alias member's bound name (e.g. text/layers/3/attention/query) to the
+    // fused side-car name (.../attention/qkv) and resolves it from the
+    // process store. n is the SUM of the member view rows (the fused
+    // side-car stacks all members); k comes from the first member. The
+    // serve dispatch requires the fused n (e.g. 10240, 14336), not the
+    // member n. Returns nullopt when the side-car is absent, so the
+    // artifact path (empty store) falls through to the unfused
+    // preparation unchanged.
+    std::optional<LinearParameters> exl3_fused(std::initializer_list<WeightId> members,
+                                               const char* section, const char* fused) const
+    {
+        if (members.size() == 0) { return std::nullopt; }
+        const auto& first = model_.weight(*members.begin());
+        const std::string key = std::string("/") + section + "/";
+        const auto pos        = first.name.rfind(key);
+        if (pos == std::string::npos) { return std::nullopt; }
+        const std::string logical = first.name.substr(0, pos + key.size()) + fused;
+        if (loading::exl3_find_payload(logical) == nullptr) { return std::nullopt; }
+        std::uint64_t rows = 0;
+        for (WeightId m : members) {
+            const auto& bound = model_.weight(m);
+            if (bound.view.shape.size() != 2) { return std::nullopt; }
+            rows += bound.view.shape[0];
+        }
+        if (first.view.shape.size() != 2) { return std::nullopt; }
+        Weight weight = loading::exl3_make_weight(logical, dimension(rows),
+                                                  dimension(first.view.shape[1]));
+        return LinearParameters{std::move(weight), ops::LinearPolicy::A16Only};
+    }
+
+    // GDN projection Single: qkv side-car as the Weight, sibling z side-car
+    // in qdata per the load/exl3_weights.h convention. Nullopt when either
+    // side-car is absent (artifact path unchanged).
+    std::optional<LinearParameters> exl3_gdn(const GdnWeights& g) const
+    {
+        auto single = exl3_fused({g.query, g.key, g.value}, "gdn", "qkv");
+        if (!single) { return std::nullopt; }
+        const auto& bound = model_.weight(g.query);
+        const std::string key("/gdn/");
+        const auto pos = bound.name.rfind(key);
+        if (pos == std::string::npos) { return std::nullopt; }
+        const std::string z_logical = bound.name.substr(0, pos + key.size()) + "z";
+        const void* z_payload       = loading::exl3_find_payload(z_logical);
+        if (z_payload == nullptr) { return std::nullopt; }
+        single->weight.qdata = z_payload;
+        return single;
+    }
 
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
@@ -53,6 +104,11 @@ public:
     }
 
     DenseParameters dense(const DenseWeights& w) const {
+        // EXL3 serve-startup path (single slot): the checkpoint fuses mlp
+        // gate/up into one side-car; serve it as one Single.
+        if (auto fused = exl3_fused({w.gate, w.up}, "mlp", "gate_up")) {
+            return {std::move(*fused), linear(w.down)};
+        }
         return {with_context(model_.weight(w.gate).name,
                              [&] {
                                  return ops::prepare_linear_swiglu_weight(model_.input(w.gate),
@@ -89,26 +145,55 @@ public:
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
-            out.mixer = AttentionParameters{
-                ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
-                                                     model_.input(a->gate), model_.input(a->value)),
-                tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
-            out.projection_prefetch =
-                prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
+            // EXL3 serve-startup path (single slot): the checkpoint stores
+            // q+gate stacked and fuses q/k/v into one attention/qkv side-car;
+            // serve it as one Single (no prefetch hint: EXL3 side-cars are
+            // device trellises, not prefetchable byte images).
+            if (auto fused = exl3_fused({a->query, a->key, a->gate, a->value}, "attention",
+                                          "qkv")) {
+                out.mixer = AttentionParameters{
+                    std::move(*fused), tensor(a->query_norm), tensor(a->key_norm),
+                    linear(a->output)};
+                out.projection_prefetch = {};
+            } else {
+                out.mixer = AttentionParameters{
+                    ops::prepare_attn_input_proj_weights(
+                        model_.input(a->query), model_.input(a->key), model_.input(a->gate),
+                        model_.input(a->value)),
+                    tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
+                out.projection_prefetch =
+                    prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
+            }
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
-            out.mixer     = GdnParameters{
-                ops::prepare_gdn_input_proj_weights(model_.input(g.query), model_.input(g.key),
-                                                        model_.input(g.value), model_.input(g.z)),
-                ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
-                                                         model_.input(g.b_projection)),
-                tensor(g.a_log),
-                tensor(g.dt_bias),
-                tensor(g.convolution),
-                tensor(g.norm),
-                linear(g.output)};
-            out.projection_prefetch =
-                prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
+            // EXL3 serve-startup path (single slot): qkv and z are separate
+            // side-cars served as one Single (z rides in qdata).
+            if (auto fused = exl3_gdn(g)) {
+                out.mixer = GdnParameters{
+                    std::move(*fused),
+                    ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
+                                                        model_.input(g.b_projection)),
+                    tensor(g.a_log),
+                    tensor(g.dt_bias),
+                    tensor(g.convolution),
+                    tensor(g.norm),
+                    linear(g.output)};
+                out.projection_prefetch = {};
+            } else {
+                out.mixer = GdnParameters{
+                    ops::prepare_gdn_input_proj_weights(
+                        model_.input(g.query), model_.input(g.key), model_.input(g.value),
+                        model_.input(g.z)),
+                    ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
+                                                        model_.input(g.b_projection)),
+                    tensor(g.a_log),
+                    tensor(g.dt_bias),
+                    tensor(g.convolution),
+                    tensor(g.norm),
+                    linear(g.output)};
+                out.projection_prefetch =
+                    prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
+            }
         }
         return out;
     }

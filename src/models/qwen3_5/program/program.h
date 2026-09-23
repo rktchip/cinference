@@ -580,7 +580,7 @@ public:
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion
     prepare_expansion(PressureTargetHandle parent,
-                      std::uint32_t maximum_owners = std::numeric_limits<std::uint32_t>::max());
+                      std::uint32_t maximum_owners = ((std::numeric_limits<std::uint32_t>::max))());
     [[nodiscard]] PressureExpansionView commit_expansion(PreparedPressureExpansion&& prepared);
     void discard_expansion(PreparedPressureExpansion&& prepared) noexcept;
     [[nodiscard]] runtime::PrefillWork

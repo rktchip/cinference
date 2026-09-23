@@ -6,15 +6,19 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+#include "ops/linear/exl3/exl3_op.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -145,6 +149,68 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    // EXL3 serve-startup path (single slot): one fused attention/qkv
+    // side-car served in one launch. The fused trellis is tiled, not
+    // row-sliceable, so the GEMM lands in a workspace temp and the caller
+    // outputs are filled with column-wise device-to-device copies (exact
+    // at every T). Checkpoint q_proj rows are per-head interleaved
+    // ([q-head h; gate-head h] per 2*head_dim group, matching oracle
+    // exllamav3 deinterleave_qg), NOT [q; gate] halves: each head group
+    // is scattered into the contiguous q/gate flats; k/v halves follow
+    // unchanged.
+    if (weight.qtype == QType::EXL3) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        if (weight.layout != QuantLayout::Contiguous || weight.ndim != 2 ||
+            weight.n != kRows || weight.k != kHidden || weight.payload == nullptr) {
+            throw std::invalid_argument("exl3 attn_input_proj: unsupported fused weight");
+        }
+        if (workspace == nullptr) {
+            throw std::invalid_argument("exl3 attn_input_proj requires caller workspace");
+        }
+        auto scope  = workspace->scope();
+        Tensor full = workspace->alloc(DType::BF16, {kRows, cols});
+        detail::exl3_dispatch(x, weight, full, policy, workspace, stream);
+        constexpr std::int32_t kHeads   = 24;
+        constexpr std::int32_t kHeadDim = 256;
+        static_assert(kQRows == kHeads * kHeadDim, "q/g interleave geometry");
+        const char* full_base       = static_cast<const char*>(full.data);
+        const std::size_t src_pitch = static_cast<std::size_t>(kRows) * sizeof(std::uint16_t);
+        const std::size_t q_pitch   = static_cast<std::size_t>(kQRows) * sizeof(std::uint16_t);
+        const std::size_t kv_pitch  = static_cast<std::size_t>(kKvRows) * sizeof(std::uint16_t);
+        auto copy_block = [&](void* dst_data, std::size_t dst_pitch, std::size_t dst_row,
+                              std::size_t src_row, std::size_t rows) {
+            const cudaError_t copy = cudaMemcpy2DAsync(
+                static_cast<char*>(dst_data) + dst_row * sizeof(std::uint16_t), dst_pitch,
+                full_base + src_row * sizeof(std::uint16_t), src_pitch,
+                rows * sizeof(std::uint16_t), static_cast<std::size_t>(cols),
+                cudaMemcpyDeviceToDevice, stream);
+            if (copy != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("exl3 attn_input_proj: device copy failed: ") +
+                    cudaGetErrorString(copy));
+            }
+        };
+        for (std::int32_t h = 0; h < kHeads; ++h) {
+            const std::size_t grp =
+                static_cast<std::size_t>(h) * static_cast<std::size_t>(kHeadDim);
+            copy_block(q.data, q_pitch, grp, grp * 2U, kHeadDim);
+            copy_block(gate.data, q_pitch, grp, grp * 2U + kHeadDim, kHeadDim);
+        }
+        copy_block(k.data, kv_pitch, 0, 12288, kKvRows);
+        copy_block(v.data, kv_pitch, 0, 13312, kKvRows);
+        return;
+    }
+
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;
@@ -204,6 +270,16 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::FP32:
     case QType::INT32:
         break;
+    case QType::EXL3:
+        // EXL3 serve-startup path (single slot): fused attention/qkv temp
+        // plus the fused dispatch scratch, mirroring dispatch_single_parent.
+        if (parent_rows != 14336 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported EXL3 profile");
+        }
+        return static_cast<std::size_t>(14336) * static_cast<std::size_t>(max_tokens) *
+                   sizeof(std::uint16_t) +
+               detail::exl3_linear_workspace_capacity_bytes(parent_rows, input_rows, policy,
+                                                            min_tokens, max_tokens);
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }

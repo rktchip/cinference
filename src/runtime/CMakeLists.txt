@@ -11,6 +11,7 @@ target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core PRIVATE ninfer::
 # Public Engine and common contracts; model execution remains in the model layer.
 add_library(ninfer_engine STATIC
   engine/model_instance.cpp
+  engine/exl3_program.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )
@@ -23,5 +24,6 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_runtime_support
   ninfer_ops
   ninfer_text
-  ninfer_media_decode)
+  ninfer_media_decode
+  ninfer::json)
 add_library(ninfer::engine ALIAS ninfer_engine)
