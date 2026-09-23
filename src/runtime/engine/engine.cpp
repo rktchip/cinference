@@ -363,6 +363,9 @@ public:
         mtp_ssrc_ = off; off += align_up(4);
         mtp_sdst_ = off; off += align_up(4);
         mtp_tok_ = off; off += align_up(4);
+        // Verify argmax outbox: one I32 slot per verify row so all four
+        // argmaxes can enqueue before the single batch sync (row 13).
+        mtp_vtok_ = off; off += align_up(4U * 4U);
         mtp_fill_ids_ = off; off += align_up(8U * 4U);
         mtp_fill_pos_ = off; off += align_up(8U * 4U);
         mtp_fill_rows_ = off; off += align_up(8U * 4U);
@@ -903,12 +906,22 @@ public:
         {
             const std::int32_t in4[4] = {bonus, host_drafts[0], host_drafts[1],
                                          host_drafts[2]};
+            // One sync for all four rows: each argmax lands in its own
+            // outbox slot, so every row + argmax enqueues before the host
+            // reads anything (row 13: 4 stalls collapse to 1).
+            Tensor vtok_out[4] = {Tensor(mbase + mtp_vtok_, DType::I32, {1}),
+                                  Tensor(mbase + mtp_vtok_ + 4, DType::I32, {1}),
+                                  Tensor(mbase + mtp_vtok_ + 8, DType::I32, {1}),
+                                  Tensor(mbase + mtp_vtok_ + 12, DType::I32, {1})};
             for (std::uint32_t i = 0; i < kDrafts + 1; ++i) {
                 run_single_row(in4[i], F + i, lane, spare, spare, hid1, log1);
-                ops::argmax(log1, tok_out, public_tokens_, stream);
-                device_.synchronize();
-                CUDA_CHECK(cudaMemcpy(&host_targets[i], mbase + mtp_tok_, sizeof(std::int32_t),
-                                      cudaMemcpyDeviceToHost));
+                ops::argmax(log1, vtok_out[i], public_tokens_, stream);
+            }
+            device_.synchronize();
+            for (std::uint32_t i = 0; i < kDrafts + 1; ++i) {
+                CUDA_CHECK(cudaMemcpy(&host_targets[i],
+                                      mbase + mtp_vtok_ + static_cast<std::size_t>(i) * 4U,
+                                      sizeof(std::int32_t), cudaMemcpyDeviceToHost));
             }
         }
         // Longest matching prefix: drafts[j] predicts slot F+1+j and
@@ -1125,6 +1138,7 @@ private:
     std::size_t mtp_ssrc_      = 0;
     std::size_t mtp_sdst_      = 0;
     std::size_t mtp_tok_       = 0;
+    std::size_t mtp_vtok_      = 0;
     std::size_t mtp_fill_ids_  = 0;
     std::size_t mtp_fill_pos_  = 0;
     std::size_t mtp_fill_rows_ = 0;
