@@ -22,6 +22,8 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/argmax.h"
+#include "models/qwen3_5/execution/mtp_spec_gate.h"
 
 #include <cuda_runtime.h>
 
@@ -194,6 +196,30 @@ public:
         }
         max_seqs_    = options.max_concurrency;
         max_context_ = options.max_context;
+        // S7 MTP-3 serve residency: --spec mtp --draft-tokens 3 admits the
+        // in-checkpoint MTP head (bound at startup in exl3_program.cpp). The
+        // window is pinned to kMtpSpecDecodeDrafts (3, full proposal head);
+        // anything else stays a startup-fatal there. Spec-off keeps the
+        // historical zeros below (no MTP KV, no MTP round state).
+        mtp_enabled_ = options.speculative.backend == SpeculativeBackend::Mtp;
+        if (mtp_enabled_) {
+            if (options.speculative.draft_tokens !=
+                models::qwen3_5::execution::kMtpSpecDecodeDrafts) {
+                throw std::invalid_argument("serve forward MTP requires draft window 3");
+            }
+            if (!parameters_.mtp) {
+                throw std::logic_error("serve forward MTP needs bound MTP parameters");
+            }
+        }
+        text_vocab_ = text_config.vocab_size;
+        if (mtp_enabled_ && text_vocab_ == 0) {
+            throw std::logic_error("serve forward MTP needs a vocabulary");
+        }
+        public_tokens_ =
+            static_cast<std::int32_t>(dimension(parameters_.model.resources().public_token_count));
+        spare_slot_ = mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) : -1;
+        mtp_shadow_base_ =
+            mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 : -1;
         hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
         max_tokens_  = options.prefill_chunk + max_seqs_;
         max_blocks_  = (max_context_ + 15U) / 16U;
@@ -212,19 +238,54 @@ public:
                 kv_builder,
                 models::qwen3_5::DecoderStateSpec{
                     .full_attention_layers     = text_config.full_attention_layers,
-                    .mtp_layers                = 0,
+                    // Single MTP layer (mtp.layers.0) when S7 is on; zero preserves spec-off.
+                    .mtp_layers                = mtp_enabled_ ? 1u : 0u,
                     .capacity                  = max_context_,
                     .kv_heads                  = dimension(text_config.attention->num_key_value_heads),
                     .attention_head_dim        = dimension(text_config.attention->head_dim),
                     .kv_storage                = options.kv_cache,
-                    .enable_mtp                = false,
+                    .enable_mtp                = mtp_enabled_,
                     .kv_table_rows             = static_cast<std::int32_t>(max_seqs_),
                     .text_physical_page_groups = physical_pages,
-                    .mtp_physical_page_groups  = 0,
+                    .mtp_physical_page_groups  = mtp_enabled_ ? physical_pages : 0,
                 });
         kv_store_ = DeviceBuffer(kv_builder.finish(256));
         kv_       = std::make_unique<models::qwen3_5::PagedKVCache>(
             DeviceSpan{kv_store_.p, kv_store_.bytes}, kv_layout.text_kv);
+        if (mtp_enabled_) {
+            // S7 MTP KV: one layer, one private page range per lane, lane L
+            // owning the same page indices as its text range. Execution row
+            // r serves lane r, so the round-state backend row is the lane.
+            if (!kv_layout.mtp_kv) {
+                throw std::logic_error("serve forward MTP layout is missing");
+            }
+            mtp_kv_ = std::make_unique<models::qwen3_5::PagedKVCache>(
+                DeviceSpan{kv_store_.p, kv_store_.bytes}, *kv_layout.mtp_kv);
+            std::optional<DeviceKVPageReservation> mtp_reservation =
+                mtp_kv_->page_pool().reserve(physical_pages);
+            if (!mtp_reservation) {
+                throw std::runtime_error("serve forward MTP page reservation failed");
+            }
+            mtp_reservation_ = std::move(*mtp_reservation);
+            mtp_page_leases_.reserve(physical_pages);
+            mtp_kv_->page_pool().materialize(mtp_reservation_, physical_pages, mtp_page_leases_);
+            std::vector<DeviceKVPageHandle> mtp_pages;
+            mtp_pages.reserve(physical_pages);
+            for (const auto& lease : mtp_page_leases_) { mtp_pages.push_back(lease.handle()); }
+            mtp_kv_->page_pool().zero_pages(mtp_pages, device_.stream);
+            for (std::uint32_t r = 0; r < max_seqs_; ++r) {
+                mtp_row_leases_.push_back(
+                    mtp_kv_->execution_tables().acquire(static_cast<std::int32_t>(r)));
+                std::vector<DeviceKVPageHandle> slot_pages;
+                slot_pages.reserve(pages_per_slot_);
+                for (std::uint32_t l = 0; l < pages_per_slot_; ++l) {
+                    slot_pages.push_back(mtp_page_leases_[r * pages_per_slot_ + l].handle());
+                }
+                mtp_kv_->execution_tables().publish(mtp_row_leases_.back().handle(), 0,
+                                                std::span(slot_pages.data(), slot_pages.size()),
+                                                device_.stream);
+            }
+        }
 
         const std::uint32_t gdn_layers = text_config.linear_attention_layers;
         LayoutBuilder pool_builder;
@@ -243,7 +304,8 @@ public:
                         dimension(text_config.gdn->linear_value_head_dim)) : 0,
                     .key_head_dim   = text_config.gdn ? static_cast<std::int32_t>(
                         dimension(text_config.gdn->linear_key_head_dim)) : 0,
-                    .slot_count     = static_cast<std::int32_t>(max_seqs_),
+                    .slot_count     = static_cast<std::int32_t>(max_seqs_) +
+                                    (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) : 0),
                     .conv_dtype     = DType::BF16,
                 });
         pool_store_ = DeviceBuffer(pool_builder.finish(256));
@@ -258,8 +320,8 @@ public:
                     .hidden          = static_cast<std::int32_t>(hidden_),
                     .output_rows     = 1,
                     .batch_capacity  = max_seqs_,
-                    .draft_window    = 0,
-                    .backend         = SpeculativeBackend::None,
+                    .draft_window    = mtp_enabled_ ? models::qwen3_5::execution::kMtpSpecDecodeDrafts : 0,
+                    .backend         = mtp_enabled_ ? SpeculativeBackend::Mtp : SpeculativeBackend::None,
                     .causal_scoring  = false,
                 });
         models::qwen3_5::complete_round_state_layout(round_builder, round_layout);
@@ -292,7 +354,37 @@ public:
         off += align_up(static_cast<std::size_t>(max_seqs_ + 1U) * 4U);
         tables_ = off;
         off += align_up(static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U);
+        // S7 single-row staging (I32) plus MTP hidden/logits scratch. The MTP
+        // decode path never runs forward_serve_step, so these regions are
+        // disjoint from the plan tensors above by construction.
+        mtp_ids_ = off; off += align_up(4);
+        mtp_pos_ = off; off += align_up(4);
+        mtp_row_ = off; off += align_up(4);
+        mtp_ssrc_ = off; off += align_up(4);
+        mtp_sdst_ = off; off += align_up(4);
+        mtp_tok_ = off; off += align_up(4);
+        mtp_fill_ids_ = off; off += align_up(8U * 4U);
+        mtp_fill_pos_ = off; off += align_up(8U * 4U);
+        mtp_fill_rows_ = off; off += align_up(8U * 4U);
+        mtp_fill_ssrc_ = off; off += align_up(8U * 4U);
+        mtp_fill_sdst_ = off; off += align_up(8U * 4U);
+        mtp_hid1_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 2U);
+        mtp_log1_ = off;
+        off += align_up(static_cast<std::size_t>(text_vocab_) * 2U);
+        mtp_mha_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 2U);
+        mtp_mhb_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 2U);
+        mtp_fill_hid_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 8U * 2U);
+        mtp_fill_log_ = off;
+        off += align_up(static_cast<std::size_t>(text_vocab_) * 8U * 2U);
+        mtp_fill_mh_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 8U * 2U);
         scratch_ = DeviceBuffer(off);
+        // Per-lane committed target hidden (MTP draft chain anchor) plus the
+        // anchor-as-input target logits (verify row 0 without re-running the
+        // anchor through GDN). anchor_valid means both are live.
+        anchor_store_ =
+            DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
+        anchor_logits_ =
+            DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
         CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(scratch_.p) + tables_, 0,
                                    static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U,
                                    device_.stream));
@@ -333,7 +425,8 @@ public:
         card_ = std::make_unique<models::qwen3_5::execution::TextContext>(
             device_, parameters_, *work_, models::qwen3_5::PagedKVCacheView{}, *pool_, *io_,
             prefill_hidden_tensor, options.prefill_chunk, 0,
-            models::qwen3_5::PagedKVCacheView{}, kv_.get(), nullptr);
+            models::qwen3_5::PagedKVCacheView{}, kv_.get(),
+            mtp_enabled_ ? mtp_kv_.get() : nullptr);
         envelope_ = ops::CausalAttentionExecutionEnvelope{1, max_context_};
         {
             // Explicit T=0 sampling config: temperature 0 resolves to greedy.
@@ -350,6 +443,13 @@ public:
             sampling_store_.copy_from_host(&explicit_argmax, sizeof(explicit_argmax));
             serve_sampling_ = static_cast<const ops::SamplingConfig*>(sampling_store_.p);
             card_->set_sampling(serve_sampling_);
+        }
+        if (mtp_enabled_) {
+            // The MTP AR draft path derives RoPE from positions plus the
+            // round-state rope delta: pin it to zero so drafts share the
+            // ordinary path's absolute positions.
+            CUDA_CHECK(cudaMemsetAsync(io_->rope_delta.data, 0, sizeof(std::int32_t),
+                                       device_.stream));
         }
         slots_.resize(max_seqs_);
         device_.synchronize();
@@ -422,6 +522,8 @@ public:
                 slot.seq_id             = seq_id;
                 slot.next_pos           = 0;
                 slot.touched_as_prefill = false;
+                slot.mtp_valid_pos      = 0;
+                slot.anchor_valid       = false;
                 std::vector<DeviceKVPageHandle> pages;
                 pages.reserve(pages_per_slot_);
                 for (std::uint32_t l = 0; l < pages_per_slot_; ++l) {
@@ -486,6 +588,21 @@ public:
             }
         }
 
+        // S7 MTP-3 (single slot): decode-only single-row steps with a warm
+        // MTP lane run draft-3 + target-verify + longest-prefix accept below.
+        // Every other mix (mixed prefill+decode, multi-row decode, cold lane,
+        // frontier at the context edge) runs the ordinary target-only path:
+        // mixed plans stay spec-off.
+        if (mtp_enabled_ && n_pref == 0 && n_dec == 1) {
+            const std::int32_t mtp_lane = row_slot[0];
+            const ServeSlot& mslot = slots_[static_cast<std::size_t>(mtp_lane)];
+            const std::uint32_t frontier = mslot.next_pos - 1;
+            if (mslot.next_pos >= 1 && mslot.mtp_valid_pos == frontier &&
+                frontier + models::qwen3_5::execution::kMtpSpecDecodeDrafts + 1 <=
+                    max_context_) {
+                return step_mtp_decode(batch, row_slot);
+            }
+        }
         cudaStream_t stream = device_.stream;
         char* base          = static_cast<char*>(scratch_.p);
         CUDA_CHECK(cudaMemcpyAsync(base + ids_, batch.tokens.data(),
@@ -573,8 +690,26 @@ public:
             }
             std::fflush(stderr);
         }
-        auto decoded = card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
-                                                 row_slot.data(), tensors, envelope_);
+        runtime::StepDecodedPairs decoded;
+        if (mtp_enabled_ && n_pref > 0) {
+            // S7 fill seeding: snapshot each prefill lane's pre-forward GDN
+            // state into its shadow slot. The ordinary forward below advances
+            // lanes in place (destroying pre-slice states), and the fill
+            // chains its rows from these shadows so every row applies exactly
+            // once. One shadow per lane: concurrent prefill lanes never share.
+            for (std::size_t s = 0; s < n_pref; ++s) {
+                pool_->copy_slot(row_slot[s], mtp_shadow_base_ + row_slot[s], stream);
+            }
+        }
+        decoded = card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
+                                            row_slot.data(), tensors, envelope_);
+        if (mtp_enabled_ && n_pref > 0) {
+            // S7 MTP-KV fill: the ordinary forward above advanced text KV
+            // and GDN only. Mirror each prefill slice through the MTP layer
+            // (chunked to the single-row helper width) so the MTP KV prefix
+            // stays warm for later decode-only MTP steps.
+            mtp_prefill_fill(plan, batch, row_slot, pos);
+        }
         if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
             for (std::size_t d = 0; d < decoded.size(); ++d) {
                 std::fprintf(stderr, "[serve-step] decoded seq=%llu tok=%d\n",
@@ -598,12 +733,366 @@ public:
         return decoded;
     }
 
+    // Single target row through the ordinary ladder: KV overwrite-identical at
+    // position, GDN from gdn_src into gdn_dst, hidden/logits out. The rewind
+    // discipline is the caller's: speculative rows run with dst == spare and
+    // only the accepted prefix is replayed lane-into-lane.
+    void run_single_row(std::int32_t tok, std::uint32_t position, std::int32_t kv_row,
+                        std::int32_t gdn_src, std::int32_t gdn_dst, Tensor& hidden_out,
+                        Tensor& logits_out) {
+        cudaStream_t stream = device_.stream;
+        char* mbase         = static_cast<char*>(scratch_.p);
+        const std::int32_t p = static_cast<std::int32_t>(position);
+        // Tight envelope {p+1,p+1} like the reference bridge/target envelopes:
+        // the serve envelope_ spans the context window and admits a different
+        // (potentially nondeterministic) attention route over unwritten cache.
+        const ops::CausalAttentionExecutionEnvelope row_env{static_cast<std::uint32_t>(p + 1),
+                                                           static_cast<std::uint32_t>(p + 1)};
+        CUDA_CHECK(
+            cudaMemcpyAsync(mbase + mtp_ids_, &tok, sizeof(tok), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(mbase + mtp_pos_, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_row_, &kv_row, sizeof(kv_row),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ssrc_, &gdn_src, sizeof(gdn_src),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_sdst_, &gdn_dst, sizeof(gdn_dst),
+                                   cudaMemcpyHostToDevice, stream));
+        const Tensor ids_t(mbase + mtp_ids_, DType::I32, {1});
+        const Tensor pos_t(mbase + mtp_pos_, DType::I32, {1});
+        const Tensor row_t(mbase + mtp_row_, DType::I32, {1});
+        const Tensor src_t(mbase + mtp_ssrc_, DType::I32, {1});
+        const Tensor dst_t(mbase + mtp_sdst_, DType::I32, {1});
+        card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, src_t, dst_t, row_env,
+                                     hidden_out, logits_out);
+    }
+
+    // S7 MTP-3 single-slot decode: draft 3 from the in-checkpoint head, one
+    // target forward over anchor + drafts (4 sequential width-1 rows in the
+    // spare GDN slot), longest-prefix accept, selective replay commit. The
+    // lane (text KV cursor, GDN state) is untouched until the commit: a
+    // rejection rewinds by construction (cursor discipline, spare discarded,
+    // only the accepted prefix replayed). Returns 1 + accepted pairs.
+    runtime::StepDecodedPairs step_mtp_decode(const batch::RaggedBatch& batch,
+                                              const std::vector<std::int32_t>& row_slot) {
+        constexpr std::uint32_t kDrafts = models::qwen3_5::execution::kMtpSpecDecodeDrafts;
+        static_assert(kDrafts == 3, "S7 serve uses MTP-3, never the 10-wide window");
+        cudaStream_t stream = device_.stream;
+        char* mbase         = static_cast<char*>(scratch_.p);
+        const std::int32_t H     = static_cast<std::int32_t>(hidden_);
+        const std::int32_t V     = static_cast<std::int32_t>(text_vocab_);
+        const std::int32_t lane  = row_slot[0];
+        ServeSlot& slot          = slots_[static_cast<std::size_t>(lane)];
+        const std::uint64_t seq_id = batch.seq_ids[0];
+        const std::uint32_t F      = slot.next_pos - 1;
+        const TokenId anchor       = batch.tokens[batch.seq_offsets[0]];
+        const std::int32_t spare   = spare_slot_;
+        const Tensor tok_in(mbase + mtp_ids_, DType::I32, {1});
+        const Tensor pos_t(mbase + mtp_pos_, DType::I32, {1});
+        Tensor hid1(mbase + mtp_hid1_, DType::BF16, {H, 1});
+        Tensor log1(mbase + mtp_log1_, DType::BF16, {V, 1});
+        Tensor tok_out(mbase + mtp_tok_, DType::I32, {1});
+        Tensor mh[2] = {Tensor(mbase + mtp_mha_, DType::BF16, {H, 1}),
+                        Tensor(mbase + mtp_mhb_, DType::BF16, {H, 1})};
+        Tensor anchor_hid(static_cast<char*>(anchor_store_.p) +
+                                  static_cast<std::size_t>(lane) * hidden_ * 2U,
+                          DType::BF16, {H, 1});
+        Tensor anchor_log(static_cast<char*>(anchor_logits_.p) +
+                                  static_cast<std::size_t>(lane) * text_vocab_ * 2U,
+                          DType::BF16, {V, 1});
+        // Stash discipline: anchor_valid means anchor_store_ and
+        // anchor_logits_ hold this anchor's exact as-input hidden and logits
+        // (stashed by the fill or the commit, both chained exactly). The
+        // anchor row must never be re-run: the lane already contains it, so a
+        // re-run would apply the GDN update twice. Fall back to the legacy
+        // replay only when no stash is live (synthetic warmup lanes).
+        const bool stash_live = slot.anchor_valid && slot.anchor_token == anchor;
+        if (!stash_live) {
+            // First MTP step on this lane: materialize the anchor target
+            // hidden (replays the anchor row; KV overwrite-identical, GDN
+            // into spare so the snapshot below stays exact).
+            run_single_row(static_cast<std::int32_t>(anchor), F - 1, lane, lane, spare,
+                           anchor_hid, log1);
+            slot.anchor_token = anchor;
+            slot.anchor_valid = false;
+        }
+        // The MTP tail consumes the single-row path via the round-state
+        // backend row (no batch bindings): point it at this lane's MTP row.
+        CUDA_CHECK(cudaMemcpyAsync(io_->backend_kv_table_row.data, &lane, sizeof(lane),
+                                   cudaMemcpyHostToDevice, stream));
+        std::int32_t host_targets[4] = {0, 0, 0, 0};
+        // Stashed anchor logits resolve the bonus token before drafting, so
+        // the first draft consumes the reference bridge input (bonus token
+        // over the anchor hidden) instead of re-consuming the anchor. Cold
+        // lanes (no stash) replay the anchor row once above; its logits are
+        // in log1, so the bonus comes from there in both cases.
+        if (stash_live) {
+            ops::argmax(anchor_log, tok_out, public_tokens_, stream);
+        } else {
+            ops::argmax(log1, tok_out, public_tokens_, stream);
+        }
+        {
+            // Explicit sync: the compute stream is non-blocking, so a host
+            // read must wait for the queued argmax (else stale mtp_tok_).
+            device_.synchronize();
+            CUDA_CHECK(cudaMemcpy(&host_targets[0], mbase + mtp_tok_, sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost));
+        }
+        // Draft-3 from the in-checkpoint MTP head. One host round-trip per
+        // draft: the next AR input is the previous draft id. Draft j runs at
+        // F+j (draft 0 consumes the bonus token at F over the anchor hidden,
+        // exactly like the reference bridge mtp_forward_batch at position)
+        // and predicts F+1+j. Envelope is per-step {F+j+1,F+j+1} like the
+        // reference (bridge_envelope / ar envelope): the serve envelope_
+        // spans the whole context window and would attend unwritten MTP KV
+        // columns, producing degenerate drafts.
+        std::int32_t host_drafts[3] = {0, 0, 0};
+        const bool mtp_dbg = std::getenv("NINFER_MTP_DEBUG") != nullptr;
+        if (mtp_dbg) {
+            std::fprintf(stderr,
+                         "[mtp-dbg] layout H=%u V=%d log1=%zu mha=%zu mhb=%zu hid1=%zu tok=%zu "
+                         "mh0=%p mh1=%p log1p=%p tokp=%p\n",
+                         hidden_, (int)text_vocab_, mtp_log1_, mtp_mha_, mtp_mhb_, mtp_hid1_,
+                         mtp_tok_, mh[0].data, mh[1].data, log1.data, tok_out.data);
+        }
+        {
+            std::int32_t tok       = host_targets[0];
+            const Tensor* prev_hid = &anchor_hid;
+            for (std::uint32_t j = 0; j < kDrafts; ++j) {
+                const std::int32_t p = static_cast<std::int32_t>(F + j);
+                const ops::CausalAttentionExecutionEnvelope ar_env{
+                    static_cast<std::uint32_t>(p + 1), static_cast<std::uint32_t>(p + 1)};
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ids_, &tok, sizeof(tok),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_pos_, &p, sizeof(p),
+                                           cudaMemcpyHostToDevice, stream));
+                card_->mtp_forward_ar_step(tok_in, *prev_hid, pos_t, ar_env, mh[j % 2], log1,
+                                           tok_out);
+                device_.synchronize();
+                CUDA_CHECK(cudaMemcpy(&host_drafts[j], mbase + mtp_tok_, sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost));
+                if (mtp_dbg) {
+                    std::uint16_t prev0 = 0, out0 = 0;
+                    CUDA_CHECK(cudaMemcpy(&prev0, prev_hid->data, sizeof(prev0),
+                                          cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(&out0, mh[j % 2].data, sizeof(out0),
+                                          cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr,
+                                 "[mtp-dbg] seq=%llu F=%u j=%u anchor=%d tok_in=%d pos=%d "
+                                 "prev_hid0=0x%04x mtp_hid0=0x%04x draft=%d\n",
+                                 (unsigned long long)seq_id, F, j, (int)anchor, tok, p,
+                                 prev0, out0, host_drafts[j]);
+                }
+                tok      = host_drafts[j];
+                prev_hid = &mh[j % 2];
+            }
+        }
+        // GDN snapshot, then the target verify over the drafts. The verify
+        // runs entirely in the spare slot, so the lane is untouched until
+        // the commit below. Verify inputs are the BONUS draft chain, not the
+        // anchor: [b@F, d0@F+1, d1@F+2, d2@F+3]. Each row's argmax is the
+        // target pick for the slot AFTER its input, so out[j] is the target
+        // pick for the same slot drafts[j] predicts (d_j vs out[j]). The
+        // anchor row is NOT re-run: the lane already contains it (a re-run
+        // would double-apply GDN) and the stash holds its logits. Width-1
+        // rows chain spare->spare, so every row applies exactly once.
+        pool_->copy_slot(lane, spare, stream);
+        // The bonus (slot-F token) is consumed as verify row 0's input;
+        // save it before the loop overwrites host_targets[0] with out[0].
+        const std::int32_t bonus = host_targets[0];
+        {
+            const std::int32_t in4[4] = {bonus, host_drafts[0], host_drafts[1],
+                                         host_drafts[2]};
+            for (std::uint32_t i = 0; i < kDrafts + 1; ++i) {
+                run_single_row(in4[i], F + i, lane, spare, spare, hid1, log1);
+                ops::argmax(log1, tok_out, public_tokens_, stream);
+                device_.synchronize();
+                CUDA_CHECK(cudaMemcpy(&host_targets[i], mbase + mtp_tok_, sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost));
+            }
+        }
+        // Longest matching prefix: drafts[j] predicts slot F+1+j and
+        // host_targets[j] (fresh verify argmax) is the target pick for that
+        // same slot, so drafts[j] == host_targets[j] extends the run. On a
+        // full run (a==3) host_targets[3] is the extra bonus sampled from
+        // the d2 row (slot F+4); otherwise host_targets[a] is the corrected
+        // token for slot F+1+a, already computed by the verify row.
+        std::uint32_t accepted = 0;
+        while (accepted < kDrafts && host_drafts[accepted] == host_targets[accepted]) {
+            ++accepted;
+        }
+        // Commit list: bonus + accepted drafts + (extra | correction).
+        // Full run (a==3): out[3] is the extra bonus for slot F+4, commit
+        // is [b, d0, d1, d2, out3] (5 tokens). Partial (a<3): out[a] is the
+        // corrected token for slot F+1+a, commit is [b, d0..d_{a-1}, out_a]
+        // (a+2 tokens).
+        std::int32_t commit[5];
+        commit[0] = bonus;
+        for (std::uint32_t j = 0; j < accepted; ++j) {
+            commit[1 + j] = host_drafts[j];
+        }
+        commit[1 + accepted]       = host_targets[accepted];
+        const std::uint32_t commit_len = (accepted == kDrafts) ? 5 : accepted + 2;
+        // Commit: replay the accepted rows lane-into-lane (GDN exact, KV
+        // overwrite-identical) and refill the MTP KV rows they own. The MTP
+        // refill follows bridge semantics (previous hidden + current token):
+        // row j consumes the hidden of F+j-1 (anchor stash for j=0, the
+        // previous row's hidden after), staged through mh[1] because hid1
+        // holds the current row. Token/position/envelope are per-row: the
+        // draft loop leaves tok_in/pos_t holding the LAST draft, and
+        // re-running that would poison the prefix the next step drafts from.
+        CUDA_CHECK(cudaMemcpyAsync(mh[1].data, anchor_hid.data,
+                                   static_cast<std::size_t>(hidden_) * 2U,
+                                   cudaMemcpyDeviceToDevice, stream));
+        for (std::uint32_t j = 0; j < commit_len; ++j) {
+            run_single_row(commit[j], F + j, lane, lane, lane, hid1, log1);
+            std::int32_t ctok = commit[j];
+            std::int32_t cpos = static_cast<std::int32_t>(F + j);
+            const ops::CausalAttentionExecutionEnvelope cenv{
+                static_cast<std::uint32_t>(cpos + 1), static_cast<std::uint32_t>(cpos + 1)};
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ids_, &ctok, sizeof(ctok),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_pos_, &cpos, sizeof(cpos),
+                                       cudaMemcpyHostToDevice, stream));
+            card_->mtp_forward_batch(tok_in, mh[1], pos_t, cenv, mh[0], -1, nullptr, nullptr);
+            CUDA_CHECK(cudaMemcpyAsync(mh[1].data, hid1.data,
+                                       static_cast<std::size_t>(hidden_) * 2U,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_store_.p) +
+                                           static_cast<std::size_t>(lane) * hidden_ * 2U,
+                                   hid1.data, static_cast<std::size_t>(hidden_) * 2U,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_logits_.p) +
+                                           static_cast<std::size_t>(lane) * text_vocab_ * 2U,
+                                   log1.data, static_cast<std::size_t>(text_vocab_) * 2U,
+                                   cudaMemcpyDeviceToDevice, stream));
+        slot.anchor_token      = static_cast<TokenId>(commit[commit_len - 1]);
+        slot.anchor_valid      = true;
+        slot.next_pos          = F + commit_len;
+        slot.mtp_valid_pos     = slot.next_pos;
+        slot.touched_as_prefill = false;
+        runtime::StepDecodedPairs decoded;
+        for (std::uint32_t j = 0; j < commit_len; ++j) {
+            decoded.emplace_back(seq_id, static_cast<TokenId>(commit[j]));
+        }
+        if (mtp_dbg) {
+            std::fprintf(stderr, "[serve-mtp] seq=%llu lane=%d F=%u stash=%d anchor=%d drafts=[%d %d %d] verify=[%d %d %d %d] accepted=%u commit=%u\n",
+                         (unsigned long long)seq_id, lane, F, stash_live ? 1 : 0, (int)anchor,
+                         host_drafts[0], host_drafts[1],
+                         host_drafts[2], host_targets[0], host_targets[1], host_targets[2],
+                         host_targets[3], accepted, commit_len);
+        }
+        // Same lane release as the ordinary path: lanes whose seq left the
+        // batch after decoding are done; mid-prefill vanishers are starved.
+        const std::size_t num_seqs = batch.num_seqs();
+        for (ServeSlot& rel : slots_) {
+            if (!rel.in_use) { continue; }
+            bool seen = false;
+            for (std::size_t q = 0; q < num_seqs; ++q) {
+                if (batch.seq_ids[q] == rel.seq_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && !rel.touched_as_prefill) { rel.in_use = false; }
+        }
+        return decoded;
+    }
+
+    // Mirror prefill slices through the MTP layer one row at a time so the
+    // MTP KV prefix stays warm. Rows chain through the lane's shadow slot
+    // (snapshotted pre-forward in step()): the ordinary forward advanced the
+    // lane in place, so re-running from the lane would apply every row twice
+    // (once by the forward, once here) and poison the MTP KV prefix. From
+    // the shadow every row applies exactly once, reproducing the true
+    // sequential GDN trajectory bit-for-bit. Width-1 additionally keeps the
+    // GDN Verify snapshot inside its single-column domain on every
+    // concurrency (a width-n batch needs n state columns and trips
+    // gdn_input_proj_conv_snapshot on small servers). Text KV writes are
+    // positional overwrite-identical; the lane GDN is never touched. The
+    // slice's last row is the lane's draft anchor: its hidden and logits are
+    // stashed so the first MTP step needs no replay.
+    void mtp_prefill_fill(const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+                          const std::vector<std::int32_t>& row_slot,
+                          const std::vector<std::int32_t>& pos) {
+        cudaStream_t stream = device_.stream;
+        char* mbase         = static_cast<char*>(scratch_.p);
+        const std::int32_t H     = static_cast<std::int32_t>(hidden_);
+        const std::int32_t V     = static_cast<std::int32_t>(text_vocab_);
+        for (std::size_t r = 0; r < plan.prefill.size(); ++r) {
+            const std::int32_t lane   = row_slot[r];
+            const std::int32_t shadow = mtp_shadow_base_ + lane;
+            CUDA_CHECK(cudaMemcpyAsync(io_->backend_kv_table_row.data, &lane, sizeof(lane),
+                                       cudaMemcpyHostToDevice, stream));
+            const std::uint32_t off   = batch.seq_offsets[r];
+            const std::uint32_t count = batch.seq_offsets[r + 1] - off;
+            for (std::uint32_t base = 0; base < count; ++base) {
+                const std::int32_t one = 1;
+                std::int32_t h_ids     = static_cast<std::int32_t>(batch.tokens[off + base]);
+                std::int32_t h_pos     = pos[off + base];
+                std::int32_t h_row     = lane;
+                std::int32_t h_ss      = shadow;
+                std::int32_t h_sd      = shadow;
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_fill_ids_, &h_ids, sizeof(h_ids),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_fill_pos_, &h_pos, sizeof(h_pos),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_fill_rows_, &h_row, sizeof(h_row),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_fill_ssrc_, &h_ss, sizeof(h_ss),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_fill_sdst_, &h_sd, sizeof(h_sd),
+                                           cudaMemcpyHostToDevice, stream));
+                const Tensor ids_t(mbase + mtp_fill_ids_, DType::I32, {one});
+                const Tensor pos_t(mbase + mtp_fill_pos_, DType::I32, {one});
+                const Tensor row_t(mbase + mtp_fill_rows_, DType::I32, {one});
+                const Tensor ssrc_t(mbase + mtp_fill_ssrc_, DType::I32, {one});
+                const Tensor sdst_t(mbase + mtp_fill_sdst_, DType::I32, {one});
+                Tensor hid_t(mbase + mtp_fill_hid_, DType::BF16, {H, one});
+                Tensor log_t(mbase + mtp_fill_log_, DType::BF16, {V, one});
+                Tensor mh_t(mbase + mtp_fill_mh_, DType::BF16, {H, one});
+                const ops::CausalAttentionExecutionEnvelope fill_env{
+                    static_cast<std::uint32_t>(h_pos + 1), static_cast<std::uint32_t>(h_pos + 1)};
+                card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, ssrc_t, sdst_t,
+                                             fill_env, hid_t, log_t);
+                card_->mtp_forward_batch(ids_t, hid_t, pos_t, fill_env, mh_t, -1, nullptr,
+                                         nullptr);
+                if (base + 1 == count) {
+                    // Slice tail is the anchor: stash its exact hidden and
+                    // as-input logits for the first MTP step (no replay).
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_store_.p) +
+                                                       static_cast<std::size_t>(lane) *
+                                                           hidden_ * 2U,
+                                               hid_t.data,
+                                               static_cast<std::size_t>(hidden_) * 2U,
+                                               cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_logits_.p) +
+                                                       static_cast<std::size_t>(lane) *
+                                                           text_vocab_ * 2U,
+                                               log_t.data,
+                                               static_cast<std::size_t>(text_vocab_) * 2U,
+                                               cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+            ServeSlot& slot     = slots_[static_cast<std::size_t>(lane)];
+            slot.mtp_valid_pos  = slot.next_pos;
+            slot.anchor_token   = batch.tokens[batch.seq_offsets[r + 1] - 1];
+            slot.anchor_valid   = count > 0;
+        }
+    }
+
 private:
     struct ServeSlot {
         bool in_use             = false;
         std::uint64_t seq_id    = 0;
         std::uint32_t next_pos  = 0;
         bool touched_as_prefill = false;
+        // S7 MTP ledger: positions [0, mtp_valid_pos) are warm in MTP KV;
+        // anchor caches the committed target hidden for the draft chain.
+        std::uint32_t mtp_valid_pos = 0;
+        TokenId anchor_token        = 0;
+        bool anchor_valid           = false;
     };
 
     DeviceContext& device_;
@@ -615,6 +1104,39 @@ private:
     std::uint32_t max_blocks_     = 0;
     std::uint32_t pages_per_slot_ = 0;
     DeviceBuffer kv_store_;
+    bool mtp_enabled_            = false;
+    std::int32_t spare_slot_     = -1;
+    std::uint32_t text_vocab_    = 0;
+    std::int32_t public_tokens_  = 0;
+    std::unique_ptr<models::qwen3_5::PagedKVCache> mtp_kv_;
+    DeviceKVPageReservation mtp_reservation_;
+    std::vector<DeviceKVPageLease> mtp_page_leases_;
+    std::vector<KVExecutionRowLease> mtp_row_leases_;
+    DeviceBuffer anchor_store_;
+    DeviceBuffer anchor_logits_;
+    // GDN shadow slots for the MTP prefill fill: shadow(lane) carries the
+    // lane's pre-forward GDN state so fill rows chain exactly. Layout after
+    // the max_seqs_ lane slots: [max_seqs_] is the verify spare, then one
+    // shadow per lane.
+    std::int32_t mtp_shadow_base_ = -1;
+    std::size_t mtp_ids_       = 0;
+    std::size_t mtp_pos_       = 0;
+    std::size_t mtp_row_       = 0;
+    std::size_t mtp_ssrc_      = 0;
+    std::size_t mtp_sdst_      = 0;
+    std::size_t mtp_tok_       = 0;
+    std::size_t mtp_fill_ids_  = 0;
+    std::size_t mtp_fill_pos_  = 0;
+    std::size_t mtp_fill_rows_ = 0;
+    std::size_t mtp_fill_ssrc_ = 0;
+    std::size_t mtp_fill_sdst_ = 0;
+    std::size_t mtp_hid1_      = 0;
+    std::size_t mtp_log1_      = 0;
+    std::size_t mtp_mha_       = 0;
+    std::size_t mtp_mhb_       = 0;
+    std::size_t mtp_fill_hid_  = 0;
+    std::size_t mtp_fill_log_  = 0;
+    std::size_t mtp_fill_mh_   = 0;
     DeviceBuffer pool_store_;
     DeviceBuffer round_store_;
     std::unique_ptr<DeviceArena> work_;

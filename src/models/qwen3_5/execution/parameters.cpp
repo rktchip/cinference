@@ -211,8 +211,6 @@ public:
 
     MtpParameters mtp(const MtpWeights& w) const {
         const auto& a = std::get<AttentionWeights>(w.layer.mixer);
-        const std::array inputs{model_.input(a.query), model_.input(a.key), model_.input(a.gate),
-                                model_.input(a.value)};
         MtpParameters out;
         out.input_projection    = linear(w.input_projection);
         out.embedding_norm      = tensor(w.embedding_norm);
@@ -220,9 +218,20 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
-        if (model_.config().text.architecture == Architecture::Qwen3_5) {
-            out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
+        // EXL3 serve-startup path (single slot): the checkpoint fuses the
+        // MTP q/k/v into one text/mtp attention/qkv side-car; serve it as
+        // one Single with the same helper as text attention.
+        if (auto fused = exl3_fused({a.query, a.key, a.gate, a.value}, "attention",
+                                    "qkv")) {
+            out.projection.packed = std::move(*fused);
+        } else {
+            const std::array inputs{model_.input(a.query), model_.input(a.key),
+                                    model_.input(a.gate), model_.input(a.value)};
+            out.projection.packed = ops::prepare_linear_weight(inputs);
+            if (model_.config().text.architecture == Architecture::Qwen3_5) {
+                out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate),
+                                       linear(a.value)};
+            }
         }
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);

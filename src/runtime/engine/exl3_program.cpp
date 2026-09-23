@@ -11,6 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/exl3_weights.h"
+#include "models/qwen3_5/execution/mtp_spec_gate.h"
 #include "models/qwen3_5/model.h"
 
 #include <cuda_runtime.h>
@@ -202,9 +203,22 @@ Exl3ModelBundle build_exl3_model(const EngineOptions& options, DeviceContext& de
         throw std::invalid_argument("EXL3 checkpoint dir serves the text backbone only "
                                     "(vision is not bound in single-slot)");
     }
-    if (options.speculative.backend != SpeculativeBackend::None) {
+    // Single-slot MTP-3: --spec mtp is admitted only with the S7 draft
+    // window (kMtpSpecDecodeDrafts == 3, full proposal head). DFlash/DFlash2
+    // stay rejected, and any other draft window stays a startup-fatal: the
+    // serve MTP loop runs draft-3 + target-verify, never the 10-wide
+    // frame-domain window.
+    const bool mtp_enabled = options.speculative.backend == SpeculativeBackend::Mtp;
+    if (options.speculative.backend != SpeculativeBackend::None && !mtp_enabled) {
         throw std::invalid_argument("EXL3 checkpoint dir serves without speculative decoding "
                                     "in single-slot");
+    }
+    if (mtp_enabled &&
+        (options.speculative.draft_tokens !=
+             models::qwen3_5::execution::kMtpSpecDecodeDrafts ||
+         options.speculative.proposal_head != ProposalHead::Full)) {
+        throw std::invalid_argument("EXL3 MTP serve requires --spec mtp --draft-tokens 3 "
+                                    "(full proposal head)");
     }
 
     // (1) Side-car store: packed trellis/suh/svh upload into the
@@ -235,7 +249,7 @@ Exl3ModelBundle build_exl3_model(const EngineOptions& options, DeviceContext& de
           "linear_conv_kernel_dim", "intermediate_size"}) {
         if (hf_text.contains(key)) shaped[key] = hf_text.at(key);
     }
-    const models::qwen3_5::Config config = models::qwen3_5::parse_text_config(shaped, false);
+    const models::qwen3_5::Config config = models::qwen3_5::parse_text_config(shaped, mtp_enabled);
     const auto& text                     = config.text;
     const std::uint64_t hidden           = text.hidden_size;
     const std::uint64_t intermediate =
@@ -487,6 +501,71 @@ Exl3ModelBundle build_exl3_model(const EngineOptions& options, DeviceContext& de
         block.ffn = std::move(mlp);
         ++fused;
         weights.text.layers.push_back(std::move(block));
+    }
+
+    // (5b) MTP head (single layer, mtp_num_hidden_layers == 1) in bind_mtp
+    // order. Member names follow the EXL3 store logicals (text/mtp/...) so
+    // parameters.cpp resolves the fused Singles with the same exl3_fused
+    // helper as the text backbone; the math inputs mirror bind_mtp.
+    if (mtp_enabled) {
+        auto require_mtp_payload = [&](const std::string& store) {
+            if (exl3_find_payload(store) == nullptr) {
+                throw std::invalid_argument(
+                    "EXL3 MTP side-car is missing from the process store: " + store);
+            }
+        };
+        require_mtp_payload("text/mtp/draft_head");
+        require_mtp_payload("text/mtp/layers/0/attention/qkv");
+        require_mtp_payload("text/mtp/layers/0/attention/output");
+        require_mtp_payload("text/mtp/layers/0/mlp/gate_up");
+        require_mtp_payload("text/mtp/layers/0/mlp/down");
+        models::qwen3_5::MtpWeights mtp;
+        mtp.input_projection =
+            add_single("text/mtp/draft_head", hidden, 2 * hidden, "mtp/stem_input");
+        mtp.embedding_norm =
+            add_resident("text/mtp/embedding_norm", "mtp.pre_fc_norm_embedding.weight",
+                         QType::BF16, {hidden}, "");
+        mtp.hidden_norm =
+            add_resident("text/mtp/hidden_norm", "mtp.pre_fc_norm_hidden.weight", QType::BF16,
+                         {hidden}, "");
+        mtp.final_norm = add_resident("text/mtp/final_norm", "mtp.norm.weight", QType::BF16,
+                                      {hidden}, "");
+        const std::string mp = "text/mtp/layers/0/";
+        const std::string mi = mp + "mixer_input";
+        models::qwen3_5::BlockWeights mlayer;
+        mlayer.input_norm =
+            add_resident(mp + "input_norm", "mtp.layers.0.input_layernorm.weight", QType::BF16,
+                         {hidden}, "");
+        mlayer.post_attention_norm = add_resident(
+            mp + "post_attention_norm", "mtp.layers.0.post_attention_layernorm.weight",
+            QType::BF16, {hidden}, "");
+        const std::string maqkv = mp + "attention/qkv";
+        models::qwen3_5::AttentionWeights mattn;
+        mattn.query  = add_flex(maqkv, mp + "attention/query", query_width, hidden, mi);
+        mattn.key    = add_flex(maqkv, mp + "attention/key", key_width, hidden, mi);
+        mattn.gate   = add_flex(maqkv, mp + "attention/gate", query_width, hidden, mi);
+        mattn.value  = add_flex(maqkv, mp + "attention/value", key_width, hidden, mi);
+        mattn.query_norm = add_resident(mp + "attention/query_norm",
+                                        "mtp.layers.0.self_attn.q_norm.weight", QType::BF16,
+                                        {text.attention->head_dim}, "");
+        mattn.key_norm =
+            add_resident(mp + "attention/key_norm", "mtp.layers.0.self_attn.k_norm.weight",
+                         QType::BF16, {text.attention->head_dim}, "");
+        mattn.output = add_single(mp + "attention/output", hidden, query_width,
+                                  mp + "attention/gated_output");
+        mlayer.mixer = std::move(mattn);
+        models::qwen3_5::DenseWeights mmlp;
+        const std::string mgu = mp + "mlp/gate_up";
+        mmlp.gate = add_flex(mgu, mp + "mlp/gate", intermediate, hidden, mp + "ffn_input");
+        mmlp.up   = add_flex(mgu, mp + "mlp/up", intermediate, hidden, mp + "ffn_input");
+        mmlp.down = add_single(mp + "mlp/down", hidden, intermediate, mp + "mlp/product");
+        mlayer.ffn          = std::move(mmlp);
+        mtp.layer           = std::move(mlayer);
+        mtp.token_embedding = weights.text.token_embedding;
+        mtp.output_head     = weights.text.output_head;
+        weights.mtp         = std::move(mtp);
+        weights.mtp->output_head_use = {weights.text.output_head, 0};
+        ++fused;
     }
 
     // (6) Publish: uploads complete before the Model is visible.

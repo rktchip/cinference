@@ -2,34 +2,37 @@
 
 # Cinference
 
-**A custom C++/CUDA inference engine for Qwen on a single RTX 5090 (32 GB), with 256K context.**
+> **Current contract (2026-09-23, commit `66ae8c7`).** EXL3 Qwen 3.8 27B
+> serve on one RTX 5090: default context/KV **8192**, max concurrency
+> **8 seqs**, spec **off**, graphs **off**, `CUDA_EXL3_AUTOTUNE=0` +
+> `CUDA_EXL3_SPLIT_TARGET=0` required. Measured serve: **~30 ms/token**
+> solo spec-off (~33 tok/s). Gate: two-curl T=0 **Paris / Rome**, 24/24.
+> 262k context is a future planner + compressed-KV project, not a flag.
+> MTP target is decode-only **window 3** (not MTP-10). Numbers from other
+> artifacts (NVFP4 tables, scratch microbench projections, HyperQwen
+> docs) are marked where they appear and are **not** this engine's.
 
-Built from [NInfer](https://github.com/Neroued/ninfer), with source-level changes to speculative decoding, CPU/GPU round buffers, and CUDA Graph management. Cinference modifies the native engine itself, not just its launch flags.
+Built from [NInfer](https://github.com/Neroued/ninfer): the native C++/CUDA
+engine for Qwen on a single RTX 5090. Cinference adds EXL3 weight support
+and a multi-client serve pump on top of it.
 
 ## Purpose
 
-Serve **one EXL3-quantized Qwen 3.8 27B** (`Qwen3.8-27B-EXL3-3.5bpw`, 3.5 bpw) on a **single RTX 5090** to **multiple concurrent HTTP clients**, with iteration-level continuous batching: mixed prefill+decode steps run as one forward at `m = live tokens`, paged KV, no Python on the step. Primary target: 262K context. Performance is judged head-to-head against local baselines by tokens/sec per watt — no borrowed bench numbers are quoted as ours.
+Serve **one EXL3-quantized Qwen 3.8 27B** (`Qwen3.8-27B-EXL3-3.5bpw`, 3.5 bpw) on a **single RTX 5090** to **multiple concurrent HTTP clients**, with iteration-level continuous batching: mixed prefill+decode steps run as one forward at `m = live tokens`, paged KV, no Python on the step. Default context/KV is 8192 (Paris/Rome profile); 262K needs a planner + compressed KV and is a separate project. Performance is judged head-to-head against local baselines by tokens/sec per watt — no borrowed bench numbers are quoted as ours.
 
 ## Where we started, where we are
 
-- **Start:** NInfer upstream (single-request decode path, `kMaximumConcurrency=8` cap, MTP<=3, fp16 KV) as modified by the Cinference fork (MTP-10, capture-based graph reuse, enlarged round buffers, Huihui NVFP4 installer path).
+- **Start:** NInfer upstream (single-request decode path, `kMaximumConcurrency=8` cap, MTP<=3, fp16 KV) as modified by the Cinference fork (MTP-10, capture-based graph reuse, enlarged round buffers, Huihui NVFP4 installer path — fork history, not our serve config).
 - **Then:** EXL3 weight support built from scratch against the exllamav3 1.5.1 reference: trellis/codebook contract, decode gemv, prefill reconstruct, numeric gates P10-P16/MG/OP/BIND/K5K6 (bit-exact or bounded 1-ulp vs the reference chain).
-- **Then:** the cuda-exl3 v3 vehicle swap (criterion 7): ATen-stripped M-tiled fused GEMM + autotuner, multi-group single-launch rows, hybrid Hadamard guard; bench 8x/25x/26x over the SIMT prefill at m=16/64/128.
-- **Now:** serve pump hardened for two clients (triplet mutex, CV backoff, workspace reserve, default concurrency 8), decode-rows sampler, ragged device-table attention; Linux two-curl is the gate. Fused single-M attention, graph capture, and MTP-in-pump are parked behind it.
+- **Then:** the cuda-exl3 v3 vehicle swap (criterion 7): ATen-stripped M-tiled fused GEMM + autotuner, multi-group single-launch rows, hybrid Hadamard guard; per-m kernel microbench 8x/25x/26x over the SIMT prefill at m=16/64/128 (kernel timings, not e2e serve).
+- **Now:** serve pump drives two clients (triplet mutex, CV backoff, workspace reserve, default concurrency 8), Engine-owned forward (embed, ragged attn, EXL3 linears, decode-rows sampler), per-seq tables/GDN, think/content split, real TTFT, working CLI. Two-curl T=0 Paris/Rome is the frozen gate. Graphs reverted (stale replay); MTP-in-pump blocked on bind + program-list + serve state (engine ticket running).
 
 ## Status
 
-- **2026-09-23 — first real tokens through the serve pump.** The
-  `run_batch_step` stub is dead (zero phrase-cycle remnants tree-wide);
-  `sample_decode_rows` has its first production caller
-  (`text.cpp:930`); two concurrent clients each stream 16 model tokens.
-  NOT a pass: output is multilingual soup and sequential same-prompt
-  runs diverge — block_tables/GDN per-step binding repair in flight.
-  Pass bar: sequential T=0 id-equality, then concurrent-A == solo-A.
-- **Diagnostic verdict (c):** solo logits bit-identical across runs;
-  first mixed step shifts ~90% of vocab (maxAbs ~12, top-8 disjoint)
-  from identical input — contamination, not wobble; sampler excluded.
-  Fix in flight: ragged-attention mixed-step isolation, then GDN Verify.
+- **Early history (collapsed):** first pump tokens streamed multilingual
+  soup with cross-run divergence (block_tables/GDN binding + fused-scatter
+  + conv-transpose + q/gate-interleave defects, fixed in order). Details
+  are run-record below; the freeze is the truth.
 - **Two-curl freeze PASSED (2026-09-23, lead-run on the same binary):**
   solo-A == conc-A (`'____'`, 16/16 tokens), conc-B 16 tokens,
   `output 16` on every req. Root cause was the EXL3 fused-QKV
@@ -37,20 +40,74 @@ Serve **one EXL3-quantized Qwen 3.8 27B** (`Qwen3.8-27B-EXL3-3.5bpw`, 3.5 bpw) o
   — fixed in `text.cpp` (+43/-1, column-wise 2D D2D). Determinism
   gate closed; fluency (flat-distribution soup) stays open.
 - **Conv transpose fix (2026-09-23):** loader copied conv1d weights
-  flat while kernels index tap-major — mixer now oracle-exact
-  (15.69 vs 15.65). Global NLL still ~15: second defect downstream,
-  layer-walk bisect in flight (full-attn fusion, MLP fusion, chunked
-  GDN).
+  flat while kernels index tap-major — mixer then oracle-exact
+  (15.69 vs 15.65). The remaining global gap was found by the
+  layer-walk: per-head q/gate interleave (next entry), not the
+  conv path.
 - **COHERENT (2026-09-23, lead-run):** per-head q/gate interleave fix
   (`q_proj` 12288 rows are `[q-head; gate-head]` per 512-group, not
   halves) — bread NLL 15.37 → 1.21, 5-tok 3.57 (oracle 3.45).
   Two concurrent clients: **Paris / Rome**, output 24/24. Serve works.
-  Known nits: think-tags leak into content; TTFT log field reads 0.
+  (Think/content split + real TTFT landed in `66ae8c7`; the nits noted
+  at freeze time are fixed.)
 - **FROZEN binary (2026-09-23):** `apps/ninfer-serve`, 216731704 B,
   sha256 `2746a95d…94aa17f46b`, env `CUDA_EXL3_AUTOTUNE=0
-  CUDA_EXL3_SPLIT_TARGET=0`. Graphs / MTP / fused attn / KVarN parked.
-  Next order when resumed: graph capture on stable single-seq decode,
-  then MTP-in-pump, then fused attention.
+  CUDA_EXL3_SPLIT_TARGET=0`. Graphs reverted (stale replay — ticket 2
+  needs the capture-stream fix first); MTP-in-pump blocked on the
+  engine ticket (Work queue §5); fused attention queued behind those.
+
+## Work queue (point of truth for /goal loops)
+
+Status words: DONE / RUNNING / QUEUED / BLOCKED. Update this table as
+work lands; the loop reads here, not chat.
+
+| # | Item | Status | Mode | Gate / exit |
+|---|---|---|---|---|
+| 0 | Freeze: coherent two-curl T=0 (Paris/Rome) | DONE | - | 66ae8c7; binary sha 2746a95d |
+| 1 | Think/content split | DONE | swarm | Test green, wire clean |
+| 2 | Real TTFT | DONE | swarm | Build + timestamp path |
+| 3 | CLI deadlock | DONE | swarm | CLI prints 24 toks, exit 0 |
+| 4 | Graph capture single-seq | REVERTED | swarm | Replay ids == eager ids (stale, reverted cleanly) |
+| 5 | MTP-in-pump (window 3, decode-only) | DONE on landed C:/src binary | Lead-verified: spec-off frozen gate holds (solo + conc Paris/Rome, 24/24, rewind True); spec-on accept 3 / commit 5 (Paris F=19 drafts=[6511 314 9338] verify=[6511 314 9338 369]); Paris/Rome rewind True; cross-path first-24 exact prefix both prompts. Re-score at landing: 03 groups > 0 (bind 979/81 fused), 04 fatal = false, 05 hard_off = false, 02 decode_only = true / mixed = off / window = 3, 09 accept > 1 (3), 14 Paris/Rome good. Known limits: serve ignores EOS (both paths run to max_tokens); final-step overshoot up to +4 over max_tokens; spec-on ~45-55 ms/tok wall vs ~25 ms/tok spec-off (syncs dominate, follow-up). Eager coherence re-proven: conc==solo 6/6 at 16 toks |
+| 5b | MTP engine work (workdir, UNCOMMITTED) | DONE landed 2026-09-23 — root causes: (1) stale host readback (non-blocking compute stream, blocking memcpy, no sync → nondeterministic first bonus), fixed with device_.synchronize() before each host read; (2) verify window off-by-one (drafts verified one slot early), fixed with bonus-chain inputs [b@F,d0@F+1,d1@F+2,d2@F+3] + commit-list (len 2-5); (3) MTP qkv split EXONERATED. Workdir proof: accept 3/commit 5, ~96-104% accept, Paris/Rome rewind True, cross-path prefix exact, pre-EOS ids == CLI 9/9 | Landed into C:/src (this tree) as uncommitted changes: `src/runtime/engine/engine.cpp` (serve-MTP state machine), `src/runtime/engine/exl3_program.cpp` (S7 allow-flag + weights.mtp bind), `src/models/qwen3_5/execution/parameters.cpp` (exl3_fused MTP qkv), `src/models/qwen3_5/frontend/frontend.{h,cpp}` (decode_tokens). All bars re-proven on the landed binary — see §5 |
+| 6 | Baseline ms/token (spec off, ctx ~2k) | DONE 2026-09-23 on landed binary | ctx 2,265-token prompt (server-counted), spec-off, T=0: wall 1.5 s / 24 tok, TTFT 914 ms → decode ~24 ms/tok; prefill ~2.48k tok/s; Paris answer correct. Matches ~30 ms/tok contract |
+| 7 | Graph ticket 2 (capture-stream fix) | BLOCKED — named blocker fixed, gate still open | 2026-09-23: `v3_capturing()` queried stream 0 but capture runs on the worker stream (`graph_execution.h:27`, worker stream `device.cu:64`) → fixed to `v3_capturing(cudaStream_t)` in `src/ops/linear/exl3/torchexl3/exl3_gemm.cu:709,730,875`; builds clean, spec-off Paris no-regress. Gate replay == eager still needs EXL3 serve-path capture wiring (none exists — serve `execution/text.cpp` has zero graph use; the .ninfer body at `program/decode.cpp:55-63` captures sample+D2H inside, violating the ticket shape) |
+| 8 | Fused single-M attention | BLOCKED behind 7 | Gate replay == eager unmet; per Known-skips §6 stays behind flag until bit-exact. maxAbs gate + no regress |
+| 9 | KVarN / DFlash2 | BLOCKED — needs standalone work orders | 2026-09-23 assessment: HyperQwen audit stands (zero `.cu`/`.cuh`/`.cpp`/`.rs` repo-wide, vLLM-0.28 Python/Triton only — nothing to port as C++/CUDA); KVarN is a backend-level KV-format change, DFlash2 needs a second draft model + degenerate-distribution guard. Neither is a serve tweak — no code started, none exists to land |
+| 10 | Follow-up commit (lanes 1-3 + graph revert) | DONE | - | 66ae8c7 already holds 1-3; revert is workdir-clean |
+| 11 | No-action audit (criterion 4) | DONE 2026-09-23 | Closing sweep: my changes scoped to 7 files (content diff 797+/71- CR-insensitive; tree-wide CRLF-vs-HEAD churn is pre-existing, untouched); no servers running, GPU free (1.2/32.6 GB); queue + Major-issues mirror consistent; frozen Paris/Rome coherence re-proven on every binary built this run. No further action outside the BLOCKED rows |
+
+Rules: swarm only items marked swarm with disjoint files; everything
+serial runs one lane at a time on the GPU. No item starts outside the
+Known-skips list. Commit only on explicit go-ahead.
+
+Side ledger (not queue work, uncommitted): `docs/cpp-optimization-and-bug-audit.md`
+— read-only audit, 8 optimizations + 5 suspected bugs with tests, nothing executed.
+`docs/optimize.md` — read-only pass 2, 8 consolidation targets + 3 new speed notes, nothing executed.
+
+## Known skips (intentional)
+
+| # | What | Why skipped | When | Accept bar |
+|---|---|---|---|---|
+| 1 | `CUDA_EXL3_AUTOTUNE=0` required at serve | Tuner-in-capture aborts; heuristic tier is the contract | Revisit only with a capture stream `v3_capturing()` actually sees | Serve starts clean without the env pin |
+| 2 | Default context / KV = 8192 | Paris/Rome profile | 262k is a planner + compressed-KV project, not a flag | - |
+| 3 | `max_concurrency` / `kMaximumConcurrency` = 8 | Max seqs/rows, not max tokens; chunk (1024) sets prefill M | - | - |
+| 4 | MTP-in-pump | BLOCKED: spec backend startup-fatal + mtp weights unbound + no serve MTP state (see queue §5) | Engine ticket first (bind mtp, serve state), then pump branch | T=0 Paris/Rome unchanged, tok/s up, head launches/token down |
+| 5 | CUDA graphs, single-seq decode | Stale-replay reverted | Gather/upload/sample-D2H outside graph; `v3_capturing()` on capture stream | Replay ids == eager ids; multi-seq is a separate ticket |
+| 6 | Fused single-M attention | 64xN launches correct today | One launch/layer, CTA per row; per-row path behind flag until bit-exact | maxAbs gate + no Paris/Rome regress |
+| 7 | KVarN (or fp8 KV) | New cache + attn; needed for 262k on one 5090 | Separate work order, not a serve tweak | - |
+| 8 | DFlash2 | Second draft model + verify | Only after MTP-in-pump is real | - |
+| 9 | Prefix page-share in admit | Digest + refcount + CoW | After two-curl is boringly stable | - |
+| 10 | int8-QK prefill, sort-free sampler | - | Only if a profile says prefill/sample is the wall | - |
+| 11 | HostKVExtentStore removal / CLI-legacy purge | Hygiene | After CLI Paris stays green | - |
+| 12 | Hybrid Hadamard in vendored `exl3_had.cuh` | Option D | Revert to pristine, rerun P16/MG/OP; fork epilogue only if a gate fails | - |
+| 13 | malaiwah K5K6-context / Gilded Gnosis 262k recipe | Another checkpoint + vLLM runtime | Loader increment at most; do not import their Python | - |
+| 14 | Vision / 8MP | Out of scope for text serve | - | - |
+| 15 | Interleave q/gate regression test | Missing in-tree | Add when `attn_input_proj` is touched again | One unit on q/gate scramble |
+
+Done, not skips: EXL3 load, pump, one scheduler, real `run_batch_step`,
+per-seq tables/GDN, think/content split, TTFT, CLI Paris. Nothing outside
+this list gets started "because HyperQwen had it."
 
 ## Provenance ledger — everything imported, ported, or added
 
@@ -62,7 +119,7 @@ Summary:
 | # | Item | Source / version | Author / license | Why used | Expectation |
 |---|---|---|---|---|---|
 | 1 | NInfer base engine | github.com/Neroued/ninfer | Neroued | The native C++/CUDA engine we fork: CLI, serve skeleton, MTP/draft paths, graph machinery | Upstream concepts only; execution path is ours |
-| 2 | Cinference fork changes | this repo history (`b74044f` MTP-10 publish) | satellitedown | MTP-10 window, capture-based graph reuse, enlarged CPU/GPU round buffers, Huihui NVFP4 setup | Retained; MTP-10 narrowed to decode-only window 3 in our pump |
+| 2 | Cinference fork changes | this repo history (`b74044f` MTP-10 publish) | satellitedown | HISTORICAL fork state: MTP-10 window, capture-based graph reuse, enlarged CPU/GPU round buffers, Huihui NVFP4 setup | Our serve narrowed to decode-only window 3, graphs off; fork flags are not our config |
 | 3 | cuda-exl3 v3 kernels (vehicle) | github.com/Zeuss5/cuda-exl3 @ `6a1ffc3` | cuda-exl3 contributors, MIT | Single M-tiled fused EXL3 GEMM + per-shape autotuner + epilogue Hadamard; 6 files vendored under `src/ops/linear/exl3/torchexl3/`, sha-pinned (`VENDORED_SHA256.txt`), ATen host layer replaced with raw-pointer seam, device code byte-identical except the documented hybrid delta in `exl3_had.cuh` | Best available EXL3 GEMM for sm_120; 8-26x over SIMT prefill; tuner intact (verified, not assumed) |
 | 4 | exllamav3 1.5.1 (reference/oracle) | pip install [exllamav3](https://github.com/turboderp/exllamav3) 1.5.1 (reference tree, not linked) | turboderp (ExLlamaV3) | Trellis/codebook/dequant ground truth; `LinearEXL3.forward`, `reconstruct_slice`, `had_r_128` grid convention, QTIP gemv lineage; every numeric gate oracles against it | Reference only — never linked, never shipped; gates stay green against it |
 | 5 | buun-llama-cpp format docs | [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp.git) @ `a2fd78181` (docs only) | buun contributors | `llama-hdf5.h`, `ggml-cuda/exl3*.cuh`, format docs for the trellis layout cross-check | Docs only; layout [k/16,n/16,16K] confirmed independently on all 409 groups |
@@ -76,7 +133,12 @@ Summary:
 
 The hybrid is not a wrapper: its 10 sites span 5 warp functions feeding both the had_in kernels *and* the GEMM epilogue (`had128_warp_acc/out` from `exl3_gemm.cu:465-510`). Making the vendored file byte-identical while keeping the behavior therefore means forking the epilogue kernels too — or reverting to pristine (`dfa6f331…`, recoverable in one `cp`) and re-running P16/MG/OP: if green, the hybrid was dead insurance on this checkpoint and deletion is pure win. Pin file stays the drift-detection contract either way.
 
-## What changed (upstream base)
+## What changed (upstream base — HISTORICAL fork state, not our serve config)
+
+> The fork shipped MTP-10 + capture graphs + big round buffers for the
+> NVFP4 path. Our EXL3 serve uses decode-only window 3 (blocked, engine
+> ticket running), graphs off (reverted), chunk 1024 / cap 8. Do not read
+> fork flags as current.
 
 - **MTP-10 decoding:** draft window raised from 5 to 10 tokens.
 - **Capture-based CUDA Graph reuse:** graph matching by captured node types and kernel functions; matching profiles + batch sizes share one executable.
@@ -84,6 +146,13 @@ The hybrid is not a wrapper: its 10 sites span 5 warp functions feeding both the
 - **Ready-to-run Huihui setup:** published NVFP4 v3 model + one-menu installer.
 
 ## Enhancements over the base (this port)
+
+> **Archive note:** the `batch.cu` / 4-descriptor / 64-wide / DFlash2
+> material below is the staged HyperQwen-shaped design essay. The live
+> serve path is: `ServeHookLoop` pump + one `RequestScheduler` +
+> Engine-owned `run_batch_step` (embed, ragged attn, EXL3 linears,
+> decode-rows sampler), per-seq tables/GDN, cap **8 seqs**. Serve
+> `Engine::submit` throws; empty decode never finishes a request.
 
 ### Multi-user continuous batching (`src/batch/`, staged)
 
@@ -93,6 +162,8 @@ iteration-level mixed scheduling inside the CUDA-graph engine.
 - `batch.cu` — interleaved device step: up to 4 batch descriptors per step
   (decode / prefill chunk / prefill recurrent / fused A), zero-copy chained kernels.
   This is the HyperQwen mechanism that yields 64-wide throughput.
+  (Archived design claim — never measured on this engine; our serve
+  runs cap 8, ~30 ms/token solo.)
 - `paged_kv.cu` — 1-block (64-token) granular paged KV allocation. Less fragmentation
   at dense concurrency, +6.25% worst-case slack vs 4-block granularity.
 - `request.cc` — DFlash2 draft state: recompute the draft path after accept, treat as
@@ -108,10 +179,16 @@ Linux-gated rest: real scheduler consumption loop, 4:1 KV quant wiring (`publish
 
 Settings: `src/batch/README.recommendations.md`.
 
-### EXL3 weight support (trellis decode + serve) — in progress
+### EXL3 weight support (trellis decode + serve) — SERVING (frozen 2026-09-23)
 
-Goal: load and serve EXL3 checkpoints (Qwen3.8-27B-EXL3-3.5bpw) natively; DFlash2
-drafts already quant-serve via the same tree. Port sources: the
+> Supersedes the stale lines inside this section: **409 groups**
+> (weight_map is the universe), **0 non-finite** scales file-wide,
+> **v3 + legacy-gemv routing** (m=1 gemv, m>=2 v3, K5/K6 via v3),
+> construct + two-curl coherent. The gate diary below is run-record;
+> where it says "in progress / gemv-only / 401 / NaN checkpoint", the
+> freeze above wins.
+
+Goal: load and serve EXL3 checkpoints (Qwen3.8-27B-EXL3-3.5bpw) natively — DONE (frozen serve). MTP draft serving is BLOCKED (weights.mtp unbound, spec startup-fatal, pump never calls MTP); DFlash2 is a separate queued work order, not a live path. Port sources: the
 [exllamav3](https://github.com/turboderp/exllamav3) 1.5.1 tree and
 [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp.git)
 (`ggml/src/llama/llama-hdf5.h`, `ggml-cuda/exl3*.cuh`, format docs).
@@ -424,8 +501,10 @@ class), dispatch = true serving path incl. workspace + memset + cast.
 m=1 legacy 38us; v3 24-61us flat across m=2..128; fused 27-94us for
 1..128 tokens in ONE launch; old SIMT prefill 242/925/1601us at
 m=16/64/128. The criterion-7 swap earns 8x/25x/26x at m=16/64/128.
-Concurrency moral: 128 decode tokens batched = one 61us launch/layer,
-~3ms full-model step -- batching is ~free up to m=128.
+Concurrency moral (kernel microbench, NOT e2e): 128 decode tokens batched = one 61us launch/layer,
+~3ms full-model step -- batching is ~free up to m=128. Measured e2e
+serve is ~30 ms/token solo spec-off; the K56 projection below is
+scratch arithmetic from these per-m timings, not a measured number.
 
 Gate BIND -- side-car builder (2026-09-22, CLOSED): new
 `exl3_bind.{h,cu}` (`exl3_build_sidecar`: validate -> host-sanitize in
@@ -461,9 +540,10 @@ Gate K56-BENCH -- per-m K5/K6 on the 5090 (2026-09-22, 2 runs,
 class as K4 dense -- o_proj costs no more than any other layer);
 lm_head-K6 FULL width (5120x248320, 953MB trellis transient)
 579/596/627/758/1844us at m=1/2/8/32/128. Full-width K6 m=2 is
-BIT-EXACT vs the torch chain (0/496640). Serving story (scratch
-projection from the per-m microbench timings above, NOT measured e2e):
-single-user decode ~= 47x35us + 579us ~= 2.2ms/token (~=450 tok/s); a
+BIT-EXACT vs the torch chain (0/496640). Serving story (SCRATCH
+projection from the per-m microbench timings above, NOT measured e2e —
+superseded by the measured ~30 ms/token solo spec-off in the Current
+contract): single-user decode ~= 47x35us + 579us ~= 2.2ms/token (~=450 tok/s); a
 128-wide batch ~= 47x61us + 1844us ~= 4.7ms for 128 tokens (~=27k tok/s).
 lm_head is ~25% of every decode step -- the head, not the body, is
 the first thing to quantize further or speculate past.
@@ -484,10 +564,13 @@ pkg-config + FFmpeg dev + libcurl pkg-config, none present on this box
   K comes from `trellis.shape[-1]/16` in `quantization_config.json`.
 - **cb is not a per-tensor byte** in this checkpoint family: K + mul1 presence fix it.
   K=3.5 -> cb2 + trellis; K=4 -> cb0/cb1 by calibration (unused split here: cb1).
-- **Why our concurrency wins over upstream NInfer:** upstream hard-caps at
+- **Why our concurrency wins over upstream NInfer (HISTORICAL note — not
+  this engine's numbers):** upstream hard-caps at
   `kMaximumConcurrency=8`, single staged prefill lane, MTP<=3, DFlash2<=15, fp16 KV.
-  The 64-wide plateau comes from batched mixed steps + quant KV + DFlash2 k=7 +
-  prefix resume — measured 1,039 tok/s at 64 on HyperQwen's 24 GB cohort.
+  The 64-wide plateau / 1,039 tok/s at 64 on HyperQwen's 24 GB cohort is
+  HyperQwen's vLLM measurement on different hardware and stack — it does
+  not describe this C++/CUDA serve path. Our measured number is ~30
+  ms/token solo spec-off (Current contract).
 - **Any TU including exl3_dispatch.h must be .cu, not .cpp** (device
   intrinsics in the header chain; nvcc compiles .cpp as host-only).
   exl3_bind started life as .cpp and died at `__dp4a unknown`.
@@ -504,10 +587,12 @@ pkg-config + FFmpeg dev + libcurl pkg-config, none present on this box
   CORRECTION). The model is a
   hybrid: interleaved `linear_attn` (gated-delta, fused qkv n=10240) and
   `self_attn` (GQA with separate q n=12288 / k,v n=1024 / o) layers, plus
-  an MTP draft block. Drafting relevance (criterion 4): the checkpoint
-  SHIPS its draft head (all-EXL3-K4, pristine) and cinference already
-  carries mtp.cpp -- the draft path is servable through this dispatch
-  today, no port needed.
+  an MTP draft block. Drafting relevance (CORRECTED 2026-09-23 — the old
+  "servable today" line was false): the checkpoint SHIPS its draft head
+  (all-EXL3-K4, pristine) and cinference carries mtp.cpp, but
+  `weights.mtp` is unbound, spec is startup-fatal, and the pump never
+  calls MTP — MTP-in-pump is BLOCKED on the engine ticket (Work queue
+  §5), not servable.
 - **A fused GEMM epilogue can beat the two-kernel reference by 1 ulp:**
   v3 folds the out-Had into the MMA epilogue (no intermediate fp16
   rounding), so sparse 1-ulp diffs vs hgemm+had on real magnitudes are a
@@ -637,16 +722,30 @@ vLLM patches):
 - **Stale-binary rule:** two-curl only counts against the binary that contains all of: pump mutex, workspace reserve, default concurrency 8, no decode break. Check the link timestamp before serving.
 - **m=1 v3 quirk:** the v3 fused row deviates slightly at m=1 only (13/128 bits, maxAbs 0.25); single-token decode routes through the legacy gemv path (bit-exact), v3 serves m>=2. See Gate P16.
 - **lm_head dominates decode:** full-width K6 head is ~25% of every decode step (~579us at m=1). Speculation or further head quantization is the first perf lever, not body kernels.
+- **Serve invariants (dual-path):** serve-mode `Engine::submit` throws — admission is via the hook-loop inbox only; exactly one `RequestScheduler` (hook-loop owned) serves both prepare and pump; GDN/conv state is per-seq (zeroed at admit, freed at finish), never a shared buffer; the NVFP4/`.ninfer` CLI path (incl. `--spec mtp`) must keep working — EXL3 is the other door, not a replacement.
+- **Graph ticket 2 shape:** capture layer launches only; block-table/upload, embed, and table gather stay eager; sample D2H after replay; `v3_capturing()` must see the capture stream (it currently queries stream 0).
 
-## Major open issues (ordered)
+## Major open issues (ordered; statuses mirror the Work queue above)
 
-1. **Linux two-curl gate** — linked `ninfer-serve` + two concurrent clients streaming. The gate for everything below.
-2. **Graph capture on stable decode-only membership** — capture key (signature, M-ceil, route); prefill stays eager; table build stays outside the capture.
-3. **MTP-in-pump** — decode-only, window 3, after tokens stream.
-4. **Fused single-M attention** — one launch over M via on-device `seq_offsets`/`block_tables`; per-row slices stay behind a flag until bit-exact gate passes.
-5. **KVarN / DFlash2 as separate work orders** — backend-level changes (KV format + attention kernels; draft algorithm + verify), never drop-ins.
+1. **Linux two-curl gate** — DONE (frozen: solo Paris + concurrent Paris/Rome, 24/24, T=0; binary sha 2746a95d).
+2. **Graph capture on stable decode-only membership** — BLOCKED (named capture-stream blocker fixed 2026-09-23: `v3_capturing(cudaStream_t)`; replay == eager still needs EXL3 serve-path capture wiring).
+3. **MTP-in-pump** — DONE 2026-09-23 (landed + lead-verified on C:/src binary: accept 3/commit 5, rewinds + cross-path exact, spec-off hold).
+4. **Fused single-M attention** — BLOCKED behind graphs (stays flagged until bit-exact).
+5. **KVarN / DFlash2 as separate work orders** — BLOCKED (no portable code exists: HyperQwen is vLLM Python/Triton only; both need standalone work orders, not serve tweaks).
 
 ## Run
+
+> **Sibling product vs this engine.** The Huihui installer below is the
+> NVFP4 sibling path, not EXL3 serve. To run this engine on EXL3:
+
+```bash
+CUDA_EXL3_AUTOTUNE=0 CUDA_EXL3_SPLIT_TARGET=0 \
+  ./apps/ninfer-serve /path/to/Qwen3.8-27B-EXL3-3.5bpw \
+  --host 127.0.0.1 --port 18080 --greedy
+```
+
+Requires Linux + NVIDIA drivers + the EXL3 checkpoint dir. Frozen
+binary: 216731704 B, sha256 `2746a95d…94aa17f46b`.
 
 For [Huihui Qwen3.8-27B Abliterated NVFP4](https://huggingface.co/satellitedown/Huihui-Qwen3.8-27B-abliterated-NVFP4-NInfer-v3), use the [one-menu installer](https://github.com/satellitedown/fast-long-context-cinference):
 
@@ -659,6 +758,11 @@ bash setup.sh
 Requires Linux and working NVIDIA drivers. Choose **1** to install, then **3** to start.
 
 ## Performance
+
+> **Not this engine.** The table below is the Huihui NVFP4 + MTP-10
+> sibling artifact on its own flags — it does not describe EXL3 serve.
+> This engine's measured number: **~30 ms/token solo spec-off**
+> (~33 tok/s; see Current contract). Kept for sibling reference only.
 
 | Prompt tokens | Tokens/s |
 |---:|---:|

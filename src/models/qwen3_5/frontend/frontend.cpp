@@ -900,6 +900,15 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
+std::string Frontend::decode_tokens(std::span<const TokenId> ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (ids.empty()) { return {}; }
+    std::vector<int> widened;
+    widened.reserve(ids.size());
+    for (TokenId id : ids) { widened.push_back(static_cast<int>(id)); }
+    return impl_->tokenizer->decode(widened, fi::DecodeOptions{.skip_special_tokens = true});
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
