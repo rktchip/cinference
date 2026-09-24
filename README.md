@@ -115,6 +115,7 @@ Side ledger (not queue work, uncommitted): `docs/cpp-optimization-and-bug-audit.
 | 13 | malaiwah K5K6-context / Gilded Gnosis 262k recipe | Another checkpoint + vLLM runtime | Loader increment at most; do not import their Python | - |
 | 14 | Vision / 8MP | Out of scope for text serve | - | - |
 | 15 | Interleave q/gate regression test | Missing in-tree | Add when `attn_input_proj` is touched again | One unit on q/gate scramble |
+| 16 | GDN snapshot/restore for graphed mixers (ORT pattern) | Not implemented; nothing graphed touches recurrent state today | Only with an attention-backend project that graphs mixers (route by width/batch, grid by capacity, mask by position) | GDN slot addresses stable across replay; rewind == eager |
 
 Done, not skips: EXL3 load, pump, one scheduler, real `run_batch_step`,
 per-seq tables/GDN, think/content split, TTFT, CLI Paris. Nothing outside
