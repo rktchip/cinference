@@ -1404,8 +1404,8 @@ public:
         if (hit == nullptr) {
             // No live exec and lane not dead: capture the layers-only call.
             // Embed runs eager first (outside the capture); uploads already
-            // ran above. Capture failure falls back to the eager forward we
-            // just ran (hidden is already valid) and parks the lane dead.
+            // ran above. Capture failure parks the lane dead and falls back
+            // to sampling whatever hidden holds (stale on this platform).
             Tensor x = card_->embed_serve_input(tensors);
             if (graph_dry_) {
                 // Diagnosis only: run the layers eagerly with no capture.
@@ -1437,6 +1437,15 @@ public:
                         exec != nullptr) {
                         cudaGraphDestroy(graph);
                         graph_store(lane, exec);
+                        // PLATFORM (2026-09-24, capmini-proven on this WSL box
+                        // in Global AND ThreadLocal modes): work launched
+                        // under capture records but never executes eagerly;
+                        // replay is the only working executor. So the capture
+                        // step's outputs must come from an immediate replay —
+                        // sampling pre-launch reads the previous step's hidden
+                        // (dup token). Costs one extra launch, once per lane
+                        // admission; steady-state replays are untouched.
+                        CUDA_CHECK(cudaGraphLaunch(exec, stream));
                         auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
                         vlog_step("capture", out);
                         plog_step("capture", x);
