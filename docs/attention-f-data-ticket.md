@@ -66,6 +66,17 @@ Bar A (all eager, no graphs yet):
 
 ## Phase B — borrow ORT snapshot/restore (do it here, not later)
 
+SKIPPED 2026-09-24 (audit, no GPU): GDN slot addresses are process-stable.
+`LinearAttentionStatePool` binds caller-owned backing at construction
+(fixed-capacity, no allocation policy); a slot is backing-base + layout
+offset, and `copy_slot` is D2D within the pool. MTP verify always uses
+(lane, spare, shadow=lane+base) — stable per lane for the admission's life —
+so a captured verify exec's slot pointers stay valid across replays. No
+realloc/rebind path exists to break replay. ORT snapshot/restore would buy
+nothing; per the ticket rule ("don't build it because the sweep mentioned
+it"), B is closed unimplemented. Original Known-skip 16 stands as the
+if-we-ever-graph-mixers note.
+
 Portable idea from the ONNX Runtime GenAI MTP doc, worth stealing as part of
 this ticket: snapshot/restore of the GDN recurrent state that **preserves
 buffer addresses** (in-place copy-back, never realloc), because CUDA-graph
@@ -82,6 +93,18 @@ replay requires stable addresses.
   address-stability check in verbose mode (pointer audit like `[gptr]`).
 
 ## Phase C — reopen verify graphs (only after A + B are green)
+
+PRE-C AUDIT 2026-09-24 (grep, no GPU): SmallT takes positions / seq lens /
+page tables as kernel args (device data). `small_t_bf16.cuh`: `pos[0]` /
+`pos[tokens-1]` / per-token `pos[token]` read in-kernel; `window =
+last_pos+1`, active-split count, split cull, and tile/window clamps all derive
+device-side; block tables + `valid_columns` arrive as device pointers.
+`logical_capacity` is now a static kMax bound (safe captured constant at any
+F — oversized splits exit device-side). No host F survives into the kernels;
+no stale-captured-constant hazard at F=200 for a graph recorded at F=20.
+Per-replay patch list for C: tokens, tables, positions, valid (live device
+buffers, same treatment as the seam's x/hidden); GDN slot views need no
+patching (stable addresses per Phase B audit).
 
 - Frozen execs keyed by shape, never `update()` across keys: `dec/M=1`
   (existing serve seam) + new `ver/M=4` wrapping `target_verify_batch`
