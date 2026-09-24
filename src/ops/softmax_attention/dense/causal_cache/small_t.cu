@@ -453,4 +453,95 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                                           partial_m, partial_l, out, stream);
 }
 
+// 2b fused pure-decode gather/scatter: exact copies between the flat
+// [D,H,T] serve tensors (row s lives at flat token seq_offsets[s]) and the
+// compact [D,H,1,B] buffers the uniform MultiBatch path consumes. One CTA
+// per row would under-fill; grid-stride over all elements instead.
+__global__ void fused_decode_gather_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const std::int32_t* pos, const std::uint32_t* seq_offsets, __nv_bfloat16* cq,
+    __nv_bfloat16* ck, __nv_bfloat16* cv, std::int32_t* cpos, std::int32_t q_row_elems,
+    std::int32_t kv_row_elems, std::uint32_t num_seqs) {
+    const std::int32_t widest = q_row_elems > kv_row_elems ? q_row_elems : kv_row_elems;
+    const std::uint64_t total = static_cast<std::uint64_t>(num_seqs) * static_cast<std::uint64_t>(widest);
+    for (std::uint64_t idx = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const std::uint32_t b = static_cast<std::uint32_t>(idx / static_cast<std::uint64_t>(widest));
+        const std::int32_t i  = static_cast<std::int32_t>(idx % static_cast<std::uint64_t>(widest));
+        const std::uint32_t off = seq_offsets[b];
+        if (i < q_row_elems) {
+            cq[static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(q_row_elems) +
+               static_cast<std::uint64_t>(i)] =
+                q[static_cast<std::uint64_t>(off) * static_cast<std::uint64_t>(q_row_elems) +
+                  static_cast<std::uint64_t>(i)];
+        }
+        if (i < kv_row_elems) {
+            const std::uint64_t dst = static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(kv_row_elems) +
+                                      static_cast<std::uint64_t>(i);
+            const std::uint64_t src = static_cast<std::uint64_t>(off) * static_cast<std::uint64_t>(kv_row_elems) +
+                                      static_cast<std::uint64_t>(i);
+            ck[dst] = k[src];
+            cv[dst] = v[src];
+        }
+        if (i == 0) { cpos[b] = pos[off]; }
+    }
+}
+
+__global__ void fused_decode_scatter_kernel(
+    const __nv_bfloat16* cout, __nv_bfloat16* out, const std::uint32_t* seq_offsets,
+    std::int32_t row_elems, std::uint32_t num_seqs) {
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(num_seqs) * static_cast<std::uint64_t>(row_elems);
+    for (std::uint64_t idx = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const std::uint32_t b = static_cast<std::uint32_t>(idx / static_cast<std::uint64_t>(row_elems));
+        const std::int32_t i  = static_cast<std::int32_t>(idx % static_cast<std::uint64_t>(row_elems));
+        out[static_cast<std::uint64_t>(seq_offsets[b]) * static_cast<std::uint64_t>(row_elems) +
+            static_cast<std::uint64_t>(i)] =
+            cout[static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(row_elems) +
+                 static_cast<std::uint64_t>(i)];
+    }
+}
+
+void causal_attention_fused_decode_batch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& table_rows, const std::uint32_t* seq_offsets, std::uint32_t num_seqs,
+    AttentionHeadGeometry geometry, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+    Tensor& out, cudaStream_t stream) {
+    const std::int32_t D       = q.ne[0];
+    const std::int32_t Hq      = q.ne[1];
+    const std::int32_t Hkv     = k.ne[1];
+    const std::int32_t B       = static_cast<std::int32_t>(num_seqs);
+    const std::int32_t q_row   = D * Hq;
+    const std::int32_t kv_row  = D * Hkv;
+    auto scope                 = workspace.scope();
+    Tensor cq                  = workspace.alloc(DType::BF16, {D, Hq, 1, B});
+    Tensor ck                  = workspace.alloc(DType::BF16, {D, Hkv, 1, B});
+    Tensor cv                  = workspace.alloc(DType::BF16, {D, Hkv, 1, B});
+    Tensor cpos                = workspace.alloc(DType::I32, {1, B});
+    Tensor cout                = workspace.alloc(DType::BF16, {D, Hq, 1, B});
+    const std::int32_t widest  = q_row > kv_row ? q_row : kv_row;
+    const std::uint64_t total  = static_cast<std::uint64_t>(B) * static_cast<std::uint64_t>(widest);
+    const std::uint32_t blocks = static_cast<std::uint32_t>(
+        (total + 255) / 256 > 1024 ? 1024 : (total + 255) / 256);
+    fused_decode_gather_kernel<<<blocks, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(positions.data),
+        seq_offsets, static_cast<__nv_bfloat16*>(cq.data), static_cast<__nv_bfloat16*>(ck.data),
+        static_cast<__nv_bfloat16*>(cv.data), static_cast<std::int32_t*>(cpos.data), q_row, kv_row,
+        num_seqs);
+    CUDA_CHECK(cudaGetLastError());
+    const Tensor dense_columns;
+    causal_softmax_attention(cq, ck, cv, cpos, dense_columns, table_rows, geometry, scale, cache,
+                             envelope, workspace, cout, stream);
+    const std::uint64_t out_total = static_cast<std::uint64_t>(B) * static_cast<std::uint64_t>(q_row);
+    const std::uint32_t out_blocks = static_cast<std::uint32_t>(
+        (out_total + 255) / 256 > 1024 ? 1024 : (out_total + 255) / 256);
+    fused_decode_scatter_kernel<<<out_blocks, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(cout.data), static_cast<__nv_bfloat16*>(out.data),
+        seq_offsets, q_row, num_seqs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

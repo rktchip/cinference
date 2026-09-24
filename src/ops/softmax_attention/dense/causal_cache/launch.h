@@ -4,6 +4,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "core/arena.h"
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cuda_runtime.h>
@@ -39,6 +40,18 @@ void causal_attention_small_t_launch(
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+
+// 2b fused pure-decode batch (serve): every live row spans exactly one
+// token. Gathers the span-1 rows into compact [D,H,1,B] buffers, runs the
+// proven singular entry once (uniform MultiBatch path), scatters back.
+// Gather/scatter are exact copies; the attention math kernel is unchanged.
+// Mixed spans and single-row batches stay on the per-row loop (caller gates).
+void causal_attention_fused_decode_batch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& table_rows, const std::uint32_t* seq_offsets, std::uint32_t num_seqs,
+    AttentionHeadGeometry geometry, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+    Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,

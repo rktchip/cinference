@@ -10,12 +10,23 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops {
 namespace {
+
+bool fused_decode_attn_enabled() {
+    // 2b flag: default = per-row loop (env unset). NINFER_FUSED_ATTN=1
+    // enables the fused pure-decode batch below. No other value enables it.
+    static const bool on = [] {
+        const char* e = std::getenv("NINFER_FUSED_ATTN");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr float kExpectedScale                       = 0.0625f;
@@ -596,6 +607,19 @@ void causal_softmax_attention_ragged(
     // batch::DeviceResolveRaggedToken) is a launch-shape optimization, never a
     // numerical change. Absolute positions ride the flat positions slice, so
     // each row appends exactly its own K/V before it is observed.
+    //
+    // 2b fused pure-decode: when every live row spans exactly one token
+    // (longest_span == 1) and more than one row is live, gather the rows
+    // into compact [D,H,1,B] buffers, run the proven singular entry once,
+    // and scatter back: 4 launches/layer instead of ~2-3 per row. Mixed
+    // spans and single-row batches always take the per-row loop below, and
+    // the loop is the default until NINFER_FUSED_ATTN=1 opts in.
+    if (num_seqs > 1 && longest_span == 1 && fused_decode_attn_enabled()) {
+        detail::causal_attention_fused_decode_batch(
+            q, k, v, positions, kv_table_rows, ragged.seq_offsets, num_seqs,
+            geometry, scale, cache, envelope, workspace, out, stream);
+        return;
+    }
     for (std::uint32_t s = 0; s < num_seqs; ++s) {
         const std::int32_t begin = static_cast<std::int32_t>(host_seq_offsets[s]);
         const std::int32_t span  = static_cast<std::int32_t>(host_seq_offsets[s + 1]) -
