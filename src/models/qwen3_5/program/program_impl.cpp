@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -45,7 +46,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      use_cuda_graph(plan.use_cuda_graph &&
+                     plan.speculative_backend != SpeculativeBackend::Mtp),
+      causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -74,6 +77,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
+    if (plan.use_cuda_graph && plan.speculative_backend == SpeculativeBackend::Mtp) {
+        // Ticket 2026-09-24 (spec-on GraphExecUpdateFailure at startup):
+        // program graph families cannot update across MTP draft shapes
+        // (update result 5). Graphs off for spec-on is the valid config —
+        // identical to --no-cuda-graph, already proven for MTP.
+        std::fprintf(stderr, "ninfer: CUDA graphs disabled for MTP speculative backend; "
+                             "spec-on runs eager\n");
+    }
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
