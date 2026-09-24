@@ -1064,6 +1064,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
+                                           const Tensor* linear_state_destination_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
@@ -1098,6 +1099,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
         ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
                                                  &linear_state_source_slots);
+        ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                       linear_state_destination_slots);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -1129,8 +1132,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+                             linear_state_source_slots, nullptr, envelope, hidden, logits,
+                             target_tokens, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -1141,8 +1144,23 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             linear_state_source_slots, nullptr, envelope, hidden, logits,
+                             target_tokens, sink);
+}
+
+// Lane B: snapshot verify with explicit destination slot (serve MTP-3 batched
+// verify, width 4). No feature sink on this arm; the record path is untouched.
+void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                                      const Tensor& rope_positions, const Tensor& valid_columns,
+                                      const Tensor& kv_table_rows,
+                                      const Tensor& linear_state_source_slots,
+                                      const Tensor& linear_state_destination_slots,
+                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
+    NullTap tap;
+    target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                             linear_state_source_slots, &linear_state_destination_slots, envelope,
+                             hidden, logits, target_tokens, tap);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -1395,7 +1413,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
         if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
-            throw std::logic_error("In-place batched GDN update requires width one");
+            // Lane B batched snapshot verify only: single row, width in
+            // (1, 4] with an explicit destination slot (spare source, shadow
+            // destination). Every other in-place caller is width-1; the
+            // record path below keeps its own domain. Anything else throws.
+            if (active_linear_state_destination_slots_ == nullptr || width <= 1 || width > 4 ||
+                active_sequence_batch_ != 1) {
+                throw std::logic_error("In-place batched GDN update requires width one");
+            }
         }
         Tensor projection_input =
             h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
@@ -1473,13 +1498,38 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, s);
-        } else {
+        } else if (width == 1) {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
                 *active_linear_state_destination_slots_, out_batch, s);
+        } else {
+            // Lane B width-4 snapshot (serve batched verify): the recurrent
+            // kernel is width-1, so chain the window column by column,
+            // alternating source/destination between the spare and shadow
+            // slots. Column c reads the previous column's published state
+            // and publishes the next, exactly like the serial width-1 rows
+            // this replaces (final state lands in the source slot after an
+            // even width; both slots are scratch). All other paths above.
+            const Tensor& ping = *active_linear_state_source_slots_;
+            const Tensor& pong = *active_linear_state_destination_slots_;
+            const float scale  = static_cast<float>(
+                1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+            for (std::int32_t c = 0; c < width; ++c) {
+                Tensor qc = q_batch.slice(2, c, 1);
+                Tensor kc = k_batch.slice(2, c, 1);
+                Tensor vc = v_batch.slice(2, c, 1);
+                Tensor gc = g_batch.slice(1, c, 1);
+                Tensor bc = beta_batch.slice(1, c, 1);
+                Tensor oc = out_batch.slice(2, c, 1);
+                const Tensor& scol = (c % 2 == 0) ? ping : pong;
+                const Tensor& dcol = (c % 2 == 0) ? pong : ping;
+                ops::gated_delta_net_batch_update(qc, kc, vc, gc, bc, scale,
+                                                  /*normalize_qk=*/true, recurrent_states, scol,
+                                                  dcol, oc, s);
+            }
         }
     } else {
         Tensor recurrent_state_in =

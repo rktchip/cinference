@@ -366,6 +366,19 @@ public:
         // Verify argmax outbox: one I32 slot per verify row so all four
         // argmaxes can enqueue before the single batch sync (row 13).
         mtp_vtok_ = off; off += align_up(4U * 4U);
+        // Lane B: single width-4 target verify staging (ids/positions over
+        // the window, one KV row / src / dst / valid slot, [H,4] + [V,4]
+        // outputs). Token outbox reuses mtp_vtok_. Disjoint from the fill
+        // regions by construction (decode never runs the prefill fill).
+        mtp_vids_ = off; off += align_up(4U * 4U);
+        mtp_vpos_ = off; off += align_up(4U * 4U);
+        mtp_vrow_ = off; off += align_up(4);
+        mtp_vsrc_ = off; off += align_up(4);
+        mtp_vdst_ = off; off += align_up(4);
+        mtp_vval_ = off; off += align_up(4);
+        mtp_vhid_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 4U * 2U);
+        mtp_vlog_ = off;
+        off += align_up(static_cast<std::size_t>(text_vocab_) * 4U * 2U);
         mtp_fill_ids_ = off; off += align_up(8U * 4U);
         mtp_fill_pos_ = off; off += align_up(8U * 4U);
         mtp_fill_rows_ = off; off += align_up(8U * 4U);
@@ -771,8 +784,8 @@ public:
     }
 
     // S7 MTP-3 single-slot decode: draft 3 from the in-checkpoint head, one
-    // target forward over anchor + drafts (4 sequential width-1 rows in the
-    // spare GDN slot), longest-prefix accept, selective replay commit. The
+    // width-4 target verify over bonus + drafts (spare->shadow snapshot, one
+    // sync), longest-prefix accept, selective replay commit. The
     // lane (text KV cursor, GDN state) is untouched until the commit: a
     // rejection rewinds by construction (cursor discipline, spare discarded,
     // only the accepted prefix replayed). Returns 1 + accepted pairs.
@@ -890,39 +903,63 @@ public:
                 prev_hid = &mh[j % 2];
             }
         }
-        // GDN snapshot, then the target verify over the drafts. The verify
-        // runs entirely in the spare slot, so the lane is untouched until
-        // the commit below. Verify inputs are the BONUS draft chain, not the
-        // anchor: [b@F, d0@F+1, d1@F+2, d2@F+3]. Each row's argmax is the
+        // GDN snapshot, then one width-4 target verify over the drafts. The
+        // verify runs spare->shadow, so the lane is untouched until the
+        // commit below. Verify inputs are the BONUS draft chain, not the
+        // anchor: [b@F, d0@F+1, d1@F+2, d2@F+3]. Each column's argmax is the
         // target pick for the slot AFTER its input, so out[j] is the target
         // pick for the same slot drafts[j] predicts (d_j vs out[j]). The
         // anchor row is NOT re-run: the lane already contains it (a re-run
-        // would double-apply GDN) and the stash holds its logits. Width-1
-        // rows chain spare->spare, so every row applies exactly once.
+        // would double-apply GDN) and the stash holds its logits. The window
+        // chains across width inside the snapshot kernels, so every column
+        // applies exactly once. Text KV writes are positional
+        // overwrite-identical to the four serial rows this replaces.
         pool_->copy_slot(lane, spare, stream);
-        // The bonus (slot-F token) is consumed as verify row 0's input;
-        // save it before the loop overwrites host_targets[0] with out[0].
+        // The bonus (slot-F token) is consumed as verify column 0's input;
+        // save it before the verify overwrites host_targets[0] with out[0].
         const std::int32_t bonus = host_targets[0];
         {
+            const std::int32_t shadow = mtp_shadow_base_ + lane;
             const std::int32_t in4[4] = {bonus, host_drafts[0], host_drafts[1],
                                          host_drafts[2]};
-            // One sync for all four rows: each argmax lands in its own
-            // outbox slot, so every row + argmax enqueues before the host
-            // reads anything (row 13: 4 stalls collapse to 1).
-            Tensor vtok_out[4] = {Tensor(mbase + mtp_vtok_, DType::I32, {1}),
-                                  Tensor(mbase + mtp_vtok_ + 4, DType::I32, {1}),
-                                  Tensor(mbase + mtp_vtok_ + 8, DType::I32, {1}),
-                                  Tensor(mbase + mtp_vtok_ + 12, DType::I32, {1})};
-            for (std::uint32_t i = 0; i < kDrafts + 1; ++i) {
-                run_single_row(in4[i], F + i, lane, spare, spare, hid1, log1);
-                ops::argmax(log1, vtok_out[i], public_tokens_, stream);
-            }
+            const std::int32_t f4 = static_cast<std::int32_t>(F);
+            const std::int32_t pos4[4] = {f4, f4 + 1, f4 + 2, f4 + 3};
+            const std::int32_t four    = 4;
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vids_, in4, sizeof(in4),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vpos_, pos4, sizeof(pos4),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vrow_, &lane, sizeof(lane),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vsrc_, &spare, sizeof(spare),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vdst_, &shadow, sizeof(shadow),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_vval_, &four, sizeof(four),
+                                       cudaMemcpyHostToDevice, stream));
+            const Tensor vids(mbase + mtp_vids_, DType::I32, {4, 1});
+            const Tensor vpos(mbase + mtp_vpos_, DType::I32, {4, 1});
+            const Tensor vrow(mbase + mtp_vrow_, DType::I32, {1});
+            const Tensor vsrc(mbase + mtp_vsrc_, DType::I32, {1});
+            const Tensor vdst(mbase + mtp_vdst_, DType::I32, {1});
+            const Tensor vval(mbase + mtp_vval_, DType::I32, {1});
+            Tensor vhid(mbase + mtp_vhid_, DType::BF16, {H, 4, 1});
+            Tensor vlog(mbase + mtp_vlog_, DType::BF16, {V, 4, 1});
+            Tensor vtok(mbase + mtp_vtok_, DType::I32, {4, 1});
+            // Envelope mirrors the reference MTP target verify ({1, F+4}):
+            // per-column masking is positional, the bound only caps the
+            // kernel launch. Argmax runs inside the verify (one sync). 
+            const ops::CausalAttentionExecutionEnvelope venv{
+                1U, static_cast<std::uint32_t>(f4 + 4)};
+            card_->set_gdn_state_action(
+                models::qwen3_5::execution::GdnStateAction::UpdateInPlace, nullptr);
+            card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv, vhid,
+                                       vlog, vtok);
+            // One sync for the whole window: hidden/logits/argmax for all
+            // four columns enqueue before the host reads anything.
             device_.synchronize();
-            for (std::uint32_t i = 0; i < kDrafts + 1; ++i) {
-                CUDA_CHECK(cudaMemcpy(&host_targets[i],
-                                      mbase + mtp_vtok_ + static_cast<std::size_t>(i) * 4U,
-                                      sizeof(std::int32_t), cudaMemcpyDeviceToHost));
-            }
+            CUDA_CHECK(cudaMemcpy(host_targets, mbase + mtp_vtok_, sizeof(host_targets),
+                                  cudaMemcpyDeviceToHost));
         }
         // Longest matching prefix: drafts[j] predicts slot F+1+j and
         // host_targets[j] (fresh verify argmax) is the target pick for that
@@ -1139,6 +1176,14 @@ private:
     std::size_t mtp_sdst_      = 0;
     std::size_t mtp_tok_       = 0;
     std::size_t mtp_vtok_      = 0;
+    std::size_t mtp_vids_      = 0;
+    std::size_t mtp_vpos_      = 0;
+    std::size_t mtp_vrow_      = 0;
+    std::size_t mtp_vsrc_      = 0;
+    std::size_t mtp_vdst_      = 0;
+    std::size_t mtp_vval_      = 0;
+    std::size_t mtp_vhid_      = 0;
+    std::size_t mtp_vlog_      = 0;
     std::size_t mtp_fill_ids_  = 0;
     std::size_t mtp_fill_pos_  = 0;
     std::size_t mtp_fill_rows_ = 0;

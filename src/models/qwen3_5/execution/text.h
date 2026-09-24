@@ -188,6 +188,16 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+    // Lane B: snapshot verify with an explicit destination slot (serve MTP-3
+    // batched verify: source = spare, destination = shadow). Width > 1 chains
+    // across the window inside the snapshot kernels; the lane is untouched
+    // until the commit replay. Record path untouched (no sink on this arm).
+    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                             const Tensor& rope_positions, const Tensor& valid_columns,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             const Tensor& linear_state_destination_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                             Tensor& logits, Tensor& target_tokens);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -220,6 +230,7 @@ private:
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
+                                  const Tensor* linear_state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
