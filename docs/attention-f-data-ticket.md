@@ -94,6 +94,8 @@ replay requires stable addresses.
 
 ## Phase C — reopen verify graphs (only after A + B are green)
 
+DONE 2026-09-24, GPU-gated (engine.cpp, opt-in NINFER_SERVE_GRAPH, default-off).
+
 PRE-C AUDIT 2026-09-24 (grep, no GPU): SmallT takes positions / seq lens /
 page tables as kernel args (device data). `small_t_bf16.cuh`: `pos[0]` /
 `pos[tokens-1]` / per-token `pos[token]` read in-kernel; `window =
@@ -117,6 +119,15 @@ patching (stable addresses per Phase B audit).
   and no FATAL; Paris drafts 6511/314/9338 accept 3 + rewind; spec-off
   GRAPH=1 still ~14 ms/tok; spec-on beats eager ~45 ms/tok or MTP stays
   graph-off per bar-4; 8/8 spec-off matrix.
+- DONE EVIDENCE: one global ver/M=4 exec (lane-independent addresses);
+  capture on 2nd verify, immediate replay (WSL rule); pre-work (copy_slot,
+  H2Ds) + post-work (sync/D2H) outside capture; drafts eager; bonus eager.
+  Canonical Paris 6511/314/9338/369 accept-3 + accept-1 rewinds ON REPLAY,
+  one exec replayed across F=19..56. Spec-off GRAPH=1: 14.4/14.3 ms/tok.
+  Spec-on FOX-64: replay 35.4 vs eager 39.2 ms/tok (n=3 each, separated
+  ranges, ~10% — verify is 1 of ~6 full passes/step, so the ceiling was
+  always ~15%). Matrix on C binary: P conc==solo True, R diverges (filed
+  pre-existing batch-reduction; no 8/8-on-graphs claim).
 - No default flip in the same commit as any of this.
 
 ## Must not (whole ticket)

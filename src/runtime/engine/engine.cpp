@@ -975,8 +975,72 @@ public:
                 1U, static_cast<std::uint32_t>(f4 + 4)};
             card_->set_gdn_state_action(
                 models::qwen3_5::execution::GdnStateAction::UpdateInPlace, nullptr);
-            card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv, vhid,
-                                       vlog, vtok);
+            // Phase C: frozen ver/M=4. Pre-work above (copy_slot, H2D uploads
+            // to fixed mbase offsets) always runs eager outside capture; only
+            // the layers call below is captured. Post-work below (sync + D2H
+            // of vtok) stays outside. First verify runs eager (seen rule),
+            // capture on the 2nd+, replay after. Default graph-off: active
+            // only under NINFER_SERVE_GRAPH with MTP on.
+            const bool vgraph_on =
+                graphs_enabled_ && mtp_enabled_ && !graph_dry_ && !verify_dead_;
+            if (vgraph_on && !verify_seen_) verify_seen_ = true;
+            auto vglog = [&](const char* act) {
+                if (graph_verbose_) {
+                    std::fprintf(stderr, "[vgraph] lane=%d F=%u action=%s\n", lane, F, act);
+                }
+            };
+            if (vgraph_on && verify_seen_ && verify_exec_ != nullptr) {
+                CUDA_CHECK(cudaGraphLaunch(verify_exec_, stream));
+                vglog("replay");
+            } else if (vgraph_on && verify_seen_ && verify_exec_ == nullptr) {
+                cudaGraph_t vgraph = nullptr;
+                bool vok           = false;
+                if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) ==
+                    cudaSuccess) {
+                    try {
+                        card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst,
+                                                   venv, vhid, vlog, vtok);
+                    } catch (...) {
+                        cudaStreamEndCapture(stream, &vgraph);
+                        if (vgraph != nullptr) cudaGraphDestroy(vgraph);
+                        verify_dead_ = true;
+                        throw;
+                    }
+                    if (cudaStreamEndCapture(stream, &vgraph) == cudaSuccess &&
+                        vgraph != nullptr) {
+                        cudaGraphExec_t vexec = nullptr;
+                        if (cudaGraphInstantiate(&vexec, vgraph, nullptr, nullptr, 0) ==
+                                cudaSuccess &&
+                            vexec != nullptr) {
+                            cudaGraphDestroy(vgraph);
+                            verify_exec_ = vexec;
+                            // WSL record-only: the capture pass never executed,
+                            // so this step's outputs come from an immediate
+                            // replay (same rule as the dec/M=1 seam).
+                            CUDA_CHECK(cudaGraphLaunch(verify_exec_, stream));
+                            vglog("capture");
+                            vok = true;
+                        } else {
+                            if (vexec != nullptr) cudaGraphExecDestroy(vexec);
+                            cudaGraphDestroy(vgraph);
+                        }
+                    } else if (vgraph != nullptr) {
+                        cudaGraphDestroy(vgraph);
+                    }
+                }
+                if (!vok) {
+                    // Capture failed without throwing: park dead and run this
+                    // step eager (capture didn't execute, hidden is stale).
+                    verify_dead_ = true;
+                    card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst,
+                                               venv, vhid, vlog, vtok);
+                    vglog("capture-fail");
+                }
+            } else {
+                card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
+                                           vhid, vlog, vtok);
+                vglog(!vgraph_on ? "eager-disabled" : "eager-first");
+            }
             // One sync for the whole window: hidden/logits/argmax for all
             // four columns enqueue before the host reads anything.
             device_.synchronize();
@@ -1259,6 +1323,16 @@ private:
     bool graphs_enabled_ = true;
     bool graph_verbose_  = false;
     bool graph_dry_      = false;
+    // Phase C (2026-09-24): one frozen ver/M=4 exec, GLOBAL not per-lane.
+    // All baked addresses are lane-independent (pool bases, mbase scratch,
+    // reset-discipline arena); lane-varying data (slot indices, ids,
+    // positions, valid) lives in fixed-address buffers rewritten per step
+    // outside capture. First verify runs eager (settles lazy state), capture
+    // on the 2nd+, immediate replay (WSL record-only rule). Fail-closed:
+    // capture failure parks it dead and verify stays eager.
+    cudaGraphExec_t verify_exec_ = nullptr;
+    bool verify_seen_            = false;
+    bool verify_dead_            = false;
 
 public:
     ~ServeForwardContext() {
@@ -1268,6 +1342,10 @@ public:
                 slot.exec = nullptr;
                 slot.live = false;
             }
+        }
+        if (verify_exec_ != nullptr) {
+            cudaGraphExecDestroy(verify_exec_);
+            verify_exec_ = nullptr;
         }
     }
 
