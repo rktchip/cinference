@@ -34,6 +34,7 @@
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
+#include "ops/wrapper/qg_scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
@@ -1353,39 +1354,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             Tensor full = work_.alloc(DType::BF16, {nr, T});
             ops::detail::exl3_dispatch(h, fused_single->weight, full, fused_single->policy,
                                        &work_, s);
-            // Fused full-attention qkv scatter: checkpoint q_proj rows
-            // are per-head interleaved ([q-head h; gate-head h] per
-            // 2*head_dim group, matching oracle exllamav3
-            // deinterleave_qg), NOT [q; gate] halves. Scatter each head
-            // group into the contiguous q/gate flats; k/v halves follow
-            // unchanged.
-            const char* full_base = static_cast<const char*>(full.data);
-            const std::size_t src_pitch = static_cast<std::size_t>(nr) * 2U;
+            // Fused full-attention qkv scatter: single owner
+            // ops::detail::scatter_qg_heads (C1 consolidation). Guards stay.
             const std::int32_t hd = dimension(config_.attention->head_dim);
             const std::int32_t nh = dimension(config_.attention->num_attention_heads);
             if (hd <= 0 || nh <= 0 || qr != hd * nh) {
                 throw std::logic_error("text attn q/g interleave geometry mismatch");
             }
-            auto copy_block = [&](void* dst_data, std::size_t dst_pitch, std::size_t dst_row,
-                                  std::size_t src_row, std::size_t rows) {
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    static_cast<char*>(dst_data) + dst_row * 2U, dst_pitch,
-                    full_base + src_row * 2U, src_pitch, rows * 2U,
-                    static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
-            };
-            const std::size_t q_pitch  = static_cast<std::size_t>(qr) * 2U;
-            const std::size_t kv_pitch = static_cast<std::size_t>(kr) * 2U;
-            for (std::int32_t h = 0; h < nh; ++h) {
-                const std::size_t grp =
-                    static_cast<std::size_t>(h) * static_cast<std::size_t>(hd);
-                copy_block(q_flat.data, q_pitch, grp, grp * 2U, static_cast<std::size_t>(hd));
-                copy_block(gate_flat.data, q_pitch, grp, grp * 2U + static_cast<std::size_t>(hd),
-                           static_cast<std::size_t>(hd));
-            }
-            copy_block(k_flat.data, kv_pitch, 0, static_cast<std::size_t>(2 * qr),
-                       static_cast<std::size_t>(kr));
-            copy_block(v_flat.data, kv_pitch, 0, static_cast<std::size_t>(2 * qr + kr),
-                       static_cast<std::size_t>(kr));
+            ops::detail::scatter_qg_heads(
+                q_flat.data, gate_flat.data, k_flat.data, v_flat.data,
+                full.data, static_cast<std::size_t>(nr), qr, kr, nh, hd,
+                static_cast<std::size_t>(T), s);
         } else {
             attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
         }

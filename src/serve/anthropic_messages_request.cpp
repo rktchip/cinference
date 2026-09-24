@@ -936,6 +936,13 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
         (*request.sampling.temperature < 0.0 || *request.sampling.temperature > 1.0)) {
         bad_request("temperature must be in [0,1]", "temperature");
     }
+    // C5/B1: the serve card holds one greedy config per step; per-request
+    // sampling never reaches it. Reject nonzero temperatures instead of
+    // silently serving greedy. Absent/null means greedy (allowed).
+    if (request.sampling.temperature && *request.sampling.temperature != 0.0) {
+        bad_request("temperature sampling is not served yet; omit temperature or use 0 (greedy)",
+                    "temperature", "temperature_not_supported");
+    }
     if (request.sampling.top_p &&
         (*request.sampling.top_p < 0.0 || *request.sampling.top_p > 1.0)) {
         bad_request("top_p must be in [0,1]", "top_p");

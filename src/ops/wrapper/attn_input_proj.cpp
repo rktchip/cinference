@@ -7,6 +7,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/exl3/exl3_op.h"
+#include "ops/wrapper/qg_scatter.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -183,31 +184,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         constexpr std::int32_t kHeads   = 24;
         constexpr std::int32_t kHeadDim = 256;
         static_assert(kQRows == kHeads * kHeadDim, "q/g interleave geometry");
-        const char* full_base       = static_cast<const char*>(full.data);
-        const std::size_t src_pitch = static_cast<std::size_t>(kRows) * sizeof(std::uint16_t);
-        const std::size_t q_pitch   = static_cast<std::size_t>(kQRows) * sizeof(std::uint16_t);
-        const std::size_t kv_pitch  = static_cast<std::size_t>(kKvRows) * sizeof(std::uint16_t);
-        auto copy_block = [&](void* dst_data, std::size_t dst_pitch, std::size_t dst_row,
-                              std::size_t src_row, std::size_t rows) {
-            const cudaError_t copy = cudaMemcpy2DAsync(
-                static_cast<char*>(dst_data) + dst_row * sizeof(std::uint16_t), dst_pitch,
-                full_base + src_row * sizeof(std::uint16_t), src_pitch,
-                rows * sizeof(std::uint16_t), static_cast<std::size_t>(cols),
-                cudaMemcpyDeviceToDevice, stream);
-            if (copy != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("exl3 attn_input_proj: device copy failed: ") +
-                    cudaGetErrorString(copy));
-            }
-        };
-        for (std::int32_t h = 0; h < kHeads; ++h) {
-            const std::size_t grp =
-                static_cast<std::size_t>(h) * static_cast<std::size_t>(kHeadDim);
-            copy_block(q.data, q_pitch, grp, grp * 2U, kHeadDim);
-            copy_block(gate.data, q_pitch, grp, grp * 2U + kHeadDim, kHeadDim);
-        }
-        copy_block(k.data, kv_pitch, 0, 12288, kKvRows);
-        copy_block(v.data, kv_pitch, 0, 13312, kKvRows);
+        // Scatter geometry has a single owner now (C1); guards above stay.
+        detail::scatter_qg_heads(q.data, gate.data, k.data, v.data, full.data,
+                                 static_cast<std::size_t>(kRows), kQRows, kKvRows,
+                                 kHeads, kHeadDim, static_cast<std::size_t>(cols),
+                                 stream);
         return;
     }
 

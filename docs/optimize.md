@@ -15,6 +15,15 @@ Where: `src/models/qwen3_5/execution/text.cpp:~1230-1260` (attn_mix) and
 ("NOT [q; gate] halves ... matching oracle exllamav3 deinterleave_qg"), same
 geometry, two separate 2D-copy lambdas (`cudaMemcpy2DAsync` at text.cpp:1248
 and attn_input_proj.cpp:192).
+STATUS 2026-09-24: IMPLEMENTED uncommitted (binary ca8a26ed, build-clean,
+no GPU yet) — new `src/ops/wrapper/qg_scatter.h::scatter_qg_heads`, both
+sites call it, all guards kept, CUDA_CHECK everywhere (fail-fast wins over
+the tagged throw). Owed on GPU: T=0 Paris/Rome ids + oracle layer-0/1
+exactness before it counts as landed.
+PROVEN 2026-09-24 (binary ca8a26ed): 8/8 conc==solo + SSE clean + spec-on
+frozen (F=19 accept 3, EOS-through-commits, accept-2 rewind) — ids identical
+with the merge. Oracle layer exactness still open (needs the exllamav3
+oracle harness, not just serve ids).
 Rewrite: one helper, e.g.
 `detail::scatter_qg_heads(dst_q, dst_g, src, head_dim, n_q_heads, stream)`,
 called from both sites. Deletes ~60-80 lines and — more important — kills the
@@ -67,6 +76,14 @@ Saves: ~30 lines of declarations. Impact: 5/10 (allocator traffic off step).
 ### C5. One sampling-config resolver (folds B1/B5 together)
 Where: `engine.cpp:340-352,562` (hardcoded greedy) vs
 `generation_service.cpp` `resolved_sampling` (per-request, never reaches card).
+STATUS 2026-09-24: PHASE 1 IMPLEMENTED uncommitted (binary ca8a26ed,
+build-clean, no GPU yet) — temperature≠0 now 400s at validation on BOTH
+paths (openai_chat_request.cpp parse_sampling + anthropic_messages_request
+range block, code temperature_not_supported); absent/null/0 still greedy.
+Owed on GPU: greedy T=0 ids byte-identical + temp=0.7 returns 400.
+PROVEN 2026-09-24 (binary ca8a26ed): absent/0/0.0 → greedy Paris identical;
+0.7 + 1.0 → HTTP 400 temperature_not_supported. (Anthropic path code-read
+identical; live 400 check owed on that path.)
 Rewrite: single `resolve_sampling(request)` function; card reads from it every
 step. This is filed as bug B1 — listed here because the fix IS a
 consolidation: two sources of truth become one.

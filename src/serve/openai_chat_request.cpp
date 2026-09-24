@@ -792,6 +792,14 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
                         "n", "n_not_supported");
         }
     }
+
+    // C5/B1: the serve card holds one greedy config per step (temperature 0);
+    // per-request sampling never reaches it. Reject nonzero temperatures
+    // instead of silently serving greedy. Absent/null means greedy (allowed).
+    if (sampling.temperature && *sampling.temperature != 0.0) {
+        bad_request("temperature sampling is not served yet; omit temperature or use 0 (greedy)",
+                    "temperature", "temperature_not_supported");
+    }
 }
 
 struct TemplateOptions {
