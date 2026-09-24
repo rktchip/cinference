@@ -178,6 +178,23 @@ public:
                        const std::uint32_t* host_seq_offsets, const std::int32_t* row_slots,
                        ServeStepTensors& tensors,
                        ops::CausalAttentionExecutionEnvelope envelope);
+    // Slot D: graph-safe layers-only decode forward. Embed and sample stay
+    // with the caller (eager, outside any capture): embed_serve_input runs
+    // the embedding into arena x, forward_serve_decode_layers runs bindings,
+    // the 64-layer loop and the final norm into tensors.hidden. Decode-only
+    // (n_pref == 0, n_dec > 0): no prefill branches, no sample, no D2H, no
+    // persistent allocs. Safe under cudaStreamBeginCapture on ctx_.stream
+    // with static tensor addresses: every per-step input arrives as device
+    // contents (ids/positions/tables/slots uploaded eagerly beforehand).
+    Tensor embed_serve_input(ServeStepTensors& tensors);
+    void forward_serve_decode_layers(const batch::StepPlan& plan,
+                                     const batch::RaggedBatch& batch,
+                                     const batch::DeviceRaggedBatch& ragged,
+                                     const std::uint32_t* host_seq_offsets,
+                                     const std::int32_t* row_slots,
+                                     ServeStepTensors& tensors, Tensor& x,
+                                     ops::CausalAttentionExecutionEnvelope envelope);
+    void reset_work() { work_.reset(); }
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,

@@ -445,6 +445,21 @@ public:
             mtp_enabled_ ? mtp_kv_.get() : nullptr);
         envelope_ = ops::CausalAttentionExecutionEnvelope{1, max_context_};
         {
+            // Parked default-off: checkpoint 5 failed (capture-step eager
+            // execution does not land; dry-run proves the layers-only method
+            // correct and replays bit-exact). Opt back in with
+            // NINFER_SERVE_GRAPH=1|verbose|dry for the next probe.
+            const char* graph_env = std::getenv("NINFER_SERVE_GRAPH");
+            const std::string graph_mode(graph_env != nullptr ? graph_env : "");
+            graphs_enabled_ = (graph_mode == "1" || graph_mode == "verbose" || graph_mode == "dry");
+            graph_verbose_  = (graph_mode == "verbose");
+            graph_dry_      = (graph_mode == "dry");
+            if (graph_dry_) {
+                graphs_enabled_ = true;
+                graph_verbose_  = true;
+            }
+        }
+        {
             // Explicit T=0 sampling config: temperature 0 resolves to greedy.
             ops::SamplingConfig explicit_argmax;
             explicit_argmax.temperature = 0.0F;
@@ -549,6 +564,7 @@ public:
                 }
                 kv_->page_pool().zero_pages(pages, device_.stream);
                 pool_->zero_slot(found, device_.stream);
+                graph_forget_lane(found);
             }
             row_slot[s] = found;
         }
@@ -717,8 +733,7 @@ public:
                 pool_->copy_slot(row_slot[s], mtp_shadow_base_ + row_slot[s], stream);
             }
         }
-        decoded = card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
-                                            row_slot.data(), tensors, envelope_);
+        decoded = step_decode_layers(plan, batch, view, tensors, row_slot, n_pref, n_dec);
         if (mtp_enabled_ && n_pref > 0) {
             // S7 MTP-KV fill: the ordinary forward above advanced text KV
             // and GDN only. Mirror each prefill slice through the MTP layer
@@ -1222,6 +1237,227 @@ private:
     std::vector<KVExecutionRowLease> row_leases_;
     ops::CausalAttentionExecutionEnvelope envelope_{0, 0};
     std::vector<ServeSlot> slots_;
+    // Graph ticket 2: eager decode-only replay (spec-off, single seq).
+    // Uploads, embed and sample stay eager; only the 64-layer loop + final
+    // norm replay. Keyed by GDN lane, cap 2 live execs; a capture miss falls
+    // back to eager and parks the lane dead. NINFER_SERVE_GRAPH=0 disables.
+    struct ServeDecodeGraph {
+        bool live = false;
+        int lane  = -1;
+        cudaGraphExec_t exec = nullptr;
+    };
+    ServeDecodeGraph decode_graphs_[2];
+    std::vector<int> graph_dead_lanes_;
+    std::vector<int> graph_seen_lanes_;
+    bool graphs_enabled_ = true;
+    bool graph_verbose_  = false;
+    bool graph_dry_      = false;
+
+public:
+    ~ServeForwardContext() {
+        for (auto& slot : decode_graphs_) {
+            if (slot.exec != nullptr) {
+                cudaGraphExecDestroy(slot.exec);
+                slot.exec = nullptr;
+                slot.live = false;
+            }
+        }
+    }
+
+    bool graph_eligible(std::size_t n_pref, std::size_t n_dec) const {
+        return graphs_enabled_ && !mtp_enabled_ && n_pref == 0 && n_dec == 1;
+    }
+
+    ServeDecodeGraph* graph_for_lane(int lane) {
+        if (std::find(graph_dead_lanes_.begin(), graph_dead_lanes_.end(), lane) !=
+            graph_dead_lanes_.end()) {
+            return nullptr;
+        }
+        for (auto& slot : decode_graphs_) {
+            if (slot.live && slot.lane == lane) return &slot;
+        }
+        return nullptr;
+    }
+
+    // Fresh admission invalidates any graph keyed by this lane: the next
+    // decode on it runs eager (seen-rule), recapture happens on decode 2+.
+    void graph_forget_lane(int lane) {
+        for (auto& slot : decode_graphs_) {
+            if (slot.live && slot.lane == lane) {
+                cudaGraphExecDestroy(slot.exec);
+                slot.exec = nullptr;
+                slot.live = false;
+            }
+        }
+        graph_seen_lanes_.erase(
+            std::remove(graph_seen_lanes_.begin(), graph_seen_lanes_.end(), lane),
+            graph_seen_lanes_.end());
+    }
+
+    void graph_mark_dead(int lane) {
+        for (auto& slot : decode_graphs_) {
+            if (slot.live && slot.lane == lane) {
+                cudaGraphExecDestroy(slot.exec);
+                slot.exec = nullptr;
+                slot.live = false;
+            }
+        }
+        if (std::find(graph_dead_lanes_.begin(), graph_dead_lanes_.end(), lane) ==
+            graph_dead_lanes_.end()) {
+            graph_dead_lanes_.push_back(lane);
+        }
+    }
+
+    void graph_store(int lane, cudaGraphExec_t exec) {
+        ServeDecodeGraph* slot = &decode_graphs_[0];
+        if (decode_graphs_[0].live && decode_graphs_[1].live) {
+            // Both live: evict slot 0 (oldest-first ring would need age bits;
+            // single-seq steady state never evicts, so any choice is fine).
+            cudaGraphExecDestroy(decode_graphs_[0].exec);
+            decode_graphs_[0].exec = nullptr;
+            decode_graphs_[0].live = false;
+        } else if (decode_graphs_[0].live) {
+            slot = &decode_graphs_[1];
+        }
+        slot->live = true;
+        slot->lane = lane;
+        slot->exec = exec;
+    }
+
+    runtime::StepDecodedPairs step_decode_layers(const batch::StepPlan& plan,
+                                                 const batch::RaggedBatch& batch,
+                                                 const batch::DeviceRaggedBatch& view,
+                                                 models::qwen3_5::execution::TextContext::ServeStepTensors& tensors,
+                                                 const std::vector<std::int32_t>& row_slot,
+                                                 std::size_t n_pref, std::size_t n_dec) {
+        cudaStream_t stream = device_.stream;
+        // Capture gate: pure single-token decode only. The first HTTP
+        // request's early steps may carry a different M/phase than steady
+        // decodes, so a lane's first decode-shaped step always runs eager
+        // (warmup) and capture starts on decode 2+ of the same admission.
+        const std::size_t T = batch.tokens.size();
+        const bool shape_ok = (n_pref == 0 && n_dec == 1 && T == 1);
+        int lane = -1;
+        bool seen = false;
+        if (shape_ok && graphs_enabled_ && !mtp_enabled_) {
+            lane = row_slot[n_pref];
+            seen = std::find(graph_seen_lanes_.begin(), graph_seen_lanes_.end(), lane) !=
+                   graph_seen_lanes_.end();
+            if (!seen) graph_seen_lanes_.push_back(lane);
+        }
+        const char* action = "eager-shape";
+        if (!graphs_enabled_ || mtp_enabled_) {
+            action = "eager-disabled";
+        } else if (shape_ok && !seen) {
+            action = "eager-first";
+        }
+        // Verbose-only step tracer: input id + first 8 hidden bytes pin down
+        // whether a divergent step saw stale inputs or wrote stale hidden.
+        // Synchronous D2H: diagnosis only, never on the hot path.
+        auto vlog_step = [&](const char* act, const runtime::StepDecodedPairs& out) {
+            if (!graph_verbose_ || out.empty()) return;
+            std::int32_t in_id = -1;
+            std::uint64_t h01  = 0;
+            if (cudaMemcpy(&in_id, tensors.ids.data, sizeof(in_id),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return;
+            }
+            if (cudaMemcpy(&h01, tensors.hidden.data, sizeof(h01),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return;
+            }
+            std::fprintf(stderr, "[gtok] lane=%d action=%s in=%d out=%u h=%016llx\n", lane,
+                         act, in_id, static_cast<unsigned>(out[0].second),
+                         static_cast<unsigned long long>(h01));
+        };
+        // Pointer audit: device addresses are host-visible. x/hidden must be
+        // identical across capture and replay runs (static scratch + reset
+        // arena); any drift here is the alias bug.
+        auto plog_step = [&](const char* act, const Tensor& x) {
+            if (!graph_verbose_) return;
+            std::fprintf(stderr, "[gptr] lane=%d action=%s x=%p hidden=%p ids=%p\n", lane, act,
+                         x.data, tensors.hidden.data, tensors.ids.data);
+        };
+        if (!shape_ok || !seen) {
+            if (graph_verbose_) {
+                std::fprintf(stderr,
+                             "[graph] lane=%d n_pref=%zu n_dec=%zu T=%zu action=%s\n",
+                             lane, n_pref, n_dec, T, action);
+            }
+            auto out = card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
+                                                 row_slot.data(), tensors, envelope_);
+            vlog_step(action, out);
+            return out;
+        }
+        ServeDecodeGraph* hit = graph_for_lane(lane);
+        if (graph_verbose_) {
+            std::fprintf(stderr, "[graph] lane=%d n_pref=%zu n_dec=%zu T=%zu action=%s\n",
+                         lane, n_pref, n_dec, T, hit != nullptr ? "replay" : "capture");
+        }
+        if (hit == nullptr) {
+            // No live exec and lane not dead: capture the layers-only call.
+            // Embed runs eager first (outside the capture); uploads already
+            // ran above. Capture failure falls back to the eager forward we
+            // just ran (hidden is already valid) and parks the lane dead.
+            Tensor x = card_->embed_serve_input(tensors);
+            if (graph_dry_) {
+                // Diagnosis only: run the layers eagerly with no capture.
+                // Fresh hidden here proves the method; stale hidden here
+                // proves the seam (not capture mode) is broken.
+                card_->forward_serve_decode_layers(plan, batch, view,
+                                                   batch.seq_offsets.data(), row_slot.data(),
+                                                   tensors, x, envelope_);
+                auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+                vlog_step("capture-dry", out);
+                return out;
+            }
+            cudaGraph_t graph = nullptr;
+            const cudaError_t begin = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (begin == cudaSuccess) {
+                try {
+                    card_->forward_serve_decode_layers(plan, batch, view,
+                                                       batch.seq_offsets.data(), row_slot.data(),
+                                                       tensors, x, envelope_);
+                } catch (...) {
+                    cudaStreamEndCapture(stream, &graph);
+                    if (graph != nullptr) cudaGraphDestroy(graph);
+                    graph_mark_dead(lane);
+                    throw;
+                }
+                if (cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph != nullptr) {
+                    cudaGraphExec_t exec = nullptr;
+                    if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess &&
+                        exec != nullptr) {
+                        cudaGraphDestroy(graph);
+                        graph_store(lane, exec);
+                        auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+                        vlog_step("capture", out);
+                        plog_step("capture", x);
+                        return out;
+                    }
+                    if (exec != nullptr) cudaGraphExecDestroy(exec);
+                    cudaGraphDestroy(graph);
+                } else if (graph != nullptr) {
+                    cudaGraphDestroy(graph);
+                }
+            }
+            graph_mark_dead(lane);
+            auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+            vlog_step("capture-fail", out);
+            return out;
+        }
+        // Replay: embed stays eager (fresh token in, same arena address as
+        // the capture run), then relaunch the recorded layers and sample.
+        Tensor x = card_->embed_serve_input(tensors);
+        (void)x;  // consumed by the graph at its baked arena address
+        CUDA_CHECK(cudaGraphLaunch(hit->exec, stream));
+        {
+            auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+            vlog_step("replay", out);
+            plog_step("replay", x);
+            return out;
+        }
+    }
 };
 
 class Engine::Impl {
@@ -1467,6 +1703,11 @@ std::vector<TokenId> Engine::prompt_token_ids(const PreparedPrompt& prompt) cons
 std::string Engine::decode_tokens(std::span<const TokenId> ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->active->frontend.decode_tokens(ids);
+}
+
+std::vector<TokenId> Engine::default_stop_token_ids() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.default_stop_policy().token_ids;
 }
 
 ResolvedSamplingParameters Engine::resolved_sampling(const PreparedPrompt& prompt,

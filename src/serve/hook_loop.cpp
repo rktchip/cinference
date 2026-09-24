@@ -162,6 +162,7 @@ std::uint64_t ServeHookLoop::submit_inbox(batch::Request request,
         state->req_id = req_id;
         state->seq_id = seq_id;
         state->max_new_tokens = request.max_new_tokens;
+        state->stop_token_ids = request.stop_token_ids;
     }
     {
         std::lock_guard lock(inbox_mutex_);

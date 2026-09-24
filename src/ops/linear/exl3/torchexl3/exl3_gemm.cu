@@ -706,7 +706,9 @@ bool tuning_enabled()
 }
 
 // Forward: defined beside check_launch below; queried by autotune_cfg.
-inline bool v3_capturing();
+// Takes the launch stream: capture runs on the worker stream (see
+// capture_graph), so querying stream 0 would miss it.
+inline bool v3_capturing(cudaStream_t stream);
 
 // Runs `run(bm)` for each candidate, returns the fastest. `run` must leave the
 // output correct for whichever bm it was last called with.
@@ -727,7 +729,7 @@ int autotune_cfg(uint64_t key, int m, int k, int n, int bits, bool split_k,
 
     // Never time inside graph capture: it needs syncs, and the capture would
     // record whichever candidate ran last.
-    if (!tuning_enabled() || v3_capturing())
+    if (!tuning_enabled() || v3_capturing(stream))
         return pack(heuristic_bm, split_for(heuristic_bm));
 
     // Search the split alongside the block size. pick_split is a cost model, and
@@ -870,12 +872,12 @@ inline void check_unsupported(int bits, int cb)
 }
 
 // Graph-capture query for the autotuner gate. cudaStreamIsCapturing takes
-// (stream, out-status); the legacy stream (0) covers the default-stream
-// launches this row uses.
-inline bool v3_capturing()
+// (stream, out-status); the query must see the stream the launches use
+// (capture_graph captures on the worker stream, never stream 0).
+inline bool v3_capturing(cudaStream_t stream)
 {
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing((cudaStream_t) 0, &st) != cudaSuccess) return false;
+    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return false;
     return st != cudaStreamCaptureStatusNone;
 }
 

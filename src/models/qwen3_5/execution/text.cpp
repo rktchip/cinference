@@ -1059,6 +1059,111 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
     return decoded;
 }
 
+Tensor TextContext::embed_serve_input(ServeStepTensors& tensors) {
+    const std::int32_t T = tensors.ids.ne[0];
+    require_tensor_shape(tensors.ids, DType::I32, {T}, "serve embed ids");
+    cudaStream_t stream = ctx_.stream;
+    work_.reset();
+    Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), T});
+    ops::embedding(tensors.ids, *embed_, x, stream);
+    return x;
+}
+
+void TextContext::forward_serve_decode_layers(
+    const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+    const batch::DeviceRaggedBatch& ragged, const std::uint32_t* host_seq_offsets,
+    const std::int32_t* row_slots, ServeStepTensors& tensors, Tensor& x,
+    ops::CausalAttentionExecutionEnvelope envelope) {
+    const std::size_t n_dec    = plan.decode_seq_ids.size();
+    const std::size_t n_pref   = plan.prefill.size();
+    const std::size_t num_seqs = batch.num_seqs();
+    if (num_seqs == 0 || n_pref != 0 || n_dec == 0 || n_pref + n_dec != num_seqs) {
+        throw std::logic_error("forward_serve_decode_layers needs decode-only plans");
+    }
+    const std::int32_t T    = static_cast<std::int32_t>(batch.tokens.size());
+    const std::int32_t nseq = static_cast<std::int32_t>(num_seqs);
+    const std::int32_t ndec = static_cast<std::int32_t>(n_dec);
+    require_tensor_shape(tensors.cache_positions, DType::I32, {T}, "serve layers cache positions");
+    require_tensor_shape(tensors.rope_positions, DType::I32, {T}, "serve layers RoPE positions");
+    require_tensor_shape(tensors.kv_table_rows, DType::I32, {nseq}, "serve layers KV rows");
+    require_tensor_shape(tensors.decode_source_slots, DType::I32, {ndec},
+                         "serve layers decode source slots");
+    require_tensor_shape(tensors.decode_destination_slots, DType::I32, {ndec},
+                         "serve layers decode destination slots");
+    require_tensor_shape(tensors.hidden, DType::BF16, {dimension(config_.hidden_size), T},
+                         "serve layers hidden");
+    require_tensor_shape(x, DType::BF16, {dimension(config_.hidden_size), T},
+                         "serve layers embed output");
+    if (host_seq_offsets == nullptr || row_slots == nullptr) {
+        throw std::invalid_argument("forward_serve_decode_layers requires host offsets and row slots");
+    }
+    (void)row_slots;  // decode rows ride the src/dst slot bindings, not per-row slots
+    if (config_.layer_types.size() != parameters_.text.layers.size()) {
+        throw std::logic_error("forward_serve_decode_layers layer inventory is inconsistent");
+    }
+    const std::int32_t prefill_tokens = static_cast<std::int32_t>(host_seq_offsets[0]);
+
+    cudaStream_t stream = ctx_.stream;
+    set_ragged_batch(&ragged, host_seq_offsets);
+    {
+        ScopedPositions cache_binding(active_cache_positions_, tensors.cache_positions);
+        ScopedPositions rope_binding(active_rope_positions_, tensors.rope_positions);
+        ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+        ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &tensors.kv_table_rows);
+        ScopedValue<const Tensor*> src_on(active_linear_state_source_slots_,
+                                          &tensors.decode_source_slots);
+        ScopedValue<const Tensor*> dst_on(active_linear_state_destination_slots_,
+                                          &tensors.decode_destination_slots);
+        ScopedValue<std::int32_t> batch_on(active_sequence_batch_, ndec);
+        ScopedValue<std::int32_t> width_on(active_sequence_width_, 1);
+        ladder::ladder_dump(x, "embed", -1, stream);
+        ladder::ladder_dump_raw(x, "bisect_embed", -1, stream);
+        for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+            const auto& block = parameters_.text.layers[layer];
+            const bool full   = config_.layer_types[layer] == MixerKind::FullAttention;
+            const auto compact = dimension(config_.compact_layer_indices[layer]);
+            try {
+                if (layer <= 1) {
+                    ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_in" : "bisect_b1_in",
+                                            static_cast<int>(layer), stream);
+                }
+                {
+                    auto scope = work_.scope();
+                    if (full) {
+                        attn_mix(block, x, compact, Phase::Verify);
+                    } else {
+                        Tensor xd = x.slice(1, prefill_tokens, ndec);
+                        gdn_mix(block, xd, compact, Phase::Verify);
+                    }
+                }
+                if (layer <= 1) {
+                    ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_attn" : "bisect_b1_attn",
+                                            static_cast<int>(layer), stream);
+                }
+                {
+                    auto scope = work_.scope();
+                    mlp_tail(block, x, Phase::Verify,
+                             next_projection_hints(static_cast<int>(layer)));
+                    ladder::ladder_dump(x, full ? "layer-full" : "layer-gdn",
+                                        static_cast<int>(layer), stream);
+                    if (layer <= 1) {
+                        ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_out" : "bisect_b1_out",
+                                                static_cast<int>(layer), stream);
+                    }
+                }
+            } catch (const std::exception& error) {
+                throw std::runtime_error("text/serve/layers-decode/" + std::to_string(layer) +
+                                         " columns=" + std::to_string(T) + ": " + error.what());
+            }
+        }
+        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, tensors.hidden, stream);
+        ladder::ladder_dump(tensors.hidden, "final_norm", -1, stream);
+        ladder::ladder_dump_raw(tensors.hidden, "bisect_final_norm", -1, stream);
+    }
+    clear_ragged_batch();
+    work_.reset();
+}
+
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,

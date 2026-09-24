@@ -126,6 +126,10 @@ public:
     // (EngineCore path); this is the minimal pump text path.
     [[nodiscard]] std::vector<TokenId> prompt_token_ids(const PreparedPrompt& prompt) const;
     [[nodiscard]] std::string decode_tokens(std::span<const TokenId> ids) const;
+    // Serve stop set: model-default stop-token ids (EOS et al) for the pump's
+    // EOS finish. Caller stop policy merges at prepare; the full
+    // thinking/reasoning/stop-string policy stays in OutputSession.
+    [[nodiscard]] std::vector<TokenId> default_stop_token_ids() const;
     [[nodiscard]] ResolvedSamplingParameters resolved_sampling(const PreparedPrompt& prompt,
                                                                const RequestOptions& options) const;
 

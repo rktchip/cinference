@@ -249,6 +249,29 @@ std::vector<std::uint64_t> RequestScheduler::on_step_done(
                 break;
             }
         }
+        // Step-1 EOS stop: any decoded token this step that hits the
+        // admitted stop set finishes the request. The accept/commit that
+        // produced the tokens is untouched (spec-on accepts through EOS);
+        // the pump drops the stop token and anything after it from the emit.
+        if (!req_done && !req.stop_token_ids.empty()) {
+            for (const auto& [seq_id, token] : decoded) {
+                bool mine = false;
+                for (const auto& seq : req.seqs) {
+                    if (seq.seq_id == seq_id) {
+                        mine = true;
+                        break;
+                    }
+                }
+                if (!mine) { continue; }
+                for (const TokenId stop : req.stop_token_ids) {
+                    if (token == stop) {
+                        req_done = true;
+                        break;
+                    }
+                }
+                if (req_done) { break; }
+            }
+        }
         if (req_done) {
             req.finish();
             finished.push_back(req.req_id);

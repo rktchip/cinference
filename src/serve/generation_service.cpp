@@ -435,6 +435,18 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             std::min<std::uint64_t>(request_options.execution.requested_output_tokens, room));
         auto stream_state = std::make_shared<ServeRequestState>();
         batch::Request batch_request(0, std::move(prompt_ids), max_new);
+        // Step-1 EOS stop: model defaults (+ caller token stops) travel with
+        // the admitted request; scheduler finishes on a hit, the pump drops
+        // the stop token and anything after it from the emit.
+        {
+            std::vector<TokenId> stops = engine_->default_stop_token_ids();
+            for (const TokenId stop : request_options.stop.token_ids) {
+                if (std::find(stops.begin(), stops.end(), stop) == stops.end()) {
+                    stops.push_back(stop);
+                }
+            }
+            batch_request.stop_token_ids = std::move(stops);
+        }
         prepared.req_id         = hook_loop_->submit_inbox(std::move(batch_request), stream_state);
         prepared.stream_state   = std::move(stream_state);
         prepared.max_new_tokens = max_new;
@@ -575,8 +587,28 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                finished.end() ||
                            hook_loop_->scheduler()->find_request(own_req) == nullptr;
                 publish.reserve(decoded.size());
+                // Step-1 EOS stop: per-step set of seqs already stopped. The
+                // stop token itself is never emitted (matches
+                // publish_stop_token=false); anything after it in the same
+                // step (spec-on commit tail past EOS) is dropped.
+                std::vector<std::uint64_t> stopped_seqs;
                 for (const auto& [seq_id, token] : decoded) {
                     if (auto target = hook_loop_->find_state_by_seq(seq_id)) {
+                        std::lock_guard state_lock(target->mutex);
+                        const bool already_stopped =
+                            std::find(stopped_seqs.begin(), stopped_seqs.end(), seq_id) !=
+                            stopped_seqs.end();
+                        const bool is_stop =
+                            std::find(target->stop_token_ids.begin(),
+                                      target->stop_token_ids.end(), token) !=
+                            target->stop_token_ids.end();
+                        if (already_stopped) { continue; }
+                        if (is_stop) {
+                            stopped_seqs.push_back(seq_id);
+                            target->stopped_on_token = true;
+                            target->finished          = true;
+                            continue;
+                        }
                         publish.emplace_back(std::move(target), token);
                     }
                 }
@@ -638,14 +670,18 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
 
     GenerationOutcome outcome;
+    bool stopped_on_token = false;
     {
         std::lock_guard state_lock(state->mutex);
         outcome.text              = state->text;
         outcome.completion_tokens = static_cast<int>(state->generated_ids.size());
+        stopped_on_token          = state->stopped_on_token;
     }
     outcome.prompt_tokens = prepared.prompt_tokens;
-    // The pump observes no terminal event yet, so the reason stays None.
-    outcome.finish_reason           = ninfer::FinishReason::None;
+    // Step 1: the pump observes a stop-token terminal event (StopToken); the
+    // max-tokens path still reports None (pre-existing behavior).
+    outcome.finish_reason = stopped_on_token ? ninfer::FinishReason::StopToken
+                                             : ninfer::FinishReason::None;
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     if (have_first_token) {
         outcome.metrics.ttft_seconds = std::chrono::duration<double>(first_token_at -

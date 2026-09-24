@@ -69,9 +69,14 @@ namespace ninfer::serve {
 // step runs before the owning run() registers its sink.
 struct ServeRequestState {
     std::mutex mutex;
-    std::uint64_t req_id        = 0;
-    std::uint64_t seq_id        = 0;
-    std::uint32_t max_new_tokens = 0;
+    std::uint64_t req_id            = 0;
+    std::uint64_t seq_id            = 0;
+    std::uint32_t max_new_tokens    = 0;
+    // Step-1 EOS stop: copy of the admitted stop-token set; the publish loop
+    // drops the stop token and any same-step tokens after it.
+    std::vector<TokenId> stop_token_ids;
+    // Set when the pump observes a stop token (scheduler finish is separate).
+    bool stopped_on_token = false;
     std::vector<TokenId> generated_ids;
     std::string text;
     // Deltas produced before the live sink registered (flushed in order on

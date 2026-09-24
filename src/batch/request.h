@@ -61,6 +61,10 @@ struct Request {
     std::vector<Sequence> seqs;
     Status status             = Status::Waiting;
     std::uint32_t max_new_tokens = 0; // decode budget per sequence
+    // Step-1 EOS stop: model-default (+ caller) stop-token ids. The
+    // scheduler finishes the request when any decoded token hits this set;
+    // the pump drops the stop token and everything after it from the emit.
+    std::vector<TokenId> stop_token_ids;
 
     Request() = default;
     Request(std::uint64_t id, std::vector<TokenId> prompt, std::uint32_t max_new);
