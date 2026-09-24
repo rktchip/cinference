@@ -7,6 +7,10 @@
 > **8 seqs**, spec **off**, graphs **off**, `CUDA_EXL3_AUTOTUNE=0` +
 > `CUDA_EXL3_SPLIT_TARGET=0` required. Measured serve: **~30 ms/token**
 > solo spec-off (~33 tok/s). Gate: two-curl T=0 **Paris / Rome**, 24/24.
+> Decode rate 2026-09-24 (FOX-64 streaming, excl tok1): spec-off eager
+> **~27–30 ms/tok**; spec-off **GRAPH=1 ~14 ms/tok** after warmup
+> (replay-only; TTFT unchanged). Product path unchanged (graphs
+> default-off) until spec-on is graph-safe.
 > 262k context is a future planner + compressed-KV project, not a flag.
 > MTP target is decode-only **window 3** (not MTP-10). Numbers from other
 > artifacts (NVFP4 tables, scratch microbench projections, HyperQwen
