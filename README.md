@@ -10,7 +10,10 @@
 > Decode rate 2026-09-24 (FOX-64 streaming, excl tok1): spec-off eager
 > **~27–30 ms/tok**; spec-off **GRAPH=1 ~14 ms/tok** after warmup
 > (replay-only; TTFT unchanged). Product path unchanged (graphs
-> default-off) until spec-on is graph-safe.
+> default-off) until spec-on is graph-safe. Tradeoff on the record:
+> GRAPH=1 doubles spec-off decode; MTP forces graphs off (spec-on
+> stays eager) — so default-on would silently de-graph MTP users.
+> Flipping the default is a product call, deferred.
 > 262k context is a future planner + compressed-KV project, not a flag.
 > MTP target is decode-only **window 3** (not MTP-10). Numbers from other
 > artifacts (NVFP4 tables, scratch microbench projections, HyperQwen
