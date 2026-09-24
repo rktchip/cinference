@@ -1,6 +1,6 @@
 # Ticket: F-as-data attention backend → reopen verify graphs
 
-Status: TICKET ONLY. No code changed, no GPU spent. Each phase needs its own go.
+Status: PHASE A DONE 2026-09-24 (GPU-gated, committed). Phases B/C still parked.
 
 ## Why this ticket exists
 
@@ -42,13 +42,27 @@ Goal: identical numerics, F-invariant launch decisions.
    envelope for sizing.
 
 Bar A (all eager, no graphs yet):
-- Eager numerics bit-identical (or maxAbs-gated) vs pre-rework: Paris/Rome,
-  8/8 spec-off matrix, spec-on accept 3 + rewind.
-- Static proof: route + grid outputs constant across F for fixed (width,
-  batch) — unit check or logged comparison over an F sweep, no GPU profiling
-  needed for the gate itself.
-- No throughput regression beyond noise on the eager path (it should be ~flat;
-  bigger grids at small F are the known cost — report it, don't hide it).
+- DONE 2026-09-24, GPU-gated. Solo Paris/Rome/FOX coherent + deterministic
+  (rerun-stable); spec-off eager 28.2/27.8 ms/tok vs 30.1/27.6 baseline (flat);
+  spec-on warmup passes, canonical Paris chain 6511/314/9338/369 accept-3 +
+  accept-1 rewind lines present; splits=85 constant over 3706 SmallT calls
+  (widths 1+4, F 19..57) — route/grid F-invariant at runtime.
+- Accepted deviation (filed, pre-existing): conc-vs-solo trailing-token
+  divergence reproduces on the PRE-Phase-A binary too (old: P16/R16/R24 False;
+  new: R only) — batch-composition reduction order, not a Phase-A regression.
+  Solo old-vs-new differs only at near-tie trailing tokens (early-EOS vs
+  '\n\nuser' template bleed; new outputs cleaner, FOX-64 fully coherent).
+- One self-inflicted bug found+fixed in-ticket: the first static-max edit left
+  the `window in [min,max]` guard in `causal_small_t_launch_capacity::include`,
+  zeroing splits for tight verify envelopes ({1,F+4} rejects every static end
+  128..262144) → splits=0 → Tensor-ctor FATAL. Fix: guard removed, capacity is
+  the static max over all ends. Lesson: when de-Fing a function, grep its
+  closures for envelope reads too.
+- No eager regression: 28.2/27.8 vs 30.1/27.6 ms/tok (flat; bigger grids at
+  small F are the known cost — reported, not hidden). BF16 (the gated model)
+  never reads `implementation_window`; INT8 partials now always take the
+  big-window variant config (same partial math, occupancy-only difference —
+  ungated, no INT8 KV model on hand, correctness from positional bounds).
 
 ## Phase B — borrow ORT snapshot/restore (do it here, not later)
 

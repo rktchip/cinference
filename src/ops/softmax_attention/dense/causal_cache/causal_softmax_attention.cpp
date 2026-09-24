@@ -38,11 +38,13 @@ constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
+    // Phase A (F-as-data ticket): chunking by shape only; the envelope stays
+    // for validation at the call sites, never for launch decisions.
+    (void)envelope;
     if (q_heads == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
-                            (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
-                             envelope.max_visible_keys > 4096)))
+                            (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10)))
         return (width + 1) / 2;
     return 8;
 }
@@ -360,25 +362,15 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                                                     CausalAttentionExecutionEnvelope envelope) {
     if (q_heads == 24 && width <= kMaximumVerifyTokens) {
         if (batch_size == 1) {
-            std::uint32_t prompt_limit = 0;
-            switch (storage) {
-            case KvCacheStorage::BFloat16:
-                prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
-                break;
-            case KvCacheStorage::Int8Group64:
-                prompt_limit = width <= 8 ? 0 : 256;
-                break;
-            case KvCacheStorage::Fp8E4M3Row256:
-                prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
-                break;
-            case KvCacheStorage::Nvfp4Group16:
-                prompt_limit = width <= 8 ? 0 : 256;
-                break;
-            case KvCacheStorage::Fp8KeyNvfp4Value:
-                prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
-                break;
-            }
-            if (envelope.max_visible_keys <= prompt_limit) return CausalAttentionRoute::Prompt;
+            // Phase A (F-as-data ticket): route by width only. SmallT kernels
+            // are positional (device pos window + active-split policy), so
+            // SmallT is correct at any F; 9..16 takes the big-F-proven
+            // ChunkedSmallT. Prompt (window-agnostic, no envelope param)
+            // remains the wide-prefill route below.
+            (void)storage;
+            (void)envelope;
+            if (width <= 8) { return CausalAttentionRoute::SmallT; }
+            return CausalAttentionRoute::ChunkedSmallT;
         }
         return width <= 8 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
     }

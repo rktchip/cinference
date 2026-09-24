@@ -77,14 +77,19 @@ template <typename Geometry>
 std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope envelope,
                                             std::int32_t tokens, KvCacheStorage storage) {
     std::int32_t capacity = 0;
+    // Phase A (F-as-data ticket): static maximum over all windows — no
+    // envelope guard. The old guard (window in [min,max]) zeroed capacity
+    // for tight verify envelopes ({1,F+4} rejects every static end).
     const auto include    = [&](std::uint32_t window) {
-        if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
         const auto splits = causal_small_t_split_count<Geometry>(static_cast<std::int32_t>(window),
                                                                     tokens, storage);
         capacity          = capacity > splits ? capacity : splits;
     };
-    include(envelope.min_visible_keys);
-    include(envelope.max_visible_keys);
+    // Phase A (F-as-data ticket): size for the static maximum window, never
+    // the F-derived envelope ends. Oversized splits exit device-side via the
+    // active-split policy; correctness comes from positional masking.
+    (void)envelope;
+    include(static_cast<std::uint32_t>(kCausalAttentionMaximumVisibleKeys));
     // The policy is monotonic inside these finite segments and may drop when crossing a boundary.
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
     constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
@@ -230,17 +235,19 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             // leaves room for the indivisible 4*B group, including B=3/5/6/7.
             const bool narrow = tokens <= 5;
             int target_ctas   = 160;
+            // Phase A (F-as-data ticket): grid by shape/storage only.
             if (cache_storage == KvCacheStorage::BFloat16)
-                target_ctas =
-                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow || batch_size >= 5 ? 320 : 160;
             else if (cache_storage == KvCacheStorage::Int8Group64)
-                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow ? 320 : 160;
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
                 target_ctas = narrow ? 320 : 160;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
             // key-tile rounding and page alignment at the 262144-key resource limit.
-            const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
+            // Phase A (F-as-data ticket): static page bound, never the F envelope.
+            const int page_limit =
+                div_up(static_cast<int>(kCausalAttentionMaximumVisibleKeys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }
         return capacity;
@@ -259,8 +266,14 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          CausalAttentionExecutionEnvelope envelope,
                                          Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                          Tensor& out, cudaStream_t stream) {
-    const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
+    const auto logical_capacity = static_cast<std::int32_t>(kCausalAttentionMaximumVisibleKeys);
+    // Phase A (F-as-data ticket): static capacity bound (guard only — the
+    // live window comes from device positions + active-split policy) and
+    // static variant selection. i8 paths keep their shape tables; all F
+    // terms are gone from the BF16 launch decision.
+    const auto implementation_window =
+        static_cast<std::int32_t>(kCausalAttentionMaximumVisibleKeys);
+    (void)envelope;
     const auto splits                = causal_attention_split_capacity(
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
