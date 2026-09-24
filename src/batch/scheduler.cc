@@ -277,6 +277,23 @@ std::vector<std::uint64_t> RequestScheduler::on_step_done(
             finished.push_back(req.req_id);
         }
     }
+    // Audit B3: requests aborted mid-step (pool exhaustion) or while waiting
+    // never take the req_done path above, but their hook states were
+    // registered at drain and would leak in seq_states_ forever. List every
+    // done request; erase_states_for_reqs is idempotent, and the pump treats
+    // an aborted own request as done (breaks instead of spinning).
+    for (auto& req : running_) {
+        if (req.done() &&
+            std::find(finished.begin(), finished.end(), req.req_id) == finished.end()) {
+            finished.push_back(req.req_id);
+        }
+    }
+    for (auto& req : waiting_) {
+        if (req.done() &&
+            std::find(finished.begin(), finished.end(), req.req_id) == finished.end()) {
+            finished.push_back(req.req_id);
+        }
+    }
     return finished;
 }
 

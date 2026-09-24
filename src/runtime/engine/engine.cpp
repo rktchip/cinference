@@ -461,6 +461,13 @@ public:
         }
         {
             // Explicit T=0 sampling config: temperature 0 resolves to greedy.
+            // Load-bearing truncation note (audit B5): top_k = 20 truncates
+            // the candidate set BEFORE the argmax, so T=0 output equals the
+            // true top-1 only when the top-1 token survives truncation. True
+            // in practice on this checkpoint (verified by frozen Paris/Rome
+            // coherence), but a distribution shift that pushes mass past
+            // rank 20 would silently change greedy ids. If that ever happens,
+            // set top_k = 0 (full-vocab argmax) here, not a wider k.
             ops::SamplingConfig explicit_argmax;
             explicit_argmax.temperature = 0.0F;
             explicit_argmax.top_k = 20;

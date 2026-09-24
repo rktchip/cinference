@@ -25,7 +25,12 @@
 
 namespace ninfer::models::qwen3_5::execution::ladder {
 
-inline bool ladder_armed() noexcept { return std::getenv("CINFERENCE_LADDER_TRACE") != nullptr; }
+inline bool ladder_armed() noexcept {
+    // Audit O4: resolved once, not per dump call (~18 sites, some per-layer).
+    // Env must be set at boot; mid-run changes are not honored.
+    static const bool armed = std::getenv("CINFERENCE_LADDER_TRACE") != nullptr;
+    return armed;
+}
 
 inline float ladder_bf16_to_float(std::uint16_t w) noexcept {
     std::uint32_t bits = static_cast<std::uint32_t>(w) << 16;
