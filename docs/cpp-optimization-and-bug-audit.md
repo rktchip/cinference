@@ -9,6 +9,18 @@ README docs. Nothing below was executed — every item needs its listed test.
 ## Optimizations (highest impact first)
 
 ### O1. Batch the per-row sample loop — text.cpp:803-810
+STATUS 2026-09-24: IMPLEMENTED uncommitted (binary f874864c, build-clean,
+no GPU yet) — audit premise corrected: no new kernel needed, the batched
+entry already exists (decode.cpp:55). sample_decode_rows now makes ONE
+ops::sample call over all decode rows; B>1 broadcasts the shared serve
+config via N tiny D2D copies into a work_-arena array (no new device code;
+new kernel rejected — .cpp files carry no __global__ in this tree). RNG
+keys are row-index-independent per the op contract; serve greedy has zero
+per-row side effects (penalties 0, counts null) → bit-identical by
+construction. Owed on GPU: T=0 ids solo+conc + spec-on frozen before landed.
+PROVEN 2026-09-24 (binary f874864c): 8/8 conc==solo + spec-on frozen
+(Paris F=19 [6511 314 9338] accept 3, Italy [6511 314 14898] accept 3,
+EOS-through-commits). Bit-identical as constructed — O1 may land.
 What: the stochastic branch of `sample_decode_rows` loops over decode rows
 on the host, building 3 slice views and launching `ops::sample` per row.
 At cap 8 that is 8 launches + 24 view constructions per step, serialized.

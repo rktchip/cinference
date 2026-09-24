@@ -792,23 +792,36 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::sample_decode_rows(
     ladder::ladder_dump(logits, "logits", -1, stream);
     Tensor out = work_.alloc(DType::I32, {ndec_cols});
     if (sampling_config_ != nullptr) {
-        // One B=1 sample per decode row against the shared device config.
-        // Logical positions are the flat decode-row indices: unique per row
-        // so shared-seed stochastic rows draw independently.
+        // O1: one batched sample for all decode rows (was: one ops::sample
+        // per row). Batched entry is proven in-tree (decode.cpp:55); row b's
+        // RNG key (seed, logical_positions[b], purpose) is independent of
+        // compact row index, so stochastic rows draw identically. Serve
+        // runs greedy (temperature<=0: RNG skipped) with penalties 0 and
+        // null token_counts (engine.cpp serve_sampling_), i.e. no per-row
+        // side effects at all — batching is bit-identical there. Callers
+        // with penalties/concurrency-sensitive counts keep per-lane configs
+        // on the program path; this site broadcasts the one shared config.
         std::vector<std::int32_t> host_positions(n_dec);
         for (std::size_t i = 0; i < n_dec; ++i) {
             host_positions[i] = first_col + static_cast<std::int32_t>(i);
         }
         Tensor positions = work_.alloc(DType::I32, {ndec_cols});
         copy_i32(host_positions.data(), positions, stream);
-        for (std::size_t i = 0; i < n_dec; ++i) {
-            const std::int32_t col = static_cast<std::int32_t>(i);
-            Tensor logits_row   = logits.slice(1, col, 1);
-            Tensor out_row      = out.slice(0, col, 1);
-            Tensor position_row = positions.slice(0, col, 1);
-            ops::sample(logits_row, out_row, domain, sampling_config_, position_row,
-                        ops::kSamplePurposeDecode, work_, stream);
+        const ops::SamplingConfig* configs = sampling_config_;
+        Tensor configs_array;
+        if (n_dec > 1) {
+            configs_array = work_.alloc(DType::U8, {static_cast<std::int32_t>(
+                n_dec * sizeof(ops::SamplingConfig))});
+            for (std::size_t i = 0; i < n_dec; ++i) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<char*>(configs_array.data) + i * sizeof(ops::SamplingConfig),
+                    sampling_config_, sizeof(ops::SamplingConfig),
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+            configs = static_cast<const ops::SamplingConfig*>(configs_array.data);
         }
+        ops::sample(logits, out, domain, configs, positions,
+                    ops::kSamplePurposeDecode, work_, stream);
     } else {
         ops::argmax(logits, out, domain, stream);
     }
