@@ -144,7 +144,40 @@ Off walls: FOX 1.03, PARIS 2.09, CODELOW 1.40, PRIME 1.02. On loses every
 regime 2.2–2.7× (FOX 2.2-2.3, PARIS 4.78, CODELOW ~3.75, PRIME ~2.77).
 CODELOW veto stands only with its off-number: 3.75 vs 1.40. Filed.
 
-## Conc SM-busy (both servers, nsys)
+## Re-bucketed step (GPU-projected NVTX, /root/mtp-nvtx, 77 MTP steps)
+
+Range semantics (read in source): MtpProposal = draft head+argmax only;
+MtpForward = mtp_forward_core = draft-module forward AND per-row MTP
+refills (both call it); target verify has NO top-level range (only
+per-layer verify.layer.*); ordinary rows share the layer ranges.
+
+- Drafts: proposal 225 × 0.61ms = 0.14s; forward-core share ≈ 3/8.5 of
+  657 × 0.90ms = 0.59s → ~2.7ms → drafts ≈ 0.6×3 + 2.7 ≈ 4.5-5ms/step.
+  DRAFTS ARE CHEAP. The 22ms draft bucket was misattributed verify.
+  Committee's verify-wall hypothesis CONFIRMED.
+- Verify call: per-layer full 737µs × 16 + GDN 286µs × 48 ≈ 25ms GPU per
+  target-verify call. T_ver ≈ 25-30ms (committee's ~30 vindicated).
+  (Width-blended avg — exact M=4-only split needs per-instance query.)
+- Refills: ~5 core calls × 0.9 ≈ 4-5ms/step (new explicit bucket).
+- Commits: ~28ms/step wall (stands).
+- Step recomposition: 5 (drafts) + 25-30 (verify) + 28 (commits) +
+  4-5 (refills) + gaps ≈ 64-70ms ✓ wall-derived 64.
+- Consequences: k-table flips — drafts cheap + m16 flat across M ⇒ k=3-4
+  likely wins (committee's call). Small-m kernel (m=2-8, dequant-once,
+  gemv-like) becomes TOP lever: pulls verify 25→~10 AND fixes conc-2..8
+  in the same move (the original "lifts both" ask). Row 16 covered m=1
+  ONLY — "kernels done forever" does NOT cover m=2-8. Filed.
+- Slots ceiling restated: (5+25+5+gaps)/3.82. Gaps-kept ≈ 12.8 (ships ~
+  10% over 14.3, needs on-device accept for 12.2). Small-m on top:
+  ≈ (5+10+5)/3.82 ≈ 5ms/tok. Order: slots (removes 28) → small-m
+  (removes ~15 + conc). T_ver picked small-m over draft-graphing.
+- TTFT (warm, steady-state): on 1.8-2.0s (CODELOW p66) / 1.3-1.5s (PRIME
+  p49) vs off warm ~0.1s. First-req capture ≈ 0.2s of it. ~1.5s steady
+  overhead (MTP prefill + eager anchor + first-step capture) is a SHIP
+  BLOCKER independent of 20b (20b doesn't touch TTFT): at 1.5ms/tok saved
+  it takes ~1000 tokens to earn back. Filed with numbers.
+
+## Conc SM-busy (both servers, nsys) + amended bars/order
 
 Spec-off conc-2 (/root/conc2-off, makespan 2.19): ZERO gemv — all m16
 GEMMs (b4 med 42.7µs, b3 med 54µs). EXL3 ≈ 1.52s / 2.19s wall = ~70%
@@ -159,12 +192,17 @@ Verdict: committee flag resolved as graphs+math, not driver. Multi-seq
 graphs (± conc-aware MTP gating = fix-5) are the aggregate lever after
 all — row 17 "polish" verdict REVERSED, pending 20b + easy-fix order.
 
-## Next (in order — NEXT-2 scope COMPLETE)
+## Next (in order — committee amended)
 
-1. Slots go/no-go on 12.8 gaps-kept bar (ships only with a plan to clear
-   12.2: on-device accept and/or draft graphing). Needs Chip sign-off.
-2. Draft graphing + head-truncate check, then the k decision (k=1-2 lead).
-3. Native exe (NEXT-1) re-gate anytime.
-4. NVTX re-capture (-t cuda,nvtx) for true GPU-projected buckets — only
-   if 20b needs exact T_ver (not blocking: go-case depends only on what
-   slots remove).
+Ship bar (prediction ≠ bar): decode ≤12.2 on high-accept regimes; TTFT at
+parity with off (BLOCKER until fixed); PARIS no worse than off; conc guard
+unchanged. Adaptive gate (~2.5 rolling E → off path) only safe once the
+MTP server's off-branch is graphed (eager today = the 58%).
+
+1. BUILD 20b, k-parametric slots + graph the MTP server's off-branch.
+   GO signed by Chip — three corrections folded, no geometry change.
+2. Small-m kernel ticket (m=2-8 dequant-once gemv-like): top lever per
+   T_ver verdict — pulls verify AND conc in one move. Write it next.
+3. Draft graphing only if small-m stalls; k decision after (k=3-4 lead).
+4. Native exe DEFERRED (reviewer overruled: graphs remove the launch
+   overhead; no mid-algorithm re-baseline). Revisit after 20b ships.
