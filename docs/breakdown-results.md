@@ -120,11 +120,27 @@ Off walls: FOX 1.03, PARIS 2.09, CODELOW 1.40, PRIME 1.02. On loses every
 regime 2.2–2.7× (FOX 2.2-2.3, PARIS 4.78, CODELOW ~3.75, PRIME ~2.77).
 CODELOW veto stands only with its off-number: 3.75 vs 1.40. Filed.
 
-## Next (in order)
+## Conc SM-busy (both servers, nsys)
 
-1. Conc-2 SM-busy both servers (batch size + graph-vs-eager HAVE from
-   logs; only SM-busy needs nsys).
-2. Slots go/no-go on 12.8 gaps-kept bar (ships only with a plan to clear
-   12.2: on-device accept and/or draft graphing).
-3. Draft graphing + head-truncate check, then the k decision (k=1-2 lead).
-4. Native exe (NEXT-1) re-gate anytime.
+Spec-off conc-2 (/root/conc2-off, makespan 2.19): ZERO gemv — all m16
+GEMMs (b4 med 42.7µs, b3 med 54µs). EXL3 ≈ 1.52s / 2.19s wall = ~70%
+GPU-busy. Math-bound, no WDDM punishment. m=2 ≈ 2× m=1 work with no
+overlap benefit at B=2 (GEMM-bound); B=4/8 amortize via bigger Ms.
+MTP-server conc-2 (/root/conc2-mtp, makespan 3.73): 26k gemv m=1
+instances (608ms) ON TOP of m16 (1.66s) = 2.9s/3.73 = 78% busy. The
+penalty is m=1 eager rows (no graphs on the MTP server) where spec-off
+runs m=2 efficient GEMMs or B=1 replay — plus scheduler races between
+batched-m=2 (zero MTP) and serial-B=1 (MTP-eligible) across runs.
+Verdict: committee flag resolved as graphs+math, not driver. Multi-seq
+graphs (± conc-aware MTP gating = fix-5) are the aggregate lever after
+all — row 17 "polish" verdict REVERSED, pending 20b + easy-fix order.
+
+## Next (in order — NEXT-2 scope COMPLETE)
+
+1. Slots go/no-go on 12.8 gaps-kept bar (ships only with a plan to clear
+   12.2: on-device accept and/or draft graphing). Needs Chip sign-off.
+2. Draft graphing + head-truncate check, then the k decision (k=1-2 lead).
+3. Native exe (NEXT-1) re-gate anytime.
+4. NVTX re-capture (-t cuda,nvtx) for true GPU-projected buckets — only
+   if 20b needs exact T_ver (not blocking: go-case depends only on what
+   slots remove).
