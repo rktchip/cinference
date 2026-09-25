@@ -213,6 +213,18 @@ No-match clause: if no candidate (identity/flip/transpose/transpose-flip/
 shifts) lands within family noise AND the 3x3 time matrix plus segment
 matrix show no mapping, the layout class itself is wrong — write that
 into this ticket and reopen the investigation (do not add more guesses).
+RE-GRADE (rig race): the CTX run reproduced the F53 verdict line
+bit-for-bit yet t[1]==mid bit-exact at L0 — the old [A1,A2,X] was a torn
+snapA_mid, not engine state. snapshot_gdn_slot used legacy-stream
+cudaMemcpy against a non-blocking compute stream (no fence); the L20/L21
+cliff is where row kernels overtook the memcpy burst. Every unfenced
+number is suspect: commit diffs (conv 55-62, L0-worst), sentinel means,
+convBPre baselines. Fix by construction: snapshot is now async-on-compute
++ stream-sync before host read (all 14 sites); engine audited clean
+(copy_slot D2D-async, inits async, no sync memcpy in ops/models decode).
+Null control: legacy-vs-legacy rerun must read exactly 0 every layer
+every run (NULL-OK), else the run is void. Rows get deleted on a fenced
+commit diff at caps 0/1/2/natural — not on the singles table alone.
 Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
 writes — the suspect line (gdn_conv.cuh publish address) is inside
 verify's kernel. "Verify exonerated" means logits only.

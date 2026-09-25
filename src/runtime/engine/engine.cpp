@@ -78,34 +78,52 @@ struct GdnSlotSnapshot {
 
 GdnSlotSnapshot snapshot_gdn_slot(LinearAttentionStatePool* pool,
                                   const std::vector<models::qwen3_5::MixerKind>& layer_types,
-                                  std::int32_t slot) {
+                                  std::int32_t slot, cudaStream_t fence_stream) {
     GdnSlotSnapshot s;
-    // Pool slots are compact-GDN-indexed (gdn_mix's gidx), not global layer
-    // id: count non-full layers for the pool view.
+    // Fenced by construction (note 2): legacy-stream cudaMemcpy does NOT
+    // wait for the non-blocking compute stream, so every D2H here is async
+    // on compute + stream sync before any host read. Every future snapshot
+    // (snapR, snapSH, ...) inherits the fence automatically.
+    struct Span {
+        std::size_t off = 0;
+        std::size_t n   = 0;
+    };
+    std::vector<Span> rec_spans;
+    std::vector<Span> conv_spans;
     std::uint32_t c = 0;
     for (std::uint32_t L = 0; L < static_cast<std::uint32_t>(layer_types.size()); ++L) {
         if (layer_types[L] == models::qwen3_5::MixerKind::FullAttention) { continue; }
-        Tensor r = pool->recurrent_slot(c, slot);
+        Tensor r  = pool->recurrent_slot(c, slot);
         Tensor co = pool->conv_slot(c, slot);
         ++c;
         s.layers.push_back(L);
         s.rec_off.push_back(s.rec.size());
         const std::size_t n = r.bytes() / 4;
+        rec_spans.push_back({s.rec_off.back(), n});
         s.rec.resize(s.rec.size() + n);
-        CUDA_CHECK(cudaMemcpy(s.rec.data() + s.rec_off.back(), r.data, r.bytes(),
-                              cudaMemcpyDeviceToHost));
         s.conv_off.push_back(s.conv.size());
         const std::size_t m = co.bytes() / 2;
+        conv_spans.push_back({s.conv_off.back(), m});
         s.conv.resize(s.conv.size() + m);
-        std::vector<std::uint16_t> tmp(m);
-        CUDA_CHECK(
-            cudaMemcpy(tmp.data(), co.data, co.bytes(), cudaMemcpyDeviceToHost));
-        for (std::size_t i = 0; i < m; ++i) {
-            std::uint32_t f = static_cast<std::uint32_t>(tmp[i]) << 16;
-            float v         = 0.0f;
-            std::memcpy(&v, &f, 4);
-            s.conv[s.conv_off.back() + i] = v;
-        }
+    }
+    std::vector<std::uint16_t> ctmp(s.conv.size());
+    c = 0;
+    for (std::uint32_t L = 0; L < static_cast<std::uint32_t>(layer_types.size()); ++L) {
+        if (layer_types[L] == models::qwen3_5::MixerKind::FullAttention) { continue; }
+        Tensor r  = pool->recurrent_slot(c, slot);
+        Tensor co = pool->conv_slot(c, slot);
+        ++c;
+        CUDA_CHECK(cudaMemcpyAsync(s.rec.data() + rec_spans[c - 1].off, r.data, r.bytes(),
+                                   cudaMemcpyDeviceToHost, fence_stream));
+        CUDA_CHECK(cudaMemcpyAsync(ctmp.data() + conv_spans[c - 1].off, co.data,
+                                   co.bytes(), cudaMemcpyDeviceToHost, fence_stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(fence_stream));
+    for (std::size_t i = 0; i < ctmp.size(); ++i) {
+        std::uint32_t f = static_cast<std::uint32_t>(ctmp[i]) << 16;
+        float v         = 0.0f;
+        std::memcpy(&v, &f, 4);
+        s.conv[i] = v;
     }
     return s;
 }
@@ -1175,8 +1193,8 @@ public:
                 // Entry gap: |lane-spare| must be ~0 (spare synced above).
                 {
                     const auto& e_types = parameters_.model.config().text.layer_types;
-                    GdnSlotSnapshot eL  = snapshot_gdn_slot(pool_.get(), e_types, lane);
-                    GdnSlotSnapshot eS  = snapshot_gdn_slot(pool_.get(), e_types, o_spare);
+                    GdnSlotSnapshot eL  = snapshot_gdn_slot(pool_.get(), e_types, lane, stream);
+                    GdnSlotSnapshot eS  = snapshot_gdn_slot(pool_.get(), e_types, o_spare, stream);
                     float egap = 0.0f;
                     for (std::size_t k = 0; k < eL.rec.size(); ++k) {
                         float d = eL.rec[k] - eS.rec[k];
@@ -1191,7 +1209,8 @@ public:
                 // never written (dst binding missing); != 0 but != convB-vs-A
                 // means written with wrong values (chaining/init).
                 GdnSlotSnapshot snapPre = snapshot_gdn_slot(
-                    pool_.get(), parameters_.model.config().text.layer_types, mtp_oracle_base_);
+                    pool_.get(), parameters_.model.config().text.layer_types, mtp_oracle_base_,
+                    stream);
                 std::fprintf(stderr, "[slot-oracle] snapPre done (%u layers)\n",
                              static_cast<std::uint32_t>(snapPre.layers.size()));
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
@@ -1215,12 +1234,12 @@ public:
                 // Mid-span canonical window (span F+aL): matches t[aS] span
                 // for the off-GPU permutation test (note 3). The last legacy
                 // row runs after this snapshot.
-                GdnSlotSnapshot snapA_mid = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                GdnSlotSnapshot snapA_mid = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 std::fprintf(stderr, "[slot-oracle] snapA_mid done (%u layers)\n",
                              static_cast<std::uint32_t>(snapA_mid.layers.size()));
                 run_single_row(commitL[commit_lenL - 1], F + commit_lenL - 1, lane, lane, lane,
                                hid1, log1, true);
-                GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 std::int32_t saved_targets_L[4] = {o_targets[0], o_targets[1], o_targets[2],
                                                    o_targets[3]};
                 std::fprintf(stderr, "[slot-oracle] snapA done (%u layers)\n",
@@ -1230,7 +1249,7 @@ public:
                 GdnSlotSnapshot snapSH[4];
                 for (std::int32_t shc = 0; shc < 4; ++shc) {
                     snapSH[shc] =
-                        snapshot_gdn_slot(pool_.get(), o_types, o_shadow + shc);
+                        snapshot_gdn_slot(pool_.get(), o_types, o_shadow + shc, stream);
                 }
                 std::fprintf(stderr, "[slot-oracle] snapSH done\n");
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
@@ -1238,7 +1257,7 @@ public:
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
                 // Restore check: lane-post-restore vs presnap (conv). Nonzero
                 // means the restore missed and the slots verify started ahead.
-                GdnSlotSnapshot snapR = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                GdnSlotSnapshot snapR = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 {
                     float rworst = 0.0f;
                     for (std::size_t k = 0; k < snapR.conv.size(); ++k) {
@@ -1249,6 +1268,36 @@ public:
                     }
                     std::fprintf(stderr, "[slot-oracle] restore-check |lane-pre|=%.4g %s\n",
                                  rworst, rworst == 0.0f ? "RESTORE-OK" : "RESTORE-DIFF");
+                }
+                // Null control (note 3): legacy-vs-legacy at the same span.
+                // Re-run the identical rows from presnap state; snapA2 must
+                // equal snapA bit-exactly at every layer. Any nonzero voids
+                // the run's diffs before anyone reads them (fencing check).
+                {
+                    for (std::uint32_t j = 0; j < commit_lenL; ++j) {
+                        run_single_row(commitL[j], F + j, lane, lane, lane, hid1, log1,
+                                       true);
+                    }
+                    GdnSlotSnapshot snapA2 =
+                        snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                    float nworst = 0.0f;
+                    for (std::size_t k = 0; k < snapA.rec.size(); ++k) {
+                        float d = snapA2.rec[k] - snapA.rec[k];
+                        if (d != d) { nworst = 1e30f; break; }
+                        if (d < 0) d = -d;
+                        if (d > nworst) nworst = d;
+                    }
+                    for (std::size_t k = 0; k < snapA.conv.size(); ++k) {
+                        float d = snapA2.conv[k] - snapA.conv[k];
+                        if (d != d) { nworst = 1e30f; break; }
+                        if (d < 0) d = -d;
+                        if (d > nworst) nworst = d;
+                    }
+                    std::fprintf(stderr, "[slot-oracle] null-control |A2-A|=%.4g %s\n",
+                                 nworst, nworst == 0.0f ? "NULL-OK" : "NULL-DIFF-VOID");
+                    pool_->copy_slot(mtp_oracle_base_, lane, stream);
+                    pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
+                    pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
                 }
                 // Pulse reset: the slots verify below should execute 192/192
                 // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
@@ -1295,16 +1344,16 @@ public:
                 GdnSlotSnapshot snapT;
                 const bool haveT = (aS >= 1);
                 if (haveT) {
-                    snapT = snapshot_gdn_slot(pool_.get(), o_types, coltab_host_o[aS]);
+                    snapT = snapshot_gdn_slot(pool_.get(), o_types, coltab_host_o[aS], stream);
                     std::fprintf(stderr, "[slot-oracle] snapT done (slot %d)\n",
                                  coltab_host_o[aS]);
                 }
                 // Column-pattern singles: t[2], t[3] hold col-2/3 publishes
                 // regardless of accept; snapshot for the overwrite analysis.
                 GdnSlotSnapshot snapT2 = snapshot_gdn_slot(pool_.get(), o_types,
-                                                           coltab_host_o[2]);
+                                                           coltab_host_o[2], stream);
                 GdnSlotSnapshot snapT3 = snapshot_gdn_slot(pool_.get(), o_types,
-                                                           coltab_host_o[3]);
+                                                           coltab_host_o[3], stream);
                 card_->commit_verify_slots(lane, coltab_host_o, aS, 4);
                 // Mirror the real path: t[aS] covers through F+aS; the
                 // trailing row executes out_aS (@F+commit_lenS-1) so both
@@ -1317,7 +1366,7 @@ public:
                 const std::uint32_t commit_lenS = (aS == kDrafts) ? 5 : aS + 2;
                 run_single_row(commitS[commit_lenS - 1], F + commit_lenS - 1, lane, lane, lane,
                                hid1, log1, true);
-                GdnSlotSnapshot snapB = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                GdnSlotSnapshot snapB = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 std::fprintf(stderr,
                              "[slot-oracle] snapB done (rec=%.1fMB conv=%.1fMB)\n",
                              snapB.rec.size() * 4.0 / 1048576.0,
