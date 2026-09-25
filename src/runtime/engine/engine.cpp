@@ -1242,28 +1242,60 @@ public:
                 // any split lands in exactly one of those two bins.
                 auto logit_top1 = [&](const char* side) {
                     std::int32_t top1[4] = {-1, -1, -1, -1};
+                    float gap[4] = {0, 0, 0, 0};
+                    float maxdiff[4] = {-1, -1, -1, -1};
+                    // Stash legacy columns; at slots time print the
+                    // inter-side max-abs-diff per column (note 2 bins).
+                    static std::vector<std::uint16_t> legacy_cols;
+                    const std::size_t V =
+                        static_cast<std::size_t>(text_vocab_);
+                    auto bf16_to_f = [](std::uint16_t b) -> float {
+                        if ((b & 0x7FFF) == 0) return 0.0f;
+                        std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+                        float f;
+                        std::memcpy(&f, &u, 4);
+                        return f;
+                    };
                     for (int c = 0; c < 4; ++c) {
-                        std::vector<std::uint16_t> col(
-                            static_cast<std::size_t>(text_vocab_));
+                        std::vector<std::uint16_t> col(V);
                         CUDA_CHECK(cudaMemcpy(col.data(), mbase + mtp_vlog_ +
-                                                              static_cast<std::size_t>(c) *
-                                                                  text_vocab_ * 2U,
+                                                              static_cast<std::size_t>(c) * V * 2U,
                                               col.size() * 2U, cudaMemcpyDeviceToHost));
-                        float best = -1e30f;
+                        float best = -1e30f, second = -1e30f;
                         for (std::uint32_t v = 0; v < text_vocab_; ++v) {
-                            const std::uint32_t b = col[v];
-                            float f;
-                            if ((b & 0x7FFF) == 0) {
-                                f = 0.0f;
-                            } else {
-                                std::uint32_t u = (static_cast<std::uint32_t>(b) << 16);
-                                std::memcpy(&f, &u, 4);
+                            const float f = bf16_to_f(col[v]);
+                            if (f > best) {
+                                second = best;
+                                best = f;
+                                top1[c] = static_cast<std::int32_t>(v);
+                            } else if (f > second) {
+                                second = f;
                             }
-                            if (f > best) { best = f; top1[c] = static_cast<std::int32_t>(v); }
+                        }
+                        gap[c] = best - second;
+                        if (side[0] == 'l') {
+                            if (legacy_cols.size() < 4 * V) legacy_cols.resize(4 * V);
+                            std::memcpy(legacy_cols.data() + static_cast<std::size_t>(c) * V,
+                                        col.data(), V * 2U);
+                        } else if (legacy_cols.size() >= 4 * V) {
+                            float md = 0.0f;
+                            const std::uint16_t* lc =
+                                legacy_cols.data() + static_cast<std::size_t>(c) * V;
+                            for (std::size_t v = 0; v < V; ++v) {
+                                float d = bf16_to_f(col[v]) - bf16_to_f(lc[v]);
+                                if (d != d) { md = 1e30f; break; }
+                                if (d < 0) d = -d;
+                                if (d > md) md = d;
+                            }
+                            maxdiff[c] = md;
                         }
                     }
-                    std::fprintf(stderr, "[slot-oracle] %s logits top1=[%d %d %d %d]\n",
-                                 side, top1[0], top1[1], top1[2], top1[3]);
+                    std::fprintf(stderr,
+                                 "[slot-oracle] %s logits top1=[%d %d %d %d] "
+                                 "gap=[%.4g %.4g %.4g %.4g] interdiff=[%.4g %.4g %.4g %.4g]\n",
+                                 side, top1[0], top1[1], top1[2], top1[3], gap[0], gap[1],
+                                 gap[2], gap[3], maxdiff[0], maxdiff[1], maxdiff[2],
+                                 maxdiff[3]);
                 };
                 logit_top1("legacy");
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
