@@ -8,8 +8,9 @@
 > `CUDA_EXL3_AUTOTUNE=0` + `CUDA_EXL3_SPLIT_TARGET=0` required. Measured
 > serve, no env vars: spec-off **~14 ms/tok** (FOX-64 streaming, excl tok1,
 > replay after warmup; TTFT unchanged; 8/8 matrix green default-on);
-> spec-on MTP **~35 ms/tok** (verify graphed under the same flag,
-> drafts/bonus/commit rows eager; frozen Paris 6511/314/9338/369 accept-3).
+> spec-on MTP **~23 ms/tok** (verify + commit rows graphed under the same
+> flag, drafts + per-row MTP refills eager; frozen Paris 6511/314/9338/369
+> accept-3).
 > Old eager numbers (GRAPH=0): spec-off ~27–30, spec-on ~39. No 180: that
 > band needs spec that beats one weight pass plus DFlash/graphs
 > we do not have. Gate: two-curl T=0 **Paris / Rome**, 24/24.
@@ -86,6 +87,9 @@ work lands; the loop reads here, not chat.
 | 13 | Async readback for spec-on (8 → 5 host stalls) | DONE 2026-09-23 | 4 verify argmaxes batched behind one sync via dedicated `mtp_vtok_` outbox (`engine.cpp` layout + verify loop); bonus + 3 draft-chain syncs stay (true AR deps — no event scheme removes them). Bars held: accept 3/commit 5 identical, rewind True, cross-path True. Wall 2.52s/33tok (~46ms/tok) vs 2.54–2.89s pre-change — marginal: step is kernel-bound (12–13 row-forwards per ~4 tokens ≈ 3× eager work), not sync-bound. Recorded, not solved; remaining lever is structural (fewer rows), not readback |
 | 14 | Ship gate: think-split in same tree as MTP binary | DONE ca8a26ed (uncommitted) | serial, before any ship claim | One binary, all re-proven 2026-09-24: spec-off 8/8 green + SSE clean; spec-on frozen Paris `**Paris**.` / Rome `*Roma*).` stop, F=19 accept 3, EOS-through-commits, accept-2 rewind; think-split LIVE (bat-and-ball, thinking default): reasoning_content=777 chars, content clean. Protocol lesson: frozen gates require enable_thinking:False — thinking-default wanders (F=59, different text, still coherent). |
 | 15 | Lane B: batched MTP verify (width-4) | DONE 2026-09-23, lead-verified | 4 serial width-1 verify rows → one `target_verify_batch` (bonus+3 drafts, single sync); draft AR + accept + commit untouched; recurrent kernel stays width-1 via spare↔shadow ping-pong (no new math). Lead re-ran bars on landed binary: `drafts=[6511 314 9338] verify=[6511 314 9338 369] accepted=3 commit=5` identical, rewind True, spec-off 8/8 green. Wall: lane-measured spec-on 3.17→2.62s single-run noisy (~17%); my TTFTs 723–884ms vs ~1s pre-change, directionally consistent. Spec-on still ~3× spec-off, kernel-bound — recorded, not solved |
+| 16 | #3: one-layer gemv head-to-head (ours vs ExLlamaV3, same 3.5bpw, same 5090) | DONE 2026-09-25, MATCHED | one GPU session | Ours (nsys): gemv_plain m=1 K4 19–22µs / K3 ~25µs. Theirs (torch-profiler, 50-tok decode = 12,750 m=1 rows): gemv_int8_sq K4 21µs / K3 30–37µs. Same band; ours a hair faster. NO 2× gap → kernels done forever, no occupancy ticket. Single-stream 14/35 stands as terminal (remaining 14→8 is sub-ticket polish, no single item) |
+| 17 | Conc-8 throughput (ours first, Tabby compare if cheap) | DONE 2026-09-25 | one GPU session | conc-1/2/4/8 FOX makespans 1.13/2.3/2.4/2.7s, aggregate 44→150 words/s (3.4×). Batches for real (8×64 toks in 2.66s vs 9s serial). B=2 ≈ serial per-token (m=2 barely beats m=1); B=4/8 amortize via efficient m=4/8 GEMMs. Scaling HEALTHY — multi-seq padded graphs optional polish (launch tax shrinks as kernels grow), not a lever. Tabby compare skipped (server down; question answered) |
+| 18 | Commit-row graphs (bonus + commits via dec/M=1-shaped exec) | DONE 2026-09-25 | one GPU session, no bisect needed | One GLOBAL commit exec (→hid1/log1; anchor replay stays eager, once/admission). Capture 2nd commit row, immediate replay. Spec-on FOX-64: 35.4 → 22.6 ms/tok ×3 metronome (−36%; predicted 17–20, remainder = 3× drafts + per-row MTP refills + glue, all eager). Paris accept-3 + accept-1 rewinds ON REPLAY (69 commit + 16 verify replays). Spec-off untouched on same binary: 14.3 + TRUE 8/8. Still worse than 14 — as priced |
 
 Rules: swarm only items marked swarm with disjoint files; everything
 serial runs one lane at a time on the GPU. No item starts outside the

@@ -776,7 +776,7 @@ public:
     // only the accepted prefix is replayed lane-into-lane.
     void run_single_row(std::int32_t tok, std::uint32_t position, std::int32_t kv_row,
                         std::int32_t gdn_src, std::int32_t gdn_dst, Tensor& hidden_out,
-                        Tensor& logits_out) {
+                        Tensor& logits_out, bool allow_graph = false) {
         cudaStream_t stream = device_.stream;
         char* mbase         = static_cast<char*>(scratch_.p);
         const std::int32_t p = static_cast<std::int32_t>(position);
@@ -800,8 +800,67 @@ public:
         const Tensor row_t(mbase + mtp_row_, DType::I32, {1});
         const Tensor src_t(mbase + mtp_ssrc_, DType::I32, {1});
         const Tensor dst_t(mbase + mtp_sdst_, DType::I32, {1});
-        card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, src_t, dst_t, row_env,
-                                     hidden_out, logits_out);
+        // Row-18: frozen dec/M=1 commit exec (GLOBAL, same address argument
+        // as ver/M=4: pool bases + mbase scratch + reset arena are stable;
+        // per-row tok/pos/row/slots are contents at fixed addresses,
+        // rewritten above). Commit rows all land in hid1/log1; the anchor
+        // replay uses anchor_hid and stays eager (allow_graph=false, once
+        // per admission). First commit row eager (seen rule), capture 2nd,
+        // immediate replay (WSL rule). Fail-closed to eager.
+        const bool cgraph_on =
+            allow_graph && graphs_enabled_ && mtp_enabled_ && !graph_dry_ && !commit_dead_;
+        if (cgraph_on && !commit_seen_) commit_seen_ = true;
+        auto cglog = [&](const char* act) {
+            if (graph_verbose_) {
+                std::fprintf(stderr, "[cgraph] lane=%d pos=%d action=%s\n", kv_row, p, act);
+            }
+        };
+        if (cgraph_on && commit_seen_ && commit_exec_ != nullptr) {
+            CUDA_CHECK(cudaGraphLaunch(commit_exec_, stream));
+            cglog("replay");
+        } else if (cgraph_on && commit_seen_ && commit_exec_ == nullptr) {
+            cudaGraph_t cgraph = nullptr;
+            bool cok           = false;
+            if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess) {
+                try {
+                    card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, src_t, dst_t,
+                                                 row_env, hidden_out, logits_out);
+                } catch (...) {
+                    cudaStreamEndCapture(stream, &cgraph);
+                    if (cgraph != nullptr) cudaGraphDestroy(cgraph);
+                    commit_dead_ = true;
+                    throw;
+                }
+                if (cudaStreamEndCapture(stream, &cgraph) == cudaSuccess &&
+                    cgraph != nullptr) {
+                    cudaGraphExec_t cexec = nullptr;
+                    if (cudaGraphInstantiate(&cexec, cgraph, nullptr, nullptr, 0) ==
+                            cudaSuccess &&
+                        cexec != nullptr) {
+                        cudaGraphDestroy(cgraph);
+                        commit_exec_ = cexec;
+                        CUDA_CHECK(cudaGraphLaunch(commit_exec_, stream));
+                        cglog("capture");
+                        cok = true;
+                    } else {
+                        if (cexec != nullptr) cudaGraphExecDestroy(cexec);
+                        cudaGraphDestroy(cgraph);
+                    }
+                } else if (cgraph != nullptr) {
+                    cudaGraphDestroy(cgraph);
+                }
+            }
+            if (!cok) {
+                commit_dead_ = true;
+                card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, src_t, dst_t,
+                                             row_env, hidden_out, logits_out);
+                cglog("capture-fail");
+            }
+        } else {
+            card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, src_t, dst_t, row_env,
+                                         hidden_out, logits_out);
+            cglog(!cgraph_on ? "eager-disabled" : "eager-first");
+        }
     }
 
     // S7 MTP-3 single-slot decode: draft 3 from the in-checkpoint head, one
@@ -1080,7 +1139,7 @@ public:
                                    static_cast<std::size_t>(hidden_) * 2U,
                                    cudaMemcpyDeviceToDevice, stream));
         for (std::uint32_t j = 0; j < commit_len; ++j) {
-            run_single_row(commit[j], F + j, lane, lane, lane, hid1, log1);
+            run_single_row(commit[j], F + j, lane, lane, lane, hid1, log1, true);
             std::int32_t ctok = commit[j];
             std::int32_t cpos = static_cast<std::int32_t>(F + j);
             const ops::CausalAttentionExecutionEnvelope cenv{
@@ -1332,6 +1391,11 @@ private:
     cudaGraphExec_t verify_exec_ = nullptr;
     bool verify_seen_            = false;
     bool verify_dead_            = false;
+    // Row-18: one frozen dec/M=1 commit exec (GLOBAL). Commit rows share
+    // hid1/log1; the anchor replay's anchor_hid never enters (allow_graph).
+    cudaGraphExec_t commit_exec_ = nullptr;
+    bool commit_seen_            = false;
+    bool commit_dead_            = false;
 
 public:
     ~ServeForwardContext() {
@@ -1345,6 +1409,10 @@ public:
         if (verify_exec_ != nullptr) {
             cudaGraphExecDestroy(verify_exec_);
             verify_exec_ = nullptr;
+        }
+        if (commit_exec_ != nullptr) {
+            cudaGraphExecDestroy(commit_exec_);
+            commit_exec_ = nullptr;
         }
     }
 
