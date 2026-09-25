@@ -15,6 +15,11 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#ifdef __linux__
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -25,9 +30,37 @@ void handle_signal(int) {
     if (server != nullptr) { server->stop(); }
 }
 
+#ifdef __linux__
+// Crash handler (durability, see scripts/harness_notes.md): a segfault
+// kills buffered logs with it, so flush stderr and print a backtrace
+// before dying. Async-signal-safe subset only (write/_exit); backtrace()+
+// backtrace_symbols_fd() are the standard glibc practice here.
+void handle_crash(int sig) {
+    const char msg[] = "ninfer-serve: fatal signal, backtrace:\n";
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    void* frames[64];
+    const int depth = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, depth, STDERR_FILENO);
+    (void)::fsync(STDERR_FILENO);
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+void install_crash_handler() {
+    struct sigaction sa;
+    sa.sa_handler = handle_crash;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND | SA_NODEFER;
+    ::sigaction(SIGSEGV, &sa, nullptr);
+    ::sigaction(SIGABRT, &sa, nullptr);
+}
+#else
+void install_crash_handler() {}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
+    install_crash_handler();
     ninfer::serve::ServeOptions options;
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
