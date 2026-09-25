@@ -209,6 +209,17 @@ t2-vs-full is span-matched, sh1[2]-vs-X tests M4-p identity.
 Pre-registered profile: wrong at EVERY accept incl a=0 and full accept
 (col 0 publishes into the lane in the same layout) — the cap sweep is
 post-fix verification, not diagnosis.
+Independent floors (gate hardening, pre-small-m): the col-match floor
+(t_c vs sh_c) shares the slot path with the commit diff, so a ratio ~1
+proves nothing by itself — the verdict rests on ABSOLUTE magnitude
+(O(1) = placement/index bug; bf16-ULP ladder + 1e-3-rel = noise).
+Before the small-m kernel changes numerics, the harness needs floors
+that don't touch the slot path:
+- Conv: M4-vs-M1 on the projection outputs (h_c, pre-conv) themselves —
+  legacy-verify h_c vs single-row h_c for the same token (both already
+  run in the oracle; snapshot h_c in both, no slots involved).
+- Recurrent: the cap-0 residual (no copy-back, no slot index; the sweep
+  produces it).
 No-match clause: if no candidate (identity/flip/transpose/transpose-flip/
 shifts) lands within family noise AND the 3x3 time matrix plus segment
 matrix show no mapping, the layout class itself is wrong — write that
