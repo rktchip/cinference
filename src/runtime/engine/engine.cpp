@@ -1182,6 +1182,10 @@ public:
                              F, lane, pool_->layer_count(),
                              static_cast<std::uint32_t>(
                                  parameters_.model.config().text.layer_types.size()));
+                // Bonus ring (note 1 token-ID check): last 4 step-input IDs.
+                // Presnap window positions are [ring[-2], ring[-1], bonus].
+                static std::int32_t bonus_ring[4] = {0, 0, 0, 0};
+                static int bonus_n = 0;
                 // Presnap lane + spare + shadow: the legacy probe clobbers
                 // spare/shadow as ping/pong scratch, and the real path needs
                 // all three pristine.
@@ -1244,6 +1248,8 @@ public:
                 }
                 std::int32_t commitL[5];
                 commitL[0] = bonus;
+                bonus_ring[bonus_n & 3] = bonus;
+                ++bonus_n;
                 for (std::uint32_t j = 0; j < aL; ++j) { commitL[1 + j] = host_drafts[j]; }
                 commitL[1 + aL] = o_targets[aL];
                 const std::uint32_t commit_lenL = (aL == kDrafts) ? 5 : aL + 2;
@@ -1646,10 +1652,14 @@ public:
                     }
                     std::fprintf(stderr,
                                  "[slot-oracle] ctx dump F=%u a=%u bases lane=%d spare=%d "
-                                 "shadow=%d colbase=%d shbase=%d orbase=%d drafts=[%d %d %d]\n",
+                                 "shadow=%d colbase=%d shbase=%d orbase=%d drafts=[%d %d %d] "
+                                 "win=[%d %d %d]\n",
                                  F, aS, lane, o_spare, o_shadow, mtp_column_base_,
                                  mtp_shadow_base_, mtp_oracle_base_, host_drafts[0],
-                                 host_drafts[1], host_drafts[2]);
+                                 host_drafts[1], host_drafts[2],
+                                 bonus_n >= 2 ? bonus_ring[(bonus_n - 2) & 3] : -1,
+                                 bonus_n >= 1 ? bonus_ring[(bonus_n - 1) & 3] : -1,
+                                 bonus);
                     ctx_dumped = true;
                 }
                 } else {
