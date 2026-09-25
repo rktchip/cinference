@@ -1184,6 +1184,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
                                            const Tensor* linear_state_destination_slots,
+                                           const Tensor* linear_state_column_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
@@ -1220,6 +1221,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                                  &linear_state_source_slots);
         ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
                                                        linear_state_destination_slots);
+        ScopedValue<const Tensor*> column_binding(active_linear_state_column_slots_,
+                                                  linear_state_column_slots);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -1251,7 +1254,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, nullptr, envelope, hidden, logits,
+                             linear_state_source_slots, nullptr, nullptr, envelope, hidden, logits,
                              target_tokens, tap);
 }
 
@@ -1263,7 +1266,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, nullptr, envelope, hidden, logits,
+                             linear_state_source_slots, nullptr, nullptr, envelope, hidden, logits,
                              target_tokens, sink);
 }
 
@@ -1275,10 +1278,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       const Tensor& linear_state_destination_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
+                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+                                      const Tensor* linear_state_column_slots) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, &linear_state_destination_slots, envelope,
+                             linear_state_source_slots, &linear_state_destination_slots,
+                             linear_state_column_slots, envelope,
                              hidden, logits, target_tokens, tap);
 }
 
@@ -1612,6 +1617,19 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             // even width; both slots are scratch). All other paths above.
             const Tensor& ping = *active_linear_state_source_slots_;
             const Tensor& pong = *active_linear_state_destination_slots_;
+            // Row 20b layout B: when a column-slot table is bound (batch==1,
+            // table length == width-1), preserve every intermediate state:
+            // col 0 in place (lane->lane), col c>=1 reads (c==1 ? ping :
+            // t[c-2]) and writes t[c-1]. Accept-a state is then ping (a==0)
+            // or t[a-1]. Strict validation when bound (fail-closed); null
+            // keeps the legacy ping/pong scratch behavior for old callers.
+            const Tensor* coltab = active_linear_state_column_slots_;
+            if (coltab != nullptr) {
+                if (active_sequence_batch_ != 1 || coltab->ne[0] != width - 1) {
+                    throw std::logic_error(
+                        "Row 20b column slots need batch==1 and table length == width-1");
+                }
+            }
             const float scale  = static_cast<float>(
                 1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
             for (std::int32_t c = 0; c < width; ++c) {
@@ -1621,8 +1639,28 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 Tensor gc = g_batch.slice(1, c, 1);
                 Tensor bc = beta_batch.slice(1, c, 1);
                 Tensor oc = out_batch.slice(2, c, 1);
-                const Tensor& scol = (c % 2 == 0) ? ping : pong;
-                const Tensor& dcol = (c % 2 == 0) ? pong : ping;
+                // Layout B: col 0 in place; col c>=1 chains through t[].
+                // Legacy: even/odd ping/pong alternation (scratch).
+                Tensor t_scol;
+                Tensor t_dcol;
+                const Tensor* scol_p = nullptr;
+                const Tensor* dcol_p = nullptr;
+                if (coltab != nullptr) {
+                    if (c == 0) {
+                        scol_p = &ping;
+                        dcol_p = &ping;
+                    } else {
+                        t_scol = (c == 1) ? ping : coltab->slice(0, c - 2, 1);
+                        t_dcol = coltab->slice(0, c - 1, 1);
+                        scol_p = &t_scol;
+                        dcol_p = &t_dcol;
+                    }
+                } else {
+                    scol_p = &((c % 2 == 0) ? ping : pong);
+                    dcol_p = &((c % 2 == 0) ? pong : ping);
+                }
+                const Tensor& scol = *scol_p;
+                const Tensor& dcol = *dcol_p;
                 ops::gated_delta_net_batch_update(qc, kc, vc, gc, bc, scale,
                                                   /*normalize_qk=*/true, recurrent_states, scol,
                                                   dcol, oc, s);

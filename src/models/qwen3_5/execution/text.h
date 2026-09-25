@@ -214,7 +214,8 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              const Tensor& linear_state_destination_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             const Tensor* linear_state_column_slots = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -248,6 +249,7 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   const Tensor* linear_state_destination_slots,
+                                  const Tensor* linear_state_column_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
@@ -301,6 +303,12 @@ private:
     const Tensor* active_kv_table_rows_                                            = nullptr;
     const Tensor* active_linear_state_source_slots_                                = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
+    // Row 20b layout-B column slots: optional {k} int32 device array (batch==1
+    // only) holding the per-column destination slot ids t[0..k-1] for a
+    // width-(k+1) verify. Column 0 updates the lane in place; column c>=1
+    // reads (c==1 ? source : t[c-2]) and writes t[c-1]. Null = legacy
+    // ping/pong fallback (both slots scratch, intermediates lost).
+    const Tensor* active_linear_state_column_slots_                                = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;

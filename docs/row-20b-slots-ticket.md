@@ -41,7 +41,22 @@ destinations, DON'T block — rebuild the window after accept with a tiny
 gather: window after column a = last (kernel−1) pre-step inputs followed
 by x_0..x_a, all resident from verify. No per-column conv output needed.
 
-## 3b. Split build (committee order — bisect safety)
+## 3b. Split build (committee order — bisect safety) + transition hazard
+
+Off-branch graphing LANDED (e40aec1, no-regress). FORCE_OFF switch LANDED
+(bf16f41, fallback decode 13.3 ✓, TTFT 1.3s tax ⇒ gate unsafe pre-row-23).
+
+HAZARD (committee): off→on resume degrades drafts silently. MTP cache
+misses off-stretch positions (conc 2→1, gate fallback→resume); verify
+masks it (correct, lower accept — no gate catches it) or a token-by-token
+re-warm stalls. Test (after slots + row-23): mid-request off-N-steps→on,
+accept histogram + step times post-resume vs uninterrupted. Fix: rung-2
+batched warming as resume catch-up (save target hiddens ~10KB/tok during
+off steps, one M=N pass on resume). Rung-2 required three ways: TTFT,
+conc transitions, adaptive gate. Rung-1 + rung-2 land TOGETHER (rung-1
+alone: conc-8 × p2k ⇒ last TTFT ~85s — ships nothing).
+Accounting nit: req3 TTFT 2.8 = req2's serial mirror (~1.8) + own (~1.0);
+mirror prefills serialize across concurrent admissions. Closes.
 
 Off-branch graphing lands + gates FIRST (independent): MTP-server conc-2
 must match spec-off (≈2.2s band), 58% penalty gone. THEN slots +
