@@ -631,7 +631,11 @@ public:
         // Every other mix (mixed prefill+decode, multi-row decode, cold lane,
         // frontier at the context edge) runs the ordinary target-only path:
         // mixed plans stay spec-off.
-        if (mtp_enabled_ && n_pref == 0 && n_dec == 1) {
+        // NINFER_MTP_FORCE_OFF=1 forces the ordinary path (adaptive gate's
+        // fallback + kill switch; default unset = spec allowed). Read once
+        // per step (cheap getenv; correctness over caching).
+        const bool mtp_force_off = std::getenv("NINFER_MTP_FORCE_OFF") != nullptr;
+        if (mtp_enabled_ && !mtp_force_off && n_pref == 0 && n_dec == 1) {
             const std::int32_t mtp_lane = row_slot[0];
             const ServeSlot& mslot = slots_[static_cast<std::size_t>(mtp_lane)];
             const std::uint32_t frontier = mslot.next_pos - 1;
