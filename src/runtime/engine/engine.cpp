@@ -1234,6 +1234,14 @@ public:
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
                 while (aL < kDrafts && host_drafts[aL] == o_targets[aL]) { ++aL; }
+                // Oracle-side cap (accept profile, note 2): same min() as the
+                // real path so capped runs stay same-span comparable.
+                if (const char* ocap = std::getenv("NINFER_MTP_MAX_ACCEPT")) {
+                    const long oc = std::strtol(ocap, nullptr, 10);
+                    if (oc >= 0 && aL > static_cast<std::uint32_t>(oc)) {
+                        aL = static_cast<std::uint32_t>(oc);
+                    }
+                }
                 std::int32_t commitL[5];
                 commitL[0] = bonus;
                 for (std::uint32_t j = 0; j < aL; ++j) { commitL[1 + j] = host_drafts[j]; }
@@ -1361,6 +1369,12 @@ public:
                                       cudaMemcpyDeviceToHost));
                 std::uint32_t aS = 0;
                 while (aS < kDrafts && host_drafts[aS] == o_targets[aS]) { ++aS; }
+                if (const char* ocap = std::getenv("NINFER_MTP_MAX_ACCEPT")) {
+                    const long oc = std::strtol(ocap, nullptr, 10);
+                    if (oc >= 0 && aS > static_cast<std::uint32_t>(oc)) {
+                        aS = static_cast<std::uint32_t>(oc);
+                    }
+                }
                 std::int32_t coltab_host_o[4];
                 coltab_host_o[0] = lane;
                 for (std::int32_t c = 1; c < 4; ++c) {
