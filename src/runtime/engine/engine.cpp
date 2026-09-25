@@ -1172,6 +1172,14 @@ public:
                     std::fprintf(stderr, "[slot-oracle] entry F=%u |lane-spare|=%.4g\n", F,
                                  egap);
                 }
+                // Discriminator 1: snapshot the pre-step window itself. After
+                // the slots commit, convB-vs-Pre == 0 means the lane conv was
+                // never written (dst binding missing); != 0 but != convB-vs-A
+                // means written with wrong values (chaining/init).
+                GdnSlotSnapshot snapPre = snapshot_gdn_slot(
+                    pool_.get(), parameters_.model.config().text.layer_types, mtp_oracle_base_);
+                std::fprintf(stderr, "[slot-oracle] snapPre done (%u layers)\n",
+                             static_cast<std::uint32_t>(snapPre.layers.size()));
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok);
                 device_.synchronize();
@@ -1233,6 +1241,9 @@ public:
                 std::uint32_t rec_L = 0, conv_L = 0;
                 float rec_meanworst = 0.0f, conv_meanworst = 0.0f;
                 std::uint32_t rec_mL = 0, conv_mL = 0;
+                float convBPre_worst = 0.0f, recBPre_worst = 0.0f;
+                float convBPre_meanworst = 0.0f, recBPre_meanworst = 0.0f;
+                std::uint32_t convBPre_L = 0, recBPre_L = 0, convBPre_mL = 0, recBPre_mL = 0;
                 std::fprintf(stderr, "[slot-oracle] diff start layers=%u recA=%u recB=%u\n",
                              static_cast<std::uint32_t>(snapA.layers.size()),
                              static_cast<std::uint32_t>(snapA.rec.size()),
@@ -1268,13 +1279,46 @@ public:
                         conv_meanworst = static_cast<float>(csum / ma);
                         conv_mL        = snapA.layers[i];
                     }
+                    // Discriminator 1 (cont.): lane-after-commit vs pre-step.
+                    double bp_csum = 0.0, bp_rsum = 0.0;
+                    for (std::size_t j = 0; j < ma; ++j) {
+                        float d = snapB.conv[snapB.conv_off[i] + j] -
+                                  snapPre.conv[snapA.conv_off[i] + j];
+                        if (d < 0) d = -d;
+                        bp_csum += d;
+                        if (d > convBPre_worst) {
+                            convBPre_worst = d;
+                            convBPre_L     = snapA.layers[i];
+                        }
+                    }
+                    for (std::size_t j = 0; j < na; ++j) {
+                        float d =
+                            snapB.rec[snapB.rec_off[i] + j] - snapPre.rec[snapA.rec_off[i] + j];
+                        if (d < 0) d = -d;
+                        bp_rsum += d;
+                        if (d > recBPre_worst) {
+                            recBPre_worst = d;
+                            recBPre_L     = snapA.layers[i];
+                        }
+                    }
+                    if (ma > 0 && bp_csum / ma > convBPre_meanworst) {
+                        convBPre_meanworst = static_cast<float>(bp_csum / ma);
+                        convBPre_mL        = snapA.layers[i];
+                    }
+                    if (na > 0 && bp_rsum / na > recBPre_meanworst) {
+                        recBPre_meanworst = static_cast<float>(bp_rsum / na);
+                        recBPre_mL        = snapA.layers[i];
+                    }
                 }
                 std::fprintf(stderr,
                              "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
+                             "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
                              "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
                              F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
+                             convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
+                             recBPre_worst, recBPre_L, recBPre_meanworst, recBPre_mL,
                              saved_targets_L[0], saved_targets_L[1], saved_targets_L[2],
                              saved_targets_L[3], o_targets[0], o_targets[1], o_targets[2],
                              o_targets[3],
