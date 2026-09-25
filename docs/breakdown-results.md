@@ -110,12 +110,36 @@ verify + per-row MTP refills) — flagged, not blocking 20b.
 Spec-off FOX wall 1.00s vs spec-on 2.22-2.30s same prompt (2.2×).
 T_1 consistent with 14.3 contract.
 
-## Wide histograms (225 steps) + off baselines
+## E recompute (committee item 1 — closed, with a reversal)
 
-Per-prompt E (spec-on, T=0): FOX 3.71 (n=14), PARIS 2.12 (n=49 — the
-partial source, real veto), CODELOW 3.90 (n=20+82), PRIME 3.87 (n=60).
+Empirical ground truth per request (log F-advance + last commit = gen):
+gen = (F_last − F_0) + commit_last, verified EXACT on 6 clean requests
+(sumC == output column: PARIS 153, CODELOW 98×4).
+
+- Finding: each step adds commit-len NEW tokens (bonus + accepted +
+  extrapolated next-bonus). E = mean(accepted) + 2, NOT +1. Max/step = 5.
+- The pooled 83-step 3.82 was CORRECT. My "correction" to 2.82 was the
+  error (it dropped the extrapolated bonus, which the output column proves
+  is emitted). Committee's double-count charge REFUTED by exact matches.
+- Regime E (clean): PARIS 153/49 = 3.12 (not 2.12); CODELOW 98/20 = 4.90
+  (not 3.90 — near the 5.0 max, deterministic digits draft perfectly);
+  PRIME 70/15 ≈ 4.67 but stop-token-truncated (reason=stop), use with care.
+- FOX req1 (F_0=53 ≠ prompt 32, adv=34) is CONTAMINATED (likely merged
+  warmup/double-run) — discarded, re-run if FOX-E is ever load-bearing.
+- Ship math IMPROVES: pooled step 64ms − 28 commits = 36ms → 36/3.82 =
+  9.4ms/tok (ships with margin). PARIS-regime: 36/3.12 = 11.5 < 12.2 ✓.
+  CODELOW-regime: 36/4.9 = 7.3 ✓✓. ALL regimes ship on gaps-kept math.
+- Break-even E at 36ms step vs off 14.3: 2.52 ✓ (committee's number
+  stands). Adaptive gate threshold ~2.5 rolling E — every regime measured
+  clears it (lowest clean: PARIS 3.12).
+
+Per-prompt E, SUPERSEDED by the recompute above (these used the +1 model —
+kept for trail): FOX 3.71 (n=14, contaminated — discard), PARIS 2.12 → 3.12,
+CODELOW 3.90 → 4.90, PRIME 3.87 → ~4.67 (stop-truncated).
 CODELOW is NOT low-accept at greedy (deterministic digits draft perfectly);
-PARIS prose is the only hostile regime at T=0. Combined E=3.48 over 225.
+PARIS prose is the most partial-heavy regime at T=0 (17 accept-0 + 16
+accept-1 of 49). Combined true E over 225 clean-ish steps ≈ 4.48
+(mean accepted 2.48 + 2; FOX-req excluded as contaminated).
 Off walls: FOX 1.03, PARIS 2.09, CODELOW 1.40, PRIME 1.02. On loses every
 regime 2.2–2.7× (FOX 2.2-2.3, PARIS 4.78, CODELOW ~3.75, PRIME ~2.77).
 CODELOW veto stands only with its off-number: 3.75 vs 1.40. Filed.
