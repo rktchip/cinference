@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,13 @@
 
 namespace ninfer {
 namespace {
+
+// Row 20b pulse counters (defined in text.cpp): per-column executions of
+// the coltab branches. Declared here to read + reset from the oracle.
+namespace models::qwen3_5::execution {
+extern std::atomic<std::uint64_t> g_coltab_conv_cols;
+extern std::atomic<std::uint64_t> g_coltab_rec_cols;
+} // namespace models::qwen3_5::execution
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
@@ -1206,6 +1214,10 @@ public:
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
+                // Pulse reset: the slots verify below should execute 192/192
+                // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
+                models::qwen3_5::execution::g_coltab_conv_cols.store(0);
+                models::qwen3_5::execution::g_coltab_rec_cols.store(0);
                 // Sentinel (note 1): NaN-fill column slots t[1..3] (rec+conv)
                 // so a missing write reads back as NaN, not stale contents.
                 // 0xFF bytes = NaN for both fp32 and bf16.
@@ -1223,6 +1235,14 @@ public:
                                            vhid, vlog, vtok, &vcoltab);
                 device_.synchronize();
                 std::fprintf(stderr, "[slot-oracle] slots verify done\n");
+                const std::uint64_t pulse_conv =
+                    models::qwen3_5::execution::g_coltab_conv_cols.load();
+                const std::uint64_t pulse_rec =
+                    models::qwen3_5::execution::g_coltab_rec_cols.load();
+                std::fprintf(stderr,
+                             "[slot-oracle] pulse cols conv=%llu rec=%llu (expect 192/192)\n",
+                             static_cast<unsigned long long>(pulse_conv),
+                             static_cast<unsigned long long>(pulse_rec));
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
                 std::uint32_t aS = 0;
@@ -1372,7 +1392,9 @@ public:
                     }
                 }
                 // Sentinel verdict: NaN in t[aS] (write missed), t[aS]-vs-A
-                // content, and t[aS]-vs-lane copy check (expect 0).
+                // content. copy = |t[aS] - lane-after-mirror-row|: NOT expect
+                // 0 (the mirror trailing row advances the lane after the
+                // copy); sanity shape only — it should mirror conv_worst.
                 std::uint64_t tNaN = 0, tTot = 0;
                 float tVsA_worst = 0.0f, copy_worst = 0.0f;
                 std::uint32_t tVsA_L = 0;

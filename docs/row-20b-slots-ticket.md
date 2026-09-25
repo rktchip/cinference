@@ -167,17 +167,19 @@ kernel is cleared and only bindings remain suspect):
   missing x_0; with a 3-entry window x_0 ages out by column 3, so full
   accept is clean and a=1,2 are wrong. convBPre != 0 distinguishes it
   from a missing writeback.
-RESOLVED (no sweep needed): the chained-stale suspect is dead. It rested
-on a slice-A fact — "lane conv pristine" — that was true only under
-slice-A bindings (c71695c: conv-input dump bound, table NOT passed, so
-verify never touched the lane). Under slice B (067bd42: table bound,
-t[0]=lane) col 0's conv publishes to the lane by code (dst_c = coltab
-slice 0; EXL3 live kernel = SnapshotHistoryPublish). Table-bound in the
-VTARG runs is proven, not assumed: NINFER_SLOTS=1 was set, and a table/
-width mismatch throws (no silent fallback) — no FATAL, so the coltab
-branch ran. Col 1 reads genuine post-col-0 output; VTARG-SAME stands as
-evidence. Remaining: publish-side offset/base/extent — the sentinel
-(tNaN fraction) picks among the three.
+PENDING PROOF (not dead yet): the chained-stale suspect rests on a
+slice-A fact — "lane conv pristine" — that was true only under slice-A
+bindings (c71695c: conv-input dump bound, table NOT passed, so verify
+never touched the lane). Under slice-B bindings col 0 publishes to the
+lane by code — but "no FATAL" does NOT prove the coltab branch ran (the
+legacy ping-pong path is also clean; same trap as correction 1, where
+coherent text was also what legacy produces). VTARG-SAME counts as
+evidence for the table-bound chain ONLY with a pulse: per-column
+execution counters (expect 192/192 conv/rec per verify = 48 layers x 4
+cols). If the accepted slot shows tNaN < 1.0 AND cols == 192/192, the
+branch wrote the slot from the right source and suspect 2 is dead on
+evidence. tNaN == 1.0 alone stays ambiguous (ran-but-missing vs
+never-ran) — the counter separates them.
 Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
 writes — the suspect line (gdn_conv.cuh publish address) is inside
 verify's kernel. "Verify exonerated" means logits only.

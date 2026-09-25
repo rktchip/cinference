@@ -38,6 +38,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
+#include <atomic>
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cuda_runtime.h>
@@ -158,6 +159,12 @@ private:
 };
 
 } // namespace
+
+// Row 20b pulse: per-column execution counters for the coltab branches.
+// The oracle reads + resets them around the slots verify (expect 192/192
+// conv/rec per verify = 48 GDN layers x 4 cols). Zero = legacy ran.
+std::atomic<std::uint64_t> g_coltab_conv_cols{0};
+std::atomic<std::uint64_t> g_coltab_rec_cols{0};
 
 void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
@@ -1595,6 +1602,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 }
                 gdn_projection_snapshot(h_c, p, *config_.gdn, conv_states, valid, *init_c, dst_c,
                                         q_c, k_c, v_c, z_c, work_, s);
+                g_coltab_conv_cols.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
@@ -1713,6 +1721,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 ops::gated_delta_net_batch_update(qc, kc, vc, gc, bc, scale,
                                                   /*normalize_qk=*/true, recurrent_states, scol,
                                                   dcol, oc, s);
+                if (coltab != nullptr) {
+                    g_coltab_rec_cols.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
     } else {
