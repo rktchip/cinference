@@ -107,14 +107,14 @@ def analyze(lid, m, t, a):
     out["tm"] = tm
     tmax = max((v for row in tm for v in row if v == v), default=float("nan"))
     out["tmax"] = tmax
-    # segment matrix when the time mapping is weak.
-    sm = None
-    if not (tmax == tmax and tmax > 0.5):
-        sm = [[pearson((t[tt * c + ch] for tt in range(3)
-                        for ch in range(s0, s1)),
-                       (a[tt * c + ch] for tt in range(3)
-                        for ch in range(d0, d1)))
-               for (dn, d0, d1) in SEGS] for (sn, s0, s1) in SEGS]
+    # segment matrix: always printed (a partial reorder, e.g. k/v swapped
+    # with q in place, leaves a moderately strong time diagonal that a
+    # "weak" gate would hide behind).
+    sm = [[pearson((t[tt * c + ch] for tt in range(3)
+                    for ch in range(s0, s1)),
+                   (a[tt * c + ch] for tt in range(3)
+                    for ch in range(d0, d1)))
+           for (dn, d0, d1) in SEGS] for (sn, s0, s1) in SEGS]
     out["sm"] = sm
     return out
 
