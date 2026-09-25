@@ -103,6 +103,11 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    // Row 20b: bind/clear the per-layer conv-input dump buffer (null = skip).
+    void set_gdn_conv_dump(Tensor* buf, std::size_t stride_bytes) noexcept {
+        active_gdn_conv_dump_         = buf;
+        active_gdn_conv_dump_stride_  = stride_bytes;
+    }
     // E2 ragged serve-batch binding: device gather output plus the host
     // offsets mirror. Set for batch-mode steps (flat T live tokens); cleared
     // for single-request paths. Never reads host block tables.
@@ -309,6 +314,12 @@ private:
     // reads (c==1 ? source : t[c-2]) and writes t[c-1]. Null = legacy
     // ping/pong fallback (both slots scratch, intermediates lost).
     const Tensor* active_linear_state_column_slots_                                = nullptr;
+    // Row 20b conv-input dump: when bound, gdn_mix (Verify) copies each
+    // GDN layer's per-column projection inputs into dump[gidx] ({H,width}
+    // BF16 at dump_base + gidx*layer_stride_bytes) for post-accept conv
+    // window gather. Null = skip (legacy path).
+    Tensor* active_gdn_conv_dump_                                                    = nullptr;
+    std::size_t active_gdn_conv_dump_stride_                                        = 0;
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;

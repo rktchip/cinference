@@ -220,6 +220,11 @@ public:
         spare_slot_ = mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) : -1;
         mtp_shadow_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 : -1;
+        // Row 20b layout B: 4 column slots per lane (k<=4 parametric; k=3
+        // uses the first 3). Static under copy-back: col c>=1 always writes
+        // column_base_[lane]+c-1, so tables are init-filled once, never rebuilt.
+        mtp_column_base_ =
+            mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 + static_cast<std::int32_t>(max_seqs_) : -1;
         hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
         max_tokens_  = options.prefill_chunk + max_seqs_;
         max_blocks_  = (max_context_ + 15U) / 16U;
@@ -305,7 +310,9 @@ public:
                     .key_head_dim   = text_config.gdn ? static_cast<std::int32_t>(
                         dimension(text_config.gdn->linear_key_head_dim)) : 0,
                     .slot_count     = static_cast<std::int32_t>(max_seqs_) +
-                                    (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) : 0),
+                                    (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) +
+                                                        4 * static_cast<std::int32_t>(max_seqs_)
+                                     : 0),
                     .conv_dtype     = DType::BF16,
                 });
         pool_store_ = DeviceBuffer(pool_builder.finish(256));
@@ -401,6 +408,25 @@ public:
             DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
+        // Row 20b layout B: static per-lane column-slot tables, init-filled
+        // once (col c>=1 -> column_base+lane*4+c-1). Lane count only changes
+        // at init, so no per-step rebuild, no per-step H2D.
+        if (mtp_enabled_) {
+            mtp_coltab_store_ = DeviceBuffer(static_cast<std::size_t>(max_seqs_) * 4U * 4U);
+            std::vector<std::int32_t> coltab(static_cast<std::size_t>(max_seqs_) * 4U);
+            for (std::uint32_t lane = 0; lane < max_seqs_; ++lane)
+                for (std::int32_t c = 0; c < 4; ++c)
+                    coltab[static_cast<std::size_t>(lane) * 4U + static_cast<std::size_t>(c)] =
+                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
+            CUDA_CHECK(cudaMemcpy(mtp_coltab_store_.p, coltab.data(), coltab.size() * 4U,
+                                  cudaMemcpyHostToDevice));
+            // Conv-input dump: one {H,4} BF16 plane per text layer (indexed
+            // by gidx). Written by Verify when bound (slots path only).
+            const std::size_t nlayers = parameters_.text.layers.size();
+            mtp_convdump_stride_ =
+                align_up(static_cast<std::size_t>(hidden_) * 4U * 2U);
+            mtp_convdump_store_ = DeviceBuffer(mtp_convdump_stride_ * nlayers);
+        }
         CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(scratch_.p) + tables_, 0,
                                    static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U,
                                    device_.stream));
@@ -1030,6 +1056,15 @@ public:
             Tensor vhid(mbase + mtp_vhid_, DType::BF16, {H, 4, 1});
             Tensor vlog(mbase + mtp_vlog_, DType::BF16, {V, 4, 1});
             Tensor vtok(mbase + mtp_vtok_, DType::I32, {4, 1});
+            // Row 20b slice A: bind the conv-input dump when NINFER_SLOTS=1
+            // (exercises the dump path; commit path still legacy so the
+            // states it preserves are unused — bit-identical behavior).
+            // The column table is NOT passed until slice B (commit-by-index):
+            // col-0 in-place would clobber the lane the commit rows read.
+            const bool slots_on = std::getenv("NINFER_SLOTS") != nullptr;
+            Tensor convdump(mtp_convdump_store_.p, DType::BF16,
+                            {static_cast<std::int32_t>(hidden_ * 4U), 1});
+            if (slots_on) card_->set_gdn_conv_dump(&convdump, mtp_convdump_stride_);
             // Envelope mirrors the reference MTP target verify ({1, F+4}):
             // per-column masking is positional, the bound only caps the
             // kernel launch. Argmax runs inside the verify (one sync). 
@@ -1106,6 +1141,7 @@ public:
             // One sync for the whole window: hidden/logits/argmax for all
             // four columns enqueue before the host reads anything.
             device_.synchronize();
+            if (slots_on) card_->set_gdn_conv_dump(nullptr, 0);
             CUDA_CHECK(cudaMemcpy(host_targets, mbase + mtp_vtok_, sizeof(host_targets),
                                   cudaMemcpyDeviceToHost));
         }
@@ -1317,6 +1353,14 @@ private:
     // the max_seqs_ lane slots: [max_seqs_] is the verify spare, then one
     // shadow per lane.
     std::int32_t mtp_shadow_base_ = -1;
+    // Row 20b layout B: base of the 4 column slots per lane (static tables,
+    // init-filled once). -1 when MTP is off.
+    std::int32_t mtp_column_base_ = -1;
+    // Row 20b: per-lane {4} I32 column-slot tables (device, init-filled) +
+    // per-layer {H,4} BF16 conv-input dump (device, written by Verify).
+    DeviceBuffer mtp_coltab_store_;
+    DeviceBuffer mtp_convdump_store_;
+    std::size_t mtp_convdump_stride_ = 0;
     std::size_t mtp_ids_       = 0;
     std::size_t mtp_pos_       = 0;
     std::size_t mtp_row_       = 0;

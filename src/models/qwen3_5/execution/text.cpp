@@ -1526,6 +1526,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         }
         Tensor projection_input =
             h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
+        // Row 20b: dump per-column block inputs for post-accept conv gather.
+        // projection_input is {H,width,batch}; this path is batch==1-only
+        // under the column-slot contract (fail-closed above), so a flat
+        // width-column copy per layer is exact.
+        if (active_gdn_conv_dump_ != nullptr) {
+            const std::size_t H = static_cast<std::size_t>(dimension(config_.hidden_size));
+            const std::size_t row_bytes = H * 2U;
+            for (std::int32_t c = 0; c < width; ++c) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<char*>(active_gdn_conv_dump_->data) +
+                        static_cast<std::size_t>(gidx) * active_gdn_conv_dump_stride_ +
+                        static_cast<std::size_t>(c) * row_bytes,
+                    static_cast<const char*>(projection_input.data) +
+                        static_cast<std::size_t>(c) * row_bytes,
+                    row_bytes, cudaMemcpyDeviceToDevice, s));
+            }
+        }
         Tensor query_output =
             qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
         Tensor key_output =
