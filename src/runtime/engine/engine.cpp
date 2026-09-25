@@ -1206,6 +1206,19 @@ public:
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
+                // Sentinel (note 1): NaN-fill column slots t[1..3] (rec+conv)
+                // so a missing write reads back as NaN, not stale contents.
+                // 0xFF bytes = NaN for both fp32 and bf16.
+                for (std::int32_t psc = 1; psc < 4; ++psc) {
+                    const std::int32_t pslot = mtp_column_base_ +
+                                               static_cast<std::int32_t>(lane) * 4 + (psc - 1);
+                    for (std::uint32_t gix = 0; gix < pool_->layer_count(); ++gix) {
+                        Tensor prec = pool_->recurrent_slot(gix, pslot);
+                        Tensor pcon = pool_->conv_slot(gix, pslot);
+                        CUDA_CHECK(cudaMemsetAsync(prec.data, 0xFF, prec.bytes(), stream));
+                        CUDA_CHECK(cudaMemsetAsync(pcon.data, 0xFF, pcon.bytes(), stream));
+                    }
+                }
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok, &vcoltab);
                 device_.synchronize();
@@ -1219,6 +1232,16 @@ public:
                 for (std::int32_t c = 1; c < 4; ++c) {
                     coltab_host_o[c] =
                         mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+                }
+                // Sentinel readback: snapshot t[aS] before copy-back. NaN
+                // here = the write to t[aS] never happened (note 1). At
+                // aS==0 there is no slot write (col 0 in place); skip.
+                GdnSlotSnapshot snapT;
+                const bool haveT = (aS >= 1);
+                if (haveT) {
+                    snapT = snapshot_gdn_slot(pool_.get(), o_types, coltab_host_o[aS]);
+                    std::fprintf(stderr, "[slot-oracle] snapT done (slot %d)\n",
+                                 coltab_host_o[aS]);
                 }
                 card_->commit_verify_slots(lane, coltab_host_o, aS, 4);
                 // Mirror the real path: t[aS] covers through F+aS; the
@@ -1310,15 +1333,61 @@ public:
                         recBPre_mL        = snapA.layers[i];
                     }
                 }
+                // Sentinel verdict: NaN in t[aS] (write missed), t[aS]-vs-A
+                // content, and t[aS]-vs-lane copy check (expect 0).
+                std::uint64_t tNaN = 0;
+                float tVsA_worst = 0.0f, copy_worst = 0.0f;
+                std::uint32_t tVsA_L = 0;
+                if (haveT) {
+                    for (std::size_t i = 0; i < snapA.layers.size(); ++i) {
+                        const std::size_t nT =
+                            ((i + 1 < snapA.rec_off.size()) ? snapA.rec_off[i + 1]
+                                                            : snapA.rec.size()) -
+                            snapA.rec_off[i];
+                        const std::size_t mT =
+                            ((i + 1 < snapA.conv_off.size()) ? snapA.conv_off[i + 1]
+                                                             : snapA.conv.size()) -
+                            snapA.conv_off[i];
+                        for (std::size_t j = 0; j < nT; ++j) {
+                            const float vT = snapT.rec[snapA.rec_off[i] + j];
+                            if (vT != vT) {
+                                ++tNaN;
+                                continue;
+                            }
+                            float d = snapA.rec[snapA.rec_off[i] + j] - vT;
+                            if (d < 0) d = -d;
+                            if (d > tVsA_worst) { tVsA_worst = d; tVsA_L = snapA.layers[i]; }
+                            float dc = vT - snapB.rec[snapB.rec_off[i] + j];
+                            if (dc < 0) dc = -dc;
+                            if (dc == dc && dc > copy_worst) copy_worst = dc;
+                        }
+                        for (std::size_t j = 0; j < mT; ++j) {
+                            const float vT = snapT.conv[snapA.conv_off[i] + j];
+                            if (vT != vT) {
+                                ++tNaN;
+                                continue;
+                            }
+                            float d = snapA.conv[snapA.conv_off[i] + j] - vT;
+                            if (d < 0) d = -d;
+                            if (d > tVsA_worst) { tVsA_worst = d; tVsA_L = snapA.layers[i]; }
+                            float dc = vT - snapB.conv[snapB.conv_off[i] + j];
+                            if (dc < 0) dc = -dc;
+                            if (dc == dc && dc > copy_worst) copy_worst = dc;
+                        }
+                    }
+                }
                 std::fprintf(stderr,
                              "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
                              "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
+                             "tNaN=%llu tVsA=%.4g@L%u copy=%.4g "
                              "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
                              F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
                              convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
                              recBPre_worst, recBPre_L, recBPre_meanworst, recBPre_mL,
+                             static_cast<unsigned long long>(tNaN), tVsA_worst, tVsA_L,
+                             copy_worst,
                              saved_targets_L[0], saved_targets_L[1], saved_targets_L[2],
                              saved_targets_L[3], o_targets[0], o_targets[1], o_targets[2],
                              o_targets[3],

@@ -138,6 +138,24 @@ First gate (before ANY perf numbers):
   position after every step. Stale draft KV beyond is harmless ONLY if
   nothing reads past that length (assert it, don't assume it).
 
+Suspect predictions across accept values (oracle sweep reads directly;
+conv-first: the recurrent diff is predicted downstream of stale conv
+through the trailing row — if rec drops to the cap-0 floor after the conv
+fix, the recurrent chain is cleared with no separate investigation):
+- Token offset dropped (every column publishes to one slot): clean at
+  full accept (last writer wins = post-col-k), error growing as accept
+  falls.
+- Window shifted by one (slot c holds window ending c-1): wrong at EVERY
+  accept incl full accept; error shaped like a one-position shift.
+- Wrong slot/batch base (gdn_conv.cuh publish address): sentinel survives
+  in the intended slot (tNaN > 0) and some other slot gets overwritten.
+- Missing writeback entirely: lane conv == pre-step window
+  (convBPre == 0) at every accept incl cap-0.
+- Garbage reads: huge max with small mean (vs systematic = large mean).
+Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
+writes — the suspect line (gdn_conv.cuh publish address) is inside
+verify's kernel. "Verify exonerated" means logits only.
+
 ## 8. Perf bands (filled)
 
 Metronome, conc-1, x3 per prompt, spec-on vs spec-off same prompts.
