@@ -152,6 +152,21 @@ fix, the recurrent chain is cleared with no separate investigation):
 - Missing writeback entirely: lane conv == pre-step window
   (convBPre == 0) at every accept incl cap-0.
 - Garbage reads: huge max with small mean (vs systematic = large mean).
+- Partial write (extent/stride bug, some heads/channels written, others
+  not): tNaN strictly between 0 and 1. Its own signature — neither a
+  missing write (tNaN == 1) nor a content bug (tNaN == 0, tVsA > 0).
+Two suspects share "clean at full accept" — the sentinel tells them
+apart (static: col-1 conv source IS t[0]/lane, text.cpp:1590ff, and the
+width-1 chain is mathematically exact, gdn_projected_conv.cu:43ff, so the
+kernel is cleared and only bindings remain suspect):
+- Offset dropped (every column publishes to one slot): last writer wins
+  = post-col-k, clean at full accept, error growing as accept falls;
+  NEVER-written slots keep NaN (tNaN high, concentrated in t[1..2]).
+- Chained stale source (col-0 conv never landed in lane, col 1..3 chain
+  on the stale window): every slot gets written (tNaN == 0) with values
+  missing x_0; with a 3-entry window x_0 ages out by column 3, so full
+  accept is clean and a=1,2 are wrong. convBPre != 0 distinguishes it
+  from a missing writeback.
 Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
 writes — the suspect line (gdn_conv.cuh publish address) is inside
 verify's kernel. "Verify exonerated" means logits only.

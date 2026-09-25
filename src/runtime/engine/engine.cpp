@@ -1267,6 +1267,9 @@ public:
                 float convBPre_worst = 0.0f, recBPre_worst = 0.0f;
                 float convBPre_meanworst = 0.0f, recBPre_meanworst = 0.0f;
                 std::uint32_t convBPre_L = 0, recBPre_L = 0, convBPre_mL = 0, recBPre_mL = 0;
+                // NaN hides from max (comparisons false) and poisons means, so
+                // every loop counts NaN explicitly and averages non-NaN only.
+                std::uint64_t nanB_rec = 0, nanB_conv = 0;
                 std::fprintf(stderr, "[slot-oracle] diff start layers=%u recA=%u recB=%u\n",
                              static_cast<std::uint32_t>(snapA.layers.size()),
                              static_cast<std::uint32_t>(snapA.rec.size()),
@@ -1277,36 +1280,62 @@ public:
                         (i + 1 < snapA.rec_off.size()) ? snapA.rec_off[i + 1] : snapA.rec.size();
                     const std::size_t na = next_rec - snapA.rec_off[i];
                     double rsum = 0.0;
+                    std::size_t rnn = 0;
                     for (std::size_t j = 0; j < na; ++j) {
-                        float d = snapA.rec[snapA.rec_off[i] + j] - snapB.rec[snapB.rec_off[i] + j];
+                        const float va = snapA.rec[snapA.rec_off[i] + j];
+                        const float vb = snapB.rec[snapB.rec_off[i] + j];
+                        if (va != va || vb != vb) {
+                            ++rnn;
+                            ++nanB_rec;
+                            continue;
+                        }
+                        float d = va - vb;
                         if (d < 0) d = -d;
                         rsum += d;
                         if (d > rec_worst) { rec_worst = d; rec_L = snapA.layers[i]; }
                     }
-                    if (na > 0 && rsum / na > rec_meanworst) {
-                        rec_meanworst = static_cast<float>(rsum / na);
+                    const std::size_t rden = na - rnn;
+                    if (rden > 0 && rsum / rden > rec_meanworst) {
+                        rec_meanworst = static_cast<float>(rsum / rden);
                         rec_mL        = snapA.layers[i];
                     }
                     const std::size_t next_conv =
                         (i + 1 < snapA.conv_off.size()) ? snapA.conv_off[i + 1] : snapA.conv.size();
                     const std::size_t ma = next_conv - snapA.conv_off[i];
                     double csum = 0.0;
+                    std::size_t cnn = 0;
                     for (std::size_t j = 0; j < ma; ++j) {
-                        float d =
-                            snapA.conv[snapA.conv_off[i] + j] - snapB.conv[snapB.conv_off[i] + j];
+                        const float va =
+                            snapA.conv[snapA.conv_off[i] + j];
+                        const float vb =
+                            snapB.conv[snapB.conv_off[i] + j];
+                        if (va != va || vb != vb) {
+                            ++cnn;
+                            ++nanB_conv;
+                            continue;
+                        }
+                        float d = va - vb;
                         if (d < 0) d = -d;
                         csum += d;
                         if (d > conv_worst) { conv_worst = d; conv_L = snapA.layers[i]; }
                     }
-                    if (ma > 0 && csum / ma > conv_meanworst) {
-                        conv_meanworst = static_cast<float>(csum / ma);
+                    const std::size_t cden = ma - cnn;
+                    if (cden > 0 && csum / cden > conv_meanworst) {
+                        conv_meanworst = static_cast<float>(csum / cden);
                         conv_mL        = snapA.layers[i];
                     }
                     // Discriminator 1 (cont.): lane-after-commit vs pre-step.
                     double bp_csum = 0.0, bp_rsum = 0.0;
+                    std::size_t bpcnn = 0, bprnn = 0;
                     for (std::size_t j = 0; j < ma; ++j) {
-                        float d = snapB.conv[snapB.conv_off[i] + j] -
-                                  snapPre.conv[snapA.conv_off[i] + j];
+                        const float vb = snapB.conv[snapB.conv_off[i] + j];
+                        const float vp = snapPre.conv[snapA.conv_off[i] + j];
+                        if (vb != vb || vp != vp) {
+                            ++bpcnn;
+                            ++nanB_conv;
+                            continue;
+                        }
+                        float d = vb - vp;
                         if (d < 0) d = -d;
                         bp_csum += d;
                         if (d > convBPre_worst) {
@@ -1315,8 +1344,16 @@ public:
                         }
                     }
                     for (std::size_t j = 0; j < na; ++j) {
-                        float d =
-                            snapB.rec[snapB.rec_off[i] + j] - snapPre.rec[snapA.rec_off[i] + j];
+                        const float vb =
+                            snapB.rec[snapB.rec_off[i] + j];
+                        const float vp =
+                            snapPre.rec[snapA.rec_off[i] + j];
+                        if (vb != vb || vp != vp) {
+                            ++bprnn;
+                            ++nanB_rec;
+                            continue;
+                        }
+                        float d = vb - vp;
                         if (d < 0) d = -d;
                         bp_rsum += d;
                         if (d > recBPre_worst) {
@@ -1324,18 +1361,19 @@ public:
                             recBPre_L     = snapA.layers[i];
                         }
                     }
-                    if (ma > 0 && bp_csum / ma > convBPre_meanworst) {
-                        convBPre_meanworst = static_cast<float>(bp_csum / ma);
+                    const std::size_t bpcc = ma - bpcnn, bprc = na - bprnn;
+                    if (bpcc > 0 && bp_csum / bpcc > convBPre_meanworst) {
+                        convBPre_meanworst = static_cast<float>(bp_csum / bpcc);
                         convBPre_mL        = snapA.layers[i];
                     }
-                    if (na > 0 && bp_rsum / na > recBPre_meanworst) {
-                        recBPre_meanworst = static_cast<float>(bp_rsum / na);
+                    if (bprc > 0 && bp_rsum / bprc > recBPre_meanworst) {
+                        recBPre_meanworst = static_cast<float>(bp_rsum / bprc);
                         recBPre_mL        = snapA.layers[i];
                     }
                 }
                 // Sentinel verdict: NaN in t[aS] (write missed), t[aS]-vs-A
                 // content, and t[aS]-vs-lane copy check (expect 0).
-                std::uint64_t tNaN = 0;
+                std::uint64_t tNaN = 0, tTot = 0;
                 float tVsA_worst = 0.0f, copy_worst = 0.0f;
                 std::uint32_t tVsA_L = 0;
                 if (haveT) {
@@ -1349,6 +1387,7 @@ public:
                                                              : snapA.conv.size()) -
                             snapA.conv_off[i];
                         for (std::size_t j = 0; j < nT; ++j) {
+                            ++tTot;
                             const float vT = snapT.rec[snapA.rec_off[i] + j];
                             if (vT != vT) {
                                 ++tNaN;
@@ -1362,6 +1401,7 @@ public:
                             if (dc == dc && dc > copy_worst) copy_worst = dc;
                         }
                         for (std::size_t j = 0; j < mT; ++j) {
+                            ++tTot;
                             const float vT = snapT.conv[snapA.conv_off[i] + j];
                             if (vT != vT) {
                                 ++tNaN;
@@ -1380,14 +1420,16 @@ public:
                              "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
                              "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
-                             "tNaN=%llu tVsA=%.4g@L%u copy=%.4g "
+                             "tNaN=%.4f tVsA=%.4g@L%u copy=%.4g nanB=%llu/%llu "
                              "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
                              F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
                              convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
                              recBPre_worst, recBPre_L, recBPre_meanworst, recBPre_mL,
-                             static_cast<unsigned long long>(tNaN), tVsA_worst, tVsA_L,
-                             copy_worst,
+                             tTot > 0 ? static_cast<double>(tNaN) / static_cast<double>(tTot)
+                                       : -1.0,
+                             tVsA_worst, tVsA_L, copy_worst, static_cast<unsigned long long>(nanB_rec),
+                             static_cast<unsigned long long>(nanB_conv),
                              saved_targets_L[0], saved_targets_L[1], saved_targets_L[2],
                              saved_targets_L[3], o_targets[0], o_targets[1], o_targets[2],
                              o_targets[3],
