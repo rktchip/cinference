@@ -180,17 +180,20 @@ cols). If the accepted slot shows tNaN < 1.0 AND cols == 192/192, the
 branch wrote the slot from the right source and suspect 2 is dead on
 evidence. tNaN == 1.0 alone stays ambiguous (ran-but-missing vs
 never-ran) — the counter separates them.
-NARROWED (layout-convention class): VTARG-SAME + tNaN=0 rules out
-chained-stale (col-1 logits would move) and shifted-base (col 2 reads
-t[1]; an offset its read doesn't share breaks its logits). What survives
-is a layout the chain shares with itself but not the engine: time order
-or channels×time vs time×channels inside the window. Fits every number
-(full write, exact VTARG, wholesale conv error at activation scale,
-clean recurrent except through the trailing row) and explains the timing
-(legacy never copied a snapshot slot into the lane). Test: off-GPU
-permutation on dumped t[a] vs canonical mid-span window at the same span
-F+a — identity (baseline), time flip, ±1 shifts; a match within family
-noise names the fix side (publish vs copy-back conversion).
+NARROWED (lane-ahead + early-layer p — layout class DEAD): the dump
+killed within-window permutations (no candidate matched; sh_lo matched
+instead, which is a SHIFT, not a layout). t[1]=[A1,A2,X] bit-exact on the
+first two slices forces col-1 init=[?,x_F,x_{F+1}] = post-col-1 window:
+the lane was a full column ahead when col 1 read it. No dst/init shift
+produces this (all die exactly one position off); col 0 ran (192-pulse)
+but its post-col-0 content is absent from lane. Second, |X-A2| is
+two-regime: GDN layers 0-20 max 2.5-25.9 mean 0.26-2.2, layers 21+ at
+family noise (max<=0.25) — col-1 p is foreign in early layers only.
+Candidates: restore no-op (lane kept post-legacy-rows span), commit
+overshoot (presnap already ahead), col-0 dst miss. Decisive dump (this
+build): presnap/rst/t1..t3/shadow+0..3/mid/full conv singles —
+pre[1:3]-vs-mid[0:2] checks presnap span, rst-vs-pre checks restore,
+t2-vs-full is span-matched, sh1[2]-vs-X tests M4-p identity.
 Pre-registered profile: wrong at EVERY accept incl a=0 and full accept
 (col 0 publishes into the lane in the same layout) — the cap sweep is
 post-fix verification, not diagnosis.

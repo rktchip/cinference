@@ -1225,9 +1225,31 @@ public:
                                                    o_targets[3]};
                 std::fprintf(stderr, "[slot-oracle] snapA done (%u layers)\n",
                              static_cast<std::uint32_t>(snapA.layers.size()));
+                // Shadow what-ifs (legacy width-4 verify wrote o_shadow+0..3):
+                // snapshot BEFORE the restore below clobbers shadow.
+                GdnSlotSnapshot snapSH[4];
+                for (std::int32_t shc = 0; shc < 4; ++shc) {
+                    snapSH[shc] =
+                        snapshot_gdn_slot(pool_.get(), o_types, o_shadow + shc);
+                }
+                std::fprintf(stderr, "[slot-oracle] snapSH done\n");
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
+                // Restore check: lane-post-restore vs presnap (conv). Nonzero
+                // means the restore missed and the slots verify started ahead.
+                GdnSlotSnapshot snapR = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                {
+                    float rworst = 0.0f;
+                    for (std::size_t k = 0; k < snapR.conv.size(); ++k) {
+                        float d = snapR.conv[k] - snapPre.conv[k];
+                        if (d != d) { rworst = 1e30f; break; }
+                        if (d < 0) d = -d;
+                        if (d > rworst) rworst = d;
+                    }
+                    std::fprintf(stderr, "[slot-oracle] restore-check |lane-pre|=%.4g %s\n",
+                                 rworst, rworst == 0.0f ? "RESTORE-OK" : "RESTORE-DIFF");
+                }
                 // Pulse reset: the slots verify below should execute 192/192
                 // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
                 models::qwen3_5::execution::g_coltab_conv_cols.store(0);
@@ -1277,6 +1299,12 @@ public:
                     std::fprintf(stderr, "[slot-oracle] snapT done (slot %d)\n",
                                  coltab_host_o[aS]);
                 }
+                // Column-pattern singles: t[2], t[3] hold col-2/3 publishes
+                // regardless of accept; snapshot for the overwrite analysis.
+                GdnSlotSnapshot snapT2 = snapshot_gdn_slot(pool_.get(), o_types,
+                                                           coltab_host_o[2]);
+                GdnSlotSnapshot snapT3 = snapshot_gdn_slot(pool_.get(), o_types,
+                                                           coltab_host_o[3]);
                 card_->commit_verify_slots(lane, coltab_host_o, aS, 4);
                 // Mirror the real path: t[aS] covers through F+aS; the
                 // trailing row executes out_aS (@F+commit_lenS-1) so both
@@ -1474,16 +1502,24 @@ public:
                               saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])
                                  ? "VTARG-SAME"
                                  : "VTARG-DIFF");
-                // Off-GPU permutation test (note 3): dump chain window t[aS]
-                // and canonical mid-span window (same span F+a), first
-                // matching step only. Format: u32 nlayers; per layer: u32 L,
-                // u64 m, m floats T-chain, m floats A-canonical.
-                static bool win_dumped = false;
-                if (!win_dumped && haveT && aL == aS) {
-                    char wpath[128];
-                    std::snprintf(wpath, sizeof(wpath), "/root/oracle_win_F%u_a%u.bin", F, aS);
-                    FILE* wdf = std::fopen(wpath, "wb");
-                    if (wdf != nullptr) {
+                // Off-GPU context dump (note 3b): conv-only singles for the
+                // lane-ahead analysis. Tags: pre (presnap), rst (post-restore
+                // lane), t1/t2/t3 (chain slots), sh0..sh3 (legacy what-ifs),
+                // mid (span F+a), full (span F+a+1). First matching step only.
+                // Format per file: u32 nlayers; per layer: u32 L, u64 m, m floats.
+                static bool ctx_dumped = false;
+                if (!ctx_dumped && haveT && aL == aS) {
+                    const GdnSlotSnapshot* snaps[11] = {
+                        &snapPre, &snapR, &snapT, &snapT2, &snapT3, &snapSH[0],
+                        &snapSH[1], &snapSH[2], &snapSH[3], &snapA_mid, &snapA};
+                    const char* tags[11] = {"pre", "rst", "t1", "t2", "t3", "sh0",
+                                            "sh1", "sh2", "sh3", "mid", "full"};
+                    for (int tg = 0; tg < 11; ++tg) {
+                        char wpath[160];
+                        std::snprintf(wpath, sizeof(wpath),
+                                      "/root/oracle_CTX_F%u_a%u_%s.bin", F, aS, tags[tg]);
+                        FILE* wdf = std::fopen(wpath, "wb");
+                        if (wdf == nullptr) { continue; }
                         const std::uint32_t wnl =
                             static_cast<std::uint32_t>(snapA.layers.size());
                         std::fwrite(&wnl, 4, 1, wdf);
@@ -1493,18 +1529,22 @@ public:
                                 static_cast<std::uint64_t>(
                                     ((wi + 1 < snapA.conv_off.size())
                                          ? snapA.conv_off[wi + 1]
-                                         : snapA.conv.size()) -
+                                         : snaps[tg]->conv.size()) -
                                     snapA.conv_off[wi]);
                             std::fwrite(&wL, 4, 1, wdf);
                             std::fwrite(&wm, 8, 1, wdf);
-                            std::fwrite(snapT.conv.data() + snapA.conv_off[wi], 4, wm, wdf);
-                            std::fwrite(snapA_mid.conv.data() + snapA.conv_off[wi], 4, wm,
-                                        wdf);
+                            std::fwrite(snaps[tg]->conv.data() + snapA.conv_off[wi], 4,
+                                        wm, wdf);
                         }
                         std::fclose(wdf);
-                        std::fprintf(stderr, "[slot-oracle] window dump %s done\n", wpath);
-                        win_dumped = true;
                     }
+                    std::fprintf(stderr,
+                                 "[slot-oracle] ctx dump F=%u a=%u bases lane=%d spare=%d "
+                                 "shadow=%d colbase=%d shbase=%d orbase=%d drafts=[%d %d %d]\n",
+                                 F, aS, lane, o_spare, o_shadow, mtp_column_base_,
+                                 mtp_shadow_base_, mtp_oracle_base_, host_drafts[0],
+                                 host_drafts[1], host_drafts[2]);
+                    ctx_dumped = true;
                 }
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
