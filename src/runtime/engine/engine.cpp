@@ -1224,6 +1224,7 @@ public:
                 GdnSlotSnapshot snapA_mid;
                 GdnSlotSnapshot snapA;
                 GdnSlotSnapshot snapSH[4];
+                GdnSlotSnapshot snapR;
                 std::int32_t saved_targets_L[4] = {0, 0, 0, 0};
                 if (rows_on) {
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
@@ -1268,7 +1269,7 @@ public:
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
                 // Restore check: lane-post-restore vs presnap (conv). Nonzero
                 // means the restore missed and the slots verify started ahead.
-                GdnSlotSnapshot snapR = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                snapR = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 {
                     float rworst = 0.0f;
                     for (std::size_t k = 0; k < snapR.conv.size(); ++k) {
