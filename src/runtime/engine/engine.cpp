@@ -1213,20 +1213,30 @@ public:
                     stream);
                 std::fprintf(stderr, "[slot-oracle] snapPre done (%u layers)\n",
                              static_cast<std::uint32_t>(snapPre.layers.size()));
+                // Note 3 (rows behind a flag): the legacy rows stay until the
+                // first valid S1; NINFER_SLOT_NOROWS skips them after. The
+                // slots verify below always runs (pulse + slots targets).
+                const bool rows_on = (std::getenv("NINFER_SLOT_NOROWS") == nullptr);
+                bool legacy_ok = false;
+                std::int32_t o_targets[4] = {0, 0, 0, 0};
+                std::uint32_t aL = 0;
+                const auto& o_types = parameters_.model.config().text.layer_types;
+                GdnSlotSnapshot snapA_mid;
+                GdnSlotSnapshot snapA;
+                GdnSlotSnapshot snapSH[4];
+                std::int32_t saved_targets_L[4] = {0, 0, 0, 0};
+                if (rows_on) {
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok);
                 device_.synchronize();
                 std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
-                std::int32_t o_targets[4] = {0, 0, 0, 0};
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
-                std::uint32_t aL = 0;
                 while (aL < kDrafts && host_drafts[aL] == o_targets[aL]) { ++aL; }
                 std::int32_t commitL[5];
                 commitL[0] = bonus;
                 for (std::uint32_t j = 0; j < aL; ++j) { commitL[1 + j] = host_drafts[j]; }
                 commitL[1 + aL] = o_targets[aL];
-                const auto& o_types = parameters_.model.config().text.layer_types;
                 const std::uint32_t commit_lenL = (aL == kDrafts) ? 5 : aL + 2;
                 for (std::uint32_t j = 0; j + 1 < commit_lenL; ++j) {
                     run_single_row(commitL[j], F + j, lane, lane, lane, hid1, log1, true);
@@ -1234,19 +1244,20 @@ public:
                 // Mid-span canonical window (span F+aL): matches t[aS] span
                 // for the off-GPU permutation test (note 3). The last legacy
                 // row runs after this snapshot.
-                GdnSlotSnapshot snapA_mid = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                snapA_mid = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
                 std::fprintf(stderr, "[slot-oracle] snapA_mid done (%u layers)\n",
                              static_cast<std::uint32_t>(snapA_mid.layers.size()));
                 run_single_row(commitL[commit_lenL - 1], F + commit_lenL - 1, lane, lane, lane,
                                hid1, log1, true);
-                GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
-                std::int32_t saved_targets_L[4] = {o_targets[0], o_targets[1], o_targets[2],
-                                                   o_targets[3]};
+                snapA = snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                saved_targets_L[0] = o_targets[0];
+                saved_targets_L[1] = o_targets[1];
+                saved_targets_L[2] = o_targets[2];
+                saved_targets_L[3] = o_targets[3];
                 std::fprintf(stderr, "[slot-oracle] snapA done (%u layers)\n",
                              static_cast<std::uint32_t>(snapA.layers.size()));
                 // Shadow what-ifs (legacy width-4 verify wrote o_shadow+0..3):
                 // snapshot BEFORE the restore below clobbers shadow.
-                GdnSlotSnapshot snapSH[4];
                 for (std::int32_t shc = 0; shc < 4; ++shc) {
                     snapSH[shc] =
                         snapshot_gdn_slot(pool_.get(), o_types, o_shadow + shc, stream);
@@ -1280,18 +1291,33 @@ public:
                     }
                     GdnSlotSnapshot snapA2 =
                         snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                    // Per-layer null (note 2): small spread = kernel
+                    // nondeterminism (null becomes the noise floor); large
+                    // layer-ordered = rig still broken (run void).
                     float nworst = 0.0f;
-                    for (std::size_t k = 0; k < snapA.rec.size(); ++k) {
-                        float d = snapA2.rec[k] - snapA.rec[k];
-                        if (d != d) { nworst = 1e30f; break; }
-                        if (d < 0) d = -d;
-                        if (d > nworst) nworst = d;
-                    }
-                    for (std::size_t k = 0; k < snapA.conv.size(); ++k) {
-                        float d = snapA2.conv[k] - snapA.conv[k];
-                        if (d != d) { nworst = 1e30f; break; }
-                        if (d < 0) d = -d;
-                        if (d > nworst) nworst = d;
+                    for (std::size_t i = 0; i < snapA.layers.size(); ++i) {
+                        float nworst_i = 0.0f;
+                        const std::size_t nr1 =
+                            (i + 1 < snapA.rec_off.size()) ? snapA.rec_off[i + 1]
+                                                           : snapA.rec.size();
+                        for (std::size_t k = snapA.rec_off[i]; k < nr1; ++k) {
+                            float d = snapA2.rec[k] - snapA.rec[k];
+                            if (d != d) { d = 1e30f; }
+                            if (d < 0) d = -d;
+                            if (d > nworst_i) nworst_i = d;
+                        }
+                        const std::size_t nc1 =
+                            (i + 1 < snapA.conv_off.size()) ? snapA.conv_off[i + 1]
+                                                            : snapA.conv.size();
+                        for (std::size_t k = snapA.conv_off[i]; k < nc1; ++k) {
+                            float d = snapA2.conv[k] - snapA.conv[k];
+                            if (d != d) { d = 1e30f; }
+                            if (d < 0) d = -d;
+                            if (d > nworst_i) nworst_i = d;
+                        }
+                        if (nworst_i > nworst) nworst = nworst_i;
+                        std::fprintf(stderr, "[slot-oracle] null L=%u %.4g\n",
+                                     snapA.layers[i], nworst_i);
                     }
                     std::fprintf(stderr, "[slot-oracle] null-control |A2-A|=%.4g %s\n",
                                  nworst, nworst == 0.0f ? "NULL-OK" : "NULL-DIFF-VOID");
@@ -1299,6 +1325,8 @@ public:
                     pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
                     pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
                 }
+                legacy_ok = true;
+                } // end if (rows_on): legacy rows + snapshots + null control
                 // Pulse reset: the slots verify below should execute 192/192
                 // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
                 models::qwen3_5::execution::g_coltab_conv_cols.store(0);
@@ -1371,6 +1399,7 @@ public:
                              "[slot-oracle] snapB done (rec=%.1fMB conv=%.1fMB)\n",
                              snapB.rec.size() * 4.0 / 1048576.0,
                              snapB.conv.size() * 4.0 / 1048576.0);
+                if (legacy_ok) {
                 float rec_worst = 0.0f, conv_worst = 0.0f;
                 std::uint32_t rec_L = 0, conv_L = 0;
                 float rec_meanworst = 0.0f, conv_meanworst = 0.0f;
@@ -1392,6 +1421,7 @@ public:
                     const std::size_t na = next_rec - snapA.rec_off[i];
                     double rsum = 0.0;
                     std::size_t rnn = 0;
+                    float rworst_i = 0.0f, cworst_i = 0.0f;
                     for (std::size_t j = 0; j < na; ++j) {
                         const float va = snapA.rec[snapA.rec_off[i] + j];
                         const float vb = snapB.rec[snapB.rec_off[i] + j];
@@ -1403,6 +1433,7 @@ public:
                         float d = va - vb;
                         if (d < 0) d = -d;
                         rsum += d;
+                        if (d > rworst_i) rworst_i = d;
                         if (d > rec_worst) { rec_worst = d; rec_L = snapA.layers[i]; }
                     }
                     const std::size_t rden = na - rnn;
@@ -1428,6 +1459,7 @@ public:
                         float d = va - vb;
                         if (d < 0) d = -d;
                         csum += d;
+                        if (d > cworst_i) cworst_i = d;
                         if (d > conv_worst) { conv_worst = d; conv_L = snapA.layers[i]; }
                     }
                     const std::size_t cden = ma - cnn;
@@ -1435,6 +1467,16 @@ public:
                         conv_meanworst = static_cast<float>(csum / cden);
                         conv_mL        = snapA.layers[i];
                     }
+                    // Per-layer floors (note 1): judge fenced diffs per layer
+                    // against cap-0 recurrent residual / M4-vs-M1 x floors,
+                    // not one global threshold (noise grows with depth).
+                    std::fprintf(stderr,
+                                 "[slot-oracle] layer L=%u rec_w=%.4g rec_m=%.4g conv_w=%.4g "
+                                 "conv_m=%.4g\n",
+                                 snapA.layers[i], rworst_i,
+                                 rden > 0 ? static_cast<float>(rsum / rden) : 0.0f,
+                                 cworst_i,
+                                 cden > 0 ? static_cast<float>(csum / cden) : 0.0f);
                     // Discriminator 1 (cont.): lane-after-commit vs pre-step.
                     double bp_csum = 0.0, bp_rsum = 0.0;
                     std::size_t bpcnn = 0, bprnn = 0;
@@ -1594,6 +1636,12 @@ public:
                                  mtp_shadow_base_, mtp_oracle_base_, host_drafts[0],
                                  host_drafts[1], host_drafts[2]);
                     ctx_dumped = true;
+                }
+                } else {
+                    std::fprintf(stderr,
+                                 "[slot-oracle] F=%u a_slot=%u NOROWS slots-targets=[%d %d %d %d]\n",
+                                 F, aS, o_targets[0], o_targets[1], o_targets[2],
+                                 o_targets[3]);
                 }
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
