@@ -1342,6 +1342,29 @@ public:
                 }
                 legacy_ok = true;
                 } // end if (rows_on): legacy rows + snapshots + null control
+                // Prestine check (F56 discriminator): lane-after-restore vs
+                // presnap. Nonzero means the legacy probe moved the lane and
+                // the restore didn't bring it back — the slots probe then
+                // starts from a different state (pos-0 divergence explained).
+                {
+                    GdnSlotSnapshot snapRS =
+                        snapshot_gdn_slot(pool_.get(), o_types, lane, stream);
+                    float pworst = 0.0f;
+                    for (std::size_t k = 0; k < snapRS.rec.size(); ++k) {
+                        float d = snapRS.rec[k] - snapPre.rec[k];
+                        if (d != d) { pworst = 1e30f; break; }
+                        if (d < 0) d = -d;
+                        if (d > pworst) pworst = d;
+                    }
+                    for (std::size_t k = 0; k < snapRS.conv.size(); ++k) {
+                        float d = snapRS.conv[k] - snapPre.conv[k];
+                        if (d != d) { pworst = 1e30f; break; }
+                        if (d < 0) d = -d;
+                        if (d > pworst) pworst = d;
+                    }
+                    std::fprintf(stderr, "[slot-oracle] prestine |lane-pre|=%.4g %s\n",
+                                 pworst, pworst == 0.0f ? "PRESTINE-OK" : "PRESTINE-DIFF");
+                }
                 // Pulse reset: the slots verify below should execute 192/192
                 // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
                 models::qwen3_5::execution::g_coltab_conv_cols.store(0);
@@ -1593,12 +1616,12 @@ public:
                     }
                 }
                 std::fprintf(stderr,
-                             "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
+                             "[slot-oracle] F=%u lane=%d a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
                              "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
                              "tNaN=%.4f tVsA=%.4g@L%u copy=%.4g nanB=%llu/%llu "
                              "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
-                             F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
+                             F, lane, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
                              convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
                              recBPre_worst, recBPre_L, recBPre_meanworst, recBPre_mL,
