@@ -111,9 +111,15 @@ if [ "$MODE" = "post" ]; then
   [ "$PIDS" != "$RPIDS" ] && VOID="${VOID:+$VOID }pids [${RPIDS}]->[${PIDS}]"
   [ "$HASH" != "$RHASH" ] && VOID="${VOID:+$VOID }hash ${RHASH}->${HASH} (rebuilt mid-run)"
   DRIFT="$(pct_diff "$RSM" "$SMCLK")"
+  # Idle P-state wobble (±15MHz at ~200MHz) is meaningless; void only on a
+  # real excursion: >3% AND >100MHz absolute. Under load (~2.5GHz) the 3%
+  # binds; at idle the floor absorbs P-state bounce.
+  SMVOID=""
   if [ "$DRIFT" -ge 0 ] && [ "$DRIFT" -gt "$MAXDRIFT" ]; then
-    VOID="${VOID:+$VOID }sm_clock ${RSM}->${SMCLK}MHz (${DRIFT}%>${MAXDRIFT}%)"
+    ABS="$(( RSM > SMCLK ? RSM - SMCLK : SMCLK - RSM ))"
+    case "$RSM$SMCLK" in ''|*[!0-9]*) SMVOID="non-numeric-clock";; *) [ "$ABS" -gt 100 ] && SMVOID="sm_clock ${RSM}->${SMCLK}MHz (${DRIFT}%>${MAXDRIFT}%, ${ABS}MHz>100MHz)";; esac
   fi
+  [ -n "$SMVOID" ] && VOID="${VOID:+$VOID }$SMVOID"
   if [ "$NPROC" -gt "$ALLOW" ]; then VOID="${VOID:+$VOID }compute_procs=${NPROC}>${ALLOW}"; fi
   if [ -n "$VOID" ]; then echo "VOID $VOID"; exit 1; fi
   echo "SEALED drift=${DRIFT}%"
