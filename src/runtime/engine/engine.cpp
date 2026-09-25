@@ -1231,6 +1231,8 @@ public:
                              snapB.conv.size() * 4.0 / 1048576.0);
                 float rec_worst = 0.0f, conv_worst = 0.0f;
                 std::uint32_t rec_L = 0, conv_L = 0;
+                float rec_meanworst = 0.0f, conv_meanworst = 0.0f;
+                std::uint32_t rec_mL = 0, conv_mL = 0;
                 std::fprintf(stderr, "[slot-oracle] diff start layers=%u recA=%u recB=%u\n",
                              static_cast<std::uint32_t>(snapA.layers.size()),
                              static_cast<std::uint32_t>(snapA.rec.size()),
@@ -1240,28 +1242,42 @@ public:
                     const std::size_t next_rec =
                         (i + 1 < snapA.rec_off.size()) ? snapA.rec_off[i + 1] : snapA.rec.size();
                     const std::size_t na = next_rec - snapA.rec_off[i];
+                    double rsum = 0.0;
                     for (std::size_t j = 0; j < na; ++j) {
                         float d = snapA.rec[snapA.rec_off[i] + j] - snapB.rec[snapB.rec_off[i] + j];
                         if (d < 0) d = -d;
+                        rsum += d;
                         if (d > rec_worst) { rec_worst = d; rec_L = snapA.layers[i]; }
+                    }
+                    if (na > 0 && rsum / na > rec_meanworst) {
+                        rec_meanworst = static_cast<float>(rsum / na);
+                        rec_mL        = snapA.layers[i];
                     }
                     const std::size_t next_conv =
                         (i + 1 < snapA.conv_off.size()) ? snapA.conv_off[i + 1] : snapA.conv.size();
                     const std::size_t ma = next_conv - snapA.conv_off[i];
+                    double csum = 0.0;
                     for (std::size_t j = 0; j < ma; ++j) {
                         float d =
                             snapA.conv[snapA.conv_off[i] + j] - snapB.conv[snapB.conv_off[i] + j];
                         if (d < 0) d = -d;
+                        csum += d;
                         if (d > conv_worst) { conv_worst = d; conv_L = snapA.layers[i]; }
+                    }
+                    if (ma > 0 && csum / ma > conv_meanworst) {
+                        conv_meanworst = static_cast<float>(csum / ma);
+                        conv_mL        = snapA.layers[i];
                     }
                 }
                 std::fprintf(stderr,
                              "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
-                             "conv_worst=%.4g@L%u vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
+                             "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
+                             "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
                              F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
-                             conv_worst, conv_L, saved_targets_L[0], saved_targets_L[1],
-                             saved_targets_L[2], saved_targets_L[3], o_targets[0], o_targets[1],
-                             o_targets[2], o_targets[3],
+                             rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
+                             saved_targets_L[0], saved_targets_L[1], saved_targets_L[2],
+                             saved_targets_L[3], o_targets[0], o_targets[1], o_targets[2],
+                             o_targets[3],
                              (saved_targets_L[0] == o_targets[0] &&
                               saved_targets_L[1] == o_targets[1] &&
                               saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])

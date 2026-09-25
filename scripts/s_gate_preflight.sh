@@ -2,21 +2,35 @@
 # scripts/s_gate_preflight.sh
 # Mechanical single-server rule for all S-number timings (S1..S4).
 # Usage:
-#   s_gate_preflight.sh pre   [--max-idle-util PCT]   # before launching server: expect 0 compute procs
-#   s_gate_preflight.sh stamp [--allow N]             # during/after run: print STAMP line, refuse if > N compute procs
-# An S-line without a STAMP line is void by default.
+#   s_gate_preflight.sh pre   [--max-idle-util PCT] [--out REF]  # before launch: expect 0 compute procs
+#   s_gate_preflight.sh stamp [--allow N]                        # one-shot stamp during/after run
+#   s_gate_preflight.sh post --ref REF [--allow N] [--max-clock-drift PCT]
+#     # end-of-window stamp: VOID if nproc/PIDs differ from REF or SM clock
+#     # drifted more than PCT% (default 3). Compares against the START stamp.
+# An S-line without a matching START+END stamp pair is void by default.
+# The rule is retroactive: unstamped history (14.3, 22.6, conc gaps, TTFT
+# slopes, bucket tables, the eager-verify price) re-baselines in the first
+# clean gate. Interleave A/B (slots-vs-legacy, on-vs-off) A-B-A-B back to
+# back in one session at the same thermal state; stamps record drift that
+# interleaving does not cancel (m16 is math-bound and moves with SM clock).
 # POSIX sh. Runs under WSL (nvidia-smi present). No GPU work itself.
 set -u
 
 MODE="${1:-stamp}"
 ALLOW=1
 MAXIDLE=5
+MAXDRIFT=3
+OUT=""
+REF=""
 if [ "$MODE" = "pre" ]; then ALLOW=0; fi
 shift 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --allow) ALLOW="$2"; shift 2;;
     --max-idle-util) MAXIDLE="$2"; shift 2;;
+    --max-clock-drift) MAXDRIFT="$2"; shift 2;;
+    --out) OUT="$2"; shift 2;;
+    --ref) REF="$2"; shift 2;;
     *) shift;;
   esac
 done
@@ -44,6 +58,25 @@ else
 fi
 NSERV="$(echo "$CAPPS" | grep -c 'ninfer-serve' || true)"
 
+save_ref() {
+  # $1=file
+  {
+    echo "hash=$HASH"
+    echo "nproc=$NPROC"
+    echo "pids=$PIDS"
+    echo "smclk=$SMCLK"
+    echo "temp=$TEMP"
+  } > "$1"
+}
+
+pct_diff() {
+  # $1=old $2=new -> integer percent |new-old|/old, or -1 if non-numeric
+  case "$1$2" in ''|*[!0-9]*) echo -1; return;; esac
+  if [ "$1" -eq 0 ]; then echo -1; return; fi
+  d=$(( $2 > $1 ? $2 - $1 : $1 - $2 ))
+  echo $(( d * 100 / $1 ))
+}
+
 # 3x1s idle samples catch display/compositor activity on the 5090
 if [ "$MODE" = "pre" ]; then
   S1="$UTIL"
@@ -51,7 +84,8 @@ if [ "$MODE" = "pre" ]; then
   S2="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
   sleep 1
   S3="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
-  echo "STAMP hash=$HASH mode=pre nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB"
+  echo "STAMP hash=$HASH mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB"
+  [ -n "$OUT" ] && save_ref "$OUT"
   FAIL=""
   [ "$NPROC" -gt "$ALLOW" ] && FAIL="compute_procs=${NPROC}>${ALLOW}"
   for s in "$S1" "$S2" "$S3"; do
@@ -60,6 +94,29 @@ if [ "$MODE" = "pre" ]; then
   done
   if [ -n "$FAIL" ]; then echo "REFUSE $FAIL"; exit 1; fi
   echo "GO"
+  exit 0
+fi
+
+if [ "$MODE" = "post" ]; then
+  echo "STAMP hash=$HASH mode=end nproc=$NPROC ninfer=$NSERV pids=[$PIDS] util=${UTIL}% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB"
+  if [ -z "$REF" ] || [ ! -f "$REF" ]; then echo "VOID no-start-stamp"; exit 1; fi
+  RNPROC=""; RPIDS=""; RSM=""; RHASH=""
+  while IFS='=' read -r k v; do
+    case "$k" in
+      nproc) RNPROC="$v";; pids) RPIDS="$v";; smclk) RSM="$v";; hash) RHASH="$v";;
+    esac
+  done < "$REF"
+  VOID=""
+  [ "$NPROC" != "$RNPROC" ] && VOID="nproc ${RNPROC}->${NPROC}"
+  [ "$PIDS" != "$RPIDS" ] && VOID="${VOID:+$VOID }pids [${RPIDS}]->[${PIDS}]"
+  [ "$HASH" != "$RHASH" ] && VOID="${VOID:+$VOID }hash ${RHASH}->${HASH} (rebuilt mid-run)"
+  DRIFT="$(pct_diff "$RSM" "$SMCLK")"
+  if [ "$DRIFT" -ge 0 ] && [ "$DRIFT" -gt "$MAXDRIFT" ]; then
+    VOID="${VOID:+$VOID }sm_clock ${RSM}->${SMCLK}MHz (${DRIFT}%>${MAXDRIFT}%)"
+  fi
+  if [ "$NPROC" -gt "$ALLOW" ]; then VOID="${VOID:+$VOID }compute_procs=${NPROC}>${ALLOW}"; fi
+  if [ -n "$VOID" ]; then echo "VOID $VOID"; exit 1; fi
+  echo "SEALED drift=${DRIFT}%"
   exit 0
 fi
 
