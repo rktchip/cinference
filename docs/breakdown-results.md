@@ -48,7 +48,37 @@ Server :8901, NINFER_MTP_DEBUG=1, STEP_TRACE=1, GRAPH=verbose.
   Cheap check first: [graph] eager-shape lines on m=2 steps; then nsys
   SM-busy B=1-replay vs B=2-eager on both servers.
 
-## Ceiling (committee metric — superseded by nsys section below, kept for trail)
+## Reconciliation (committee corrections folded, off-GPU)
+
+- NVTX: ABSENT in /root/mtp-nsys (captured -t cuda only) —
+  nvtx_gpu_proj_sum SKIPPED, no NVTX data. GPU-projected buckets need a
+  re-capture with -t cuda,nvtx. Until then: my draft/verify split is
+  CPU-range arithmetic on async launches and the verify half is
+  MISATTRIBUTED (a sync inside the "draft" range bills queued verify work
+  as draft). Accepted.
+- Verify 5–10ms is impossible: full target pass floor ~8.4ms (15GB÷1.79),
+  realistically ≥ T_1 ~14ms. True step recomposition (pooled E=2.82):
+  drafts ~22 + verify ~14-16 + commits ~28 + gaps ≈ 64-66ms ✓ matches
+  wall-derived 64ms. The 5–10 bucket was sync-billed draft time.
+- Makespans: the "32ms/tok" scare is wall÷tokens including ~1.0-1.2s TTFT.
+  nsys FOX run: 14 steps, wall 2.30 = TTFT ~1.1 + decode ~1.2s;
+  55 toks/14 steps E=3.93 → 22.6×3.93 ≈ 88ms/step ✓ row-18 22.6 decode
+  rate CONFIRMED on the capture binary. No re-capture needed for the rate;
+  the ~0.6-1.0s "outside decode" is TTFT/prefill + eager anchor replay.
+  Per-regime step budgets (FOX E=3.9): beat 14.3 → <53ms; margin → <45ms.
+  Pooled (E=2.82): <40/<34. PARIS (E=2.12): <30/<26.
+- Slots ceiling with gaps KEPT: (64-28)/2.82 = 12.8ms/tok — beats 14.3
+  ~10%, MISSES 12.2 margin. 9.6–11 needs gaps gone = on-device accept
+  and/or cheaper drafts. Filed as the bar, not the hope.
+- Drafts are the next wall: 7.8ms/tok = 55% of spec-off's budget; ~7.3ms
+  per draft step (half a target pass for a 1-layer head = eager launches
+  on WDDM and/or full-vocab head and/or the misattribution above). k-rule
+  from this histogram: k=3 → 36ms/12.8; k=2 → ~28.7/~12.2;
+  k=1 → ~21.3/~11.9 (gaps kept). Decision AFTER draft graphing +
+  head-truncate check, not before.
+- What survives untouched: commit bucket (~2 M=1 rows/step × 14-15ms ≈
+  28ms). Slots go-case holds wherever draft/verify lands — it depends
+  only on what slots remove.
 
 - First version wrongly used E=3.82 (double-counted anchor replay).
   Correct E=2.82, budgets <40ms / <34ms per step. See nsys section.
@@ -80,11 +110,21 @@ verify + per-row MTP refills) — flagged, not blocking 20b.
 Spec-off FOX wall 1.00s vs spec-on 2.22-2.30s same prompt (2.2×).
 T_1 consistent with 14.3 contract.
 
-## Next
+## Wide histograms (225 steps) + off baselines
 
-1. Wider histograms: CODELOW + one more prompt, several hundred steps,
-   each with spec-off baseline (CODELOW has no off-number yet — 3.69s
-   is not a veto until it does).
-2. Conc-2 SM-busy both servers (batch size + graph-vs-eager HAVE from
+Per-prompt E (spec-on, T=0): FOX 3.71 (n=14), PARIS 2.12 (n=49 — the
+partial source, real veto), CODELOW 3.90 (n=20+82), PRIME 3.87 (n=60).
+CODELOW is NOT low-accept at greedy (deterministic digits draft perfectly);
+PARIS prose is the only hostile regime at T=0. Combined E=3.48 over 225.
+Off walls: FOX 1.03, PARIS 2.09, CODELOW 1.40, PRIME 1.02. On loses every
+regime 2.2–2.7× (FOX 2.2-2.3, PARIS 4.78, CODELOW ~3.75, PRIME ~2.77).
+CODELOW veto stands only with its off-number: 3.75 vs 1.40. Filed.
+
+## Next (in order)
+
+1. Conc-2 SM-busy both servers (batch size + graph-vs-eager HAVE from
    logs; only SM-busy needs nsys).
-3. Then 20b slots (NEXT-3). Native exe (NEXT-1) re-gate anytime.
+2. Slots go/no-go on 12.8 gaps-kept bar (ships only with a plan to clear
+   12.2: on-device accept and/or draft graphing).
+3. Draft graphing + head-truncate check, then the k decision (k=1-2 lead).
+4. Native exe (NEXT-1) re-gate anytime.
