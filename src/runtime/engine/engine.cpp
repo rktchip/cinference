@@ -269,9 +269,9 @@ public:
         // column_base_[lane]+c-1, so tables are init-filled once, never rebuilt.
         mtp_column_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 + static_cast<std::int32_t>(max_seqs_) : -1;
-        // Row 20b oracle: one presnap slot holding the pre-verify lane GDN
-        // (debug only, NINFER_SLOT_ORACLE). Snapshots go to host; the slot
-        // is just the restore point.
+        // Row 20b oracle: three presnap slots (lane + spare + shadow: the
+        // legacy probe clobbers spare/shadow as ping/pong scratch, and the
+        // real path needs all three pristine). Debug only.
         mtp_oracle_base_ =
             mtp_enabled_ ? mtp_column_base_ + 4 * static_cast<std::int32_t>(max_seqs_) : -1;
         hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
@@ -360,7 +360,7 @@ public:
                         dimension(text_config.gdn->linear_key_head_dim)) : 0,
                     .slot_count     = static_cast<std::int32_t>(max_seqs_) +
                                     (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) +
-                                                        4 * static_cast<std::int32_t>(max_seqs_) + 1
+                                                        4 * static_cast<std::int32_t>(max_seqs_) + 3
                                      : 0),
                     .conv_dtype     = DType::BF16,
                 });
@@ -1150,7 +1150,28 @@ public:
                              F, lane, pool_->layer_count(),
                              static_cast<std::uint32_t>(
                                  parameters_.model.config().text.layer_types.size()));
+                // Presnap lane + spare + shadow: the legacy probe clobbers
+                // spare/shadow as ping/pong scratch, and the real path needs
+                // all three pristine.
+                const std::int32_t o_spare  = spare_slot_;
+                const std::int32_t o_shadow = mtp_shadow_base_ + lane;
                 pool_->copy_slot(lane, mtp_oracle_base_, stream);
+                pool_->copy_slot(o_spare, mtp_oracle_base_ + 1, stream);
+                pool_->copy_slot(o_shadow, mtp_oracle_base_ + 2, stream);
+                // Entry gap: |lane-spare| must be ~0 (spare synced above).
+                {
+                    const auto& e_types = parameters_.model.config().text.layer_types;
+                    GdnSlotSnapshot eL  = snapshot_gdn_slot(pool_.get(), e_types, lane);
+                    GdnSlotSnapshot eS  = snapshot_gdn_slot(pool_.get(), e_types, o_spare);
+                    float egap = 0.0f;
+                    for (std::size_t k = 0; k < eL.rec.size(); ++k) {
+                        float d = eL.rec[k] - eS.rec[k];
+                        if (d < 0) d = -d;
+                        if (d > egap) egap = d;
+                    }
+                    std::fprintf(stderr, "[slot-oracle] entry F=%u |lane-spare|=%.4g\n", F,
+                                 egap);
+                }
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok);
                 device_.synchronize();
@@ -1170,9 +1191,13 @@ public:
                 }
                 const auto& o_types = parameters_.model.config().text.layer_types;
                 GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                std::int32_t saved_targets_L[4] = {o_targets[0], o_targets[1], o_targets[2],
+                                                   o_targets[3]};
                 std::fprintf(stderr, "[slot-oracle] snapA done (%u layers)\n",
                              static_cast<std::uint32_t>(snapA.layers.size()));
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
+                pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
+                pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok, &vcoltab);
                 device_.synchronize();
@@ -1188,6 +1213,17 @@ public:
                         mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
                 }
                 card_->commit_verify_slots(lane, coltab_host_o, aS, 4);
+                // Mirror the real path: t[aS] covers through F+aS; the
+                // trailing row executes out_aS (@F+commit_lenS-1) so both
+                // snapshots cover the same span. (The row's hid1/log1 are
+                // probe-local; the real path restages everything.)
+                std::int32_t commitS[5];
+                commitS[0] = bonus;
+                for (std::uint32_t j = 0; j < aS; ++j) { commitS[1 + j] = host_drafts[j]; }
+                commitS[1 + aS] = o_targets[aS];
+                const std::uint32_t commit_lenS = (aS == kDrafts) ? 5 : aS + 2;
+                run_single_row(commitS[commit_lenS - 1], F + commit_lenS - 1, lane, lane, lane,
+                               hid1, log1, true);
                 GdnSlotSnapshot snapB = snapshot_gdn_slot(pool_.get(), o_types, lane);
                 std::fprintf(stderr,
                              "[slot-oracle] snapB done (rec=%.1fMB conv=%.1fMB)\n",
@@ -1195,20 +1231,23 @@ public:
                              snapB.conv.size() * 4.0 / 1048576.0);
                 float rec_worst = 0.0f, conv_worst = 0.0f;
                 std::uint32_t rec_L = 0, conv_L = 0;
+                std::fprintf(stderr, "[slot-oracle] diff start layers=%u recA=%u recB=%u\n",
+                             static_cast<std::uint32_t>(snapA.layers.size()),
+                             static_cast<std::uint32_t>(snapA.rec.size()),
+                             static_cast<std::uint32_t>(snapB.rec.size()));
+                std::fflush(stderr);
                 for (std::size_t i = 0; i < snapA.layers.size(); ++i) {
-                    const std::size_t na = snapA.rec_off[i + 1 < snapA.rec_off.size()
-                                                             ? snapA.rec_off[i + 1]
-                                                             : snapA.rec.size()] -
-                                           snapA.rec_off[i];
+                    const std::size_t next_rec =
+                        (i + 1 < snapA.rec_off.size()) ? snapA.rec_off[i + 1] : snapA.rec.size();
+                    const std::size_t na = next_rec - snapA.rec_off[i];
                     for (std::size_t j = 0; j < na; ++j) {
                         float d = snapA.rec[snapA.rec_off[i] + j] - snapB.rec[snapB.rec_off[i] + j];
                         if (d < 0) d = -d;
                         if (d > rec_worst) { rec_worst = d; rec_L = snapA.layers[i]; }
                     }
-                    const std::size_t ma =
-                        snapA.conv_off[i + 1 < snapA.conv_off.size() ? snapA.conv_off[i + 1]
-                                                                     : snapA.conv.size()] -
-                        snapA.conv_off[i];
+                    const std::size_t next_conv =
+                        (i + 1 < snapA.conv_off.size()) ? snapA.conv_off[i + 1] : snapA.conv.size();
+                    const std::size_t ma = next_conv - snapA.conv_off[i];
                     for (std::size_t j = 0; j < ma; ++j) {
                         float d =
                             snapA.conv[snapA.conv_off[i] + j] - snapB.conv[snapB.conv_off[i] + j];
@@ -1218,10 +1257,19 @@ public:
                 }
                 std::fprintf(stderr,
                              "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
-                             "conv_worst=%.4g@L%u\n",
+                             "conv_worst=%.4g@L%u vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
                              F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
-                             conv_worst, conv_L);
+                             conv_worst, conv_L, saved_targets_L[0], saved_targets_L[1],
+                             saved_targets_L[2], saved_targets_L[3], o_targets[0], o_targets[1],
+                             o_targets[2], o_targets[3],
+                             (saved_targets_L[0] == o_targets[0] &&
+                              saved_targets_L[1] == o_targets[1] &&
+                              saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])
+                                 ? "VTARG-SAME"
+                                 : "VTARG-DIFF");
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
+                pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
+                pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);
             }
             if (vgraph_on && !slots_on && verify_seen_ && verify_exec_ != nullptr) {
                 CUDA_CHECK(cudaGraphLaunch(verify_exec_, stream));
