@@ -290,6 +290,25 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     replay_records_   = replay_records;
 }
 
+void TextContext::commit_verify_slots(std::int32_t lane, const std::int32_t* col_slots,
+                                      std::uint32_t accepted, std::int32_t width) {
+    cudaStream_t s = ctx_.stream;
+    if (lane < 0 || lane >= state_.slot_count() || col_slots == nullptr || width < 2 ||
+        accepted > static_cast<std::uint32_t>(width - 1)) {
+        throw std::invalid_argument("commit_verify_slots: bad lane/table/shape");
+    }
+    // Accept-a state is t[a]; t[0]=lane so a==0 is a no-op (col 0 already
+    // wrote the lane in place, recurrent and conv together). a>=1 copies the
+    // whole slot (conv window + recurrent) — each column slot holds the
+    // exact post-column state from the real width-1 kernels.
+    if (accepted == 0) { return; }
+    const std::int32_t src = col_slots[accepted];
+    if (src < 0 || src >= state_.slot_count()) {
+        throw std::invalid_argument("commit_verify_slots: column slot OOB");
+    }
+    state_.copy_slot(src, lane, s);
+}
+
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
                                    const Tensor* input_embeddings, Tensor& x, Tensor& ah) {
     cudaStream_t s     = ctx_.stream;
@@ -1514,6 +1533,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         if (width <= 0 || width * active_sequence_batch_ != T) {
             throw std::logic_error("GDN sequence batch binding does not match aggregate columns");
         }
+        // Row 20b layout-B table ({k+1}, batch==1, length==width): shared by
+        // the per-column snapshot below and the recurrent chain after it.
+        // Null = legacy single snapshot + ping/pong chain.
+        const Tensor* coltab_verify = active_linear_state_column_slots_;
+        if (coltab_verify != nullptr) {
+            if (active_sequence_batch_ != 1 || coltab_verify->ne[0] != width) {
+                throw std::logic_error(
+                    "Row 20b column slots need batch==1 and table length == width");
+            }
+        }
         if (gdn_state_action_ == GdnStateAction::UpdateInPlace && width != 1) {
             // Lane B batched snapshot verify only: single row, width in
             // (1, 4] with an explicit destination slot (spare source, shadow
@@ -1526,23 +1555,6 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         }
         Tensor projection_input =
             h.view({dimension(config_.hidden_size), width, active_sequence_batch_});
-        // Row 20b: dump per-column block inputs for post-accept conv gather.
-        // projection_input is {H,width,batch}; this path is batch==1-only
-        // under the column-slot contract (fail-closed above), so a flat
-        // width-column copy per layer is exact.
-        if (active_gdn_conv_dump_ != nullptr) {
-            const std::size_t H = static_cast<std::size_t>(dimension(config_.hidden_size));
-            const std::size_t row_bytes = H * 2U;
-            for (std::int32_t c = 0; c < width; ++c) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    static_cast<char*>(active_gdn_conv_dump_->data) +
-                        static_cast<std::size_t>(gidx) * active_gdn_conv_dump_stride_ +
-                        static_cast<std::size_t>(c) * row_bytes,
-                    static_cast<const char*>(projection_input.data) +
-                        static_cast<std::size_t>(c) * row_bytes,
-                    row_bytes, cudaMemcpyDeviceToDevice, s));
-            }
-        }
         Tensor query_output =
             qc.view({dimension(config_.gdn->key_width()), width, active_sequence_batch_});
         Tensor key_output =
@@ -1561,6 +1573,29 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
+        } else if (coltab_verify != nullptr) {
+            // Row 20b: one width-1 snapshot per column with chained slots —
+            // col c reads (c==0 ? source : t[c-1]) and writes t[c]. Each
+            // width-1 call shifts exactly one input into the window, so t[c]
+            // holds the exact post-column-c conv window from the real kernel
+            // (no gather math, no projection replication). q/k/v/z outputs
+            // are sliced per column; valid is a batch mask (shared).
+            for (std::int32_t c = 0; c < width; ++c) {
+                Tensor h_c = projection_input.slice(1, c, 1);
+                Tensor q_c = query_output.slice(1, c, 1);
+                Tensor k_c = key_output.slice(1, c, 1);
+                Tensor v_c = value_output.slice(1, c, 1);
+                Tensor z_c = gate_output.slice(1, c, 1);
+                Tensor dst_c = coltab_verify->slice(0, c, 1);
+                const Tensor* init_c = (c == 0) ? active_linear_state_source_slots_ : nullptr;
+                Tensor init_tmp;
+                if (c > 0) {
+                    init_tmp = coltab_verify->slice(0, c - 1, 1);
+                    init_c   = &init_tmp;
+                }
+                gdn_projection_snapshot(h_c, p, *config_.gdn, conv_states, valid, *init_c, dst_c,
+                                        q_c, k_c, v_c, z_c, work_, s);
+            }
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1634,17 +1669,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             // even width; both slots are scratch). All other paths above.
             const Tensor& ping = *active_linear_state_source_slots_;
             const Tensor& pong = *active_linear_state_destination_slots_;
-            // Row 20b layout B: when a column-slot table is bound (batch==1,
-            // table length == width-1), preserve every intermediate state:
-            // col 0 in place (lane->lane), col c>=1 reads (c==1 ? ping :
-            // t[c-2]) and writes t[c-1]. Accept-a state is then ping (a==0)
-            // or t[a-1]. Strict validation when bound (fail-closed); null
-            // keeps the legacy ping/pong scratch behavior for old callers.
+            // Row 20b layout B ({k+1} table): col c reads
+            // (c==0 ? source : t[c-1]) and writes t[c]. Accept-a = t[a].
+            // Validated here (this block is outside the snapshot section's
+            // scope); null keeps the legacy ping/pong scratch behavior.
             const Tensor* coltab = active_linear_state_column_slots_;
             if (coltab != nullptr) {
-                if (active_sequence_batch_ != 1 || coltab->ne[0] != width - 1) {
+                if (active_sequence_batch_ != 1 || coltab->ne[0] != width) {
                     throw std::logic_error(
-                        "Row 20b column slots need batch==1 and table length == width-1");
+                        "Row 20b column slots need batch==1 and table length == width");
                 }
             }
             const float scale  = static_cast<float>(
@@ -1656,22 +1689,21 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 Tensor gc = g_batch.slice(1, c, 1);
                 Tensor bc = beta_batch.slice(1, c, 1);
                 Tensor oc = out_batch.slice(2, c, 1);
-                // Layout B: col 0 in place; col c>=1 chains through t[].
-                // Legacy: even/odd ping/pong alternation (scratch).
+                // Layout B {k+1}: col c reads (c==0 ? ping : t[c-1]), writes
+                // t[c]. Legacy: even/odd ping/pong alternation (scratch).
                 Tensor t_scol;
                 Tensor t_dcol;
                 const Tensor* scol_p = nullptr;
                 const Tensor* dcol_p = nullptr;
                 if (coltab != nullptr) {
+                    t_dcol = coltab->slice(0, c, 1);
                     if (c == 0) {
                         scol_p = &ping;
-                        dcol_p = &ping;
                     } else {
-                        t_scol = (c == 1) ? ping : coltab->slice(0, c - 2, 1);
-                        t_dcol = coltab->slice(0, c - 1, 1);
+                        t_scol = coltab->slice(0, c - 1, 1);
                         scol_p = &t_scol;
-                        dcol_p = &t_dcol;
                     }
+                    dcol_p = &t_dcol;
                 } else {
                     scol_p = &((c % 2 == 0) ? ping : pong);
                     dcol_p = &((c % 2 == 0) ? pong : ping);

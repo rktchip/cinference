@@ -103,11 +103,16 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
-    // Row 20b: bind/clear the per-layer conv-input dump buffer (null = skip).
-    void set_gdn_conv_dump(Tensor* buf, std::size_t stride_bytes) noexcept {
-        active_gdn_conv_dump_         = buf;
-        active_gdn_conv_dump_stride_  = stride_bytes;
-    }
+    // Row 20b slice B (revised): commit verify column states into the lane.
+    // Table is {k+1} = {lane, s1..sk} (static per lane, init-filled):
+    // col c reads t[c-1]-as-source (c==0: the verify source/spare) and both
+    // the recurrent chain and the per-column snapshot write t[c]. Accept-a
+    // state is then t[a] (t[0]=lane, so a==0 is a no-op). a>=1 copies
+    // t[a] -> lane via pool copy_slot (conv+recurrent together — no gather:
+    // each column slot holds its own exact post-column window from the real
+    // width-1 snapshot kernel). Throws fail-closed on shape surprise.
+    void commit_verify_slots(std::int32_t lane, const std::int32_t* col_slots,
+                             std::uint32_t accepted, std::int32_t width);
     // E2 ragged serve-batch binding: device gather output plus the host
     // offsets mirror. Set for batch-mode steps (flat T live tokens); cleared
     // for single-request paths. Never reads host block tables.
@@ -308,18 +313,12 @@ private:
     const Tensor* active_kv_table_rows_                                            = nullptr;
     const Tensor* active_linear_state_source_slots_                                = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
-    // Row 20b layout-B column slots: optional {k} int32 device array (batch==1
-    // only) holding the per-column destination slot ids t[0..k-1] for a
-    // width-(k+1) verify. Column 0 updates the lane in place; column c>=1
-    // reads (c==1 ? source : t[c-2]) and writes t[c-1]. Null = legacy
-    // ping/pong fallback (both slots scratch, intermediates lost).
+    // Row 20b layout-B column slots: optional {k+1} int32 device array
+    // (batch==1 only): t[0]=lane (col-0 destination, in place for a==0),
+    // t[1..k]=column slots. Col c reads (c==0 ? source : t[c-1]) and writes
+    // t[c], for BOTH the recurrent chain and the per-column snapshot below.
+    // Accept-a state is t[a]. Null = legacy ping/pong fallback.
     const Tensor* active_linear_state_column_slots_                                = nullptr;
-    // Row 20b conv-input dump: when bound, gdn_mix (Verify) copies each
-    // GDN layer's per-column projection inputs into dump[gidx] ({H,width}
-    // BF16 at dump_base + gidx*layer_stride_bytes) for post-accept conv
-    // window gather. Null = skip (legacy path).
-    Tensor* active_gdn_conv_dump_                                                    = nullptr;
-    std::size_t active_gdn_conv_dump_stride_                                        = 0;
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;

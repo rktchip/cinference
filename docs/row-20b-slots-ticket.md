@@ -1,5 +1,10 @@
 # Row 20b — Slots-first speculative state commit (replaces Row 20 lane-restore)
 
+Moves S1 (decode ms/tok conc-1): predicted step 36ms -> (T_ver + 1xT_1 +
+refills) ~44-49ms -> /3.82 ~11.5-12.8 high-accept. Kill: S1 slots >= S1
+legacy (22.6) same binary -> revert (flag-off). S2/S3/S4 untouched (row-23
+owns S2; conc owns S3).
+
 Status: PROPOSED 2026-09-25. NEXT-3 in execution order (after NEXT-1 exe + NEXT-2 breakdown). Needs Chip sign-off. No GPU spent. 5090 HELD.
 Supersedes: Row 20 lane-restore — DEAD, do not revive. No commit rows, no state copies, no replay, no restore path.
 Default flip: none. Spec stays opt-in regardless of outcome.
@@ -21,13 +26,21 @@ suffix. 20b fixes the wording by removing the path entirely.
 ## 3. Design: slots-first + layout (named explicitly)
 
 Slot count: verify has k+1 columns (bonus + k drafts); every accept
-outcome a ∈ 0..k needs the state after column a = k+1 states. Two valid
-layouts (off-by-one breaks exactly one accept value — fuzz accept-0..3
-FIRST):
-- (A) Source slot + k+1 output slots.
-- (B) Column 0 updates the lane IN PLACE + k slots. Safe: the bonus comes
-  from real target logits and is always kept.
-Layout (B) is the first cut (fewer slots, no lane move on the common path).
+outcome a ∈ 0..k needs the state after column a = k+1 states. Layout B
+(t[0]=lane in place for col 0, t[1..k]=column slots; static per lane,
+init-filled once). Off-by-one named: table length == width (k+1), NOT k
+(an off-by-one here breaks exactly one accept value — forced accept-0..3
+fuzz comes first).
+- Recurrent: chained per column (col c reads t[c-1], writes t[c]).
+- Conv: NO gather — one width-1 snapshot per column with chained slots,
+  using the real kernel (t[c] holds the exact post-column-c window).
+- Commit: a==0 is a no-op (both states already in place); a>=1 copies
+  t[a] -> lane via pool copy_slot (conv+recurrent together).
+- Trailing row: t[a] covers through F+a, but out_a (@F+1+a) was only
+  argmaxed, never executed — one M=1 row executes it (was commit_len
+  rows). E (tokens/step = a+2) is UNCHANGED: decoded list + F-advance
+  identical; only compute rows die. The "+1 disappears" correction is
+  declined with this derivation (filed 2026-09-25).
 
 Slot mapping: COPY-BACK first cut. After accept a: copy slot[a] (or lane
 itself under layout B for a=0) back into the fixed lane address. One

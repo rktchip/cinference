@@ -52,6 +52,50 @@ DeviceContext initialize_device(const EngineOptions& options) {
     return device;
 }
 
+// Row 20b oracle helpers (debug only, NINFER_SLOT_ORACLE): host snapshots of
+// a GDN slot (recurrent FP32 + conv BF16->FP32) and their max-abs diff.
+struct GdnSlotSnapshot {
+    std::vector<std::uint32_t> layers;
+    std::vector<float> rec;
+    std::vector<float> conv;
+    std::vector<std::size_t> rec_off;
+    std::vector<std::size_t> conv_off;
+};
+
+GdnSlotSnapshot snapshot_gdn_slot(LinearAttentionStatePool* pool,
+                                  const std::vector<models::qwen3_5::MixerKind>& layer_types,
+                                  std::int32_t slot) {
+    GdnSlotSnapshot s;
+    // Pool slots are compact-GDN-indexed (gdn_mix's gidx), not global layer
+    // id: count non-full layers for the pool view.
+    std::uint32_t c = 0;
+    for (std::uint32_t L = 0; L < static_cast<std::uint32_t>(layer_types.size()); ++L) {
+        if (layer_types[L] == models::qwen3_5::MixerKind::FullAttention) { continue; }
+        Tensor r = pool->recurrent_slot(c, slot);
+        Tensor co = pool->conv_slot(c, slot);
+        ++c;
+        s.layers.push_back(L);
+        s.rec_off.push_back(s.rec.size());
+        const std::size_t n = r.bytes() / 4;
+        s.rec.resize(s.rec.size() + n);
+        CUDA_CHECK(cudaMemcpy(s.rec.data() + s.rec_off.back(), r.data, r.bytes(),
+                              cudaMemcpyDeviceToHost));
+        s.conv_off.push_back(s.conv.size());
+        const std::size_t m = co.bytes() / 2;
+        s.conv.resize(s.conv.size() + m);
+        std::vector<std::uint16_t> tmp(m);
+        CUDA_CHECK(
+            cudaMemcpy(tmp.data(), co.data, co.bytes(), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < m; ++i) {
+            std::uint32_t f = static_cast<std::uint32_t>(tmp[i]) << 16;
+            float v         = 0.0f;
+            std::memcpy(&v, &f, 4);
+            s.conv[s.conv_off.back() + i] = v;
+        }
+    }
+    return s;
+}
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
@@ -225,6 +269,11 @@ public:
         // column_base_[lane]+c-1, so tables are init-filled once, never rebuilt.
         mtp_column_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 + static_cast<std::int32_t>(max_seqs_) : -1;
+        // Row 20b oracle: one presnap slot holding the pre-verify lane GDN
+        // (debug only, NINFER_SLOT_ORACLE). Snapshots go to host; the slot
+        // is just the restore point.
+        mtp_oracle_base_ =
+            mtp_enabled_ ? mtp_column_base_ + 4 * static_cast<std::int32_t>(max_seqs_) : -1;
         hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
         max_tokens_  = options.prefill_chunk + max_seqs_;
         max_blocks_  = (max_context_ + 15U) / 16U;
@@ -311,7 +360,7 @@ public:
                         dimension(text_config.gdn->linear_key_head_dim)) : 0,
                     .slot_count     = static_cast<std::int32_t>(max_seqs_) +
                                     (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) +
-                                                        4 * static_cast<std::int32_t>(max_seqs_)
+                                                        4 * static_cast<std::int32_t>(max_seqs_) + 1
                                      : 0),
                     .conv_dtype     = DType::BF16,
                 });
@@ -409,23 +458,20 @@ public:
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
         // Row 20b layout B: static per-lane column-slot tables, init-filled
-        // once (col c>=1 -> column_base+lane*4+c-1). Lane count only changes
-        // at init, so no per-step rebuild, no per-step H2D.
+        // once: t[0]=lane (col-0 writes the lane in place), t[1..3]=column
+        // slots. Lane ids never change, so no per-step rebuild, no H2D.
         if (mtp_enabled_) {
             mtp_coltab_store_ = DeviceBuffer(static_cast<std::size_t>(max_seqs_) * 4U * 4U);
             std::vector<std::int32_t> coltab(static_cast<std::size_t>(max_seqs_) * 4U);
-            for (std::uint32_t lane = 0; lane < max_seqs_; ++lane)
-                for (std::int32_t c = 0; c < 4; ++c)
+            for (std::uint32_t lane = 0; lane < max_seqs_; ++lane) {
+                coltab[static_cast<std::size_t>(lane) * 4U + 0] =
+                    static_cast<std::int32_t>(lane);
+                for (std::int32_t c = 1; c < 4; ++c)
                     coltab[static_cast<std::size_t>(lane) * 4U + static_cast<std::size_t>(c)] =
-                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
+                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+            }
             CUDA_CHECK(cudaMemcpy(mtp_coltab_store_.p, coltab.data(), coltab.size() * 4U,
                                   cudaMemcpyHostToDevice));
-            // Conv-input dump: one {H,4} BF16 plane per text layer (indexed
-            // by gidx). Written by Verify when bound (slots path only).
-            const std::size_t nlayers = parameters_.text.layers.size();
-            mtp_convdump_stride_ =
-                align_up(static_cast<std::size_t>(hidden_) * 4U * 2U);
-            mtp_convdump_store_ = DeviceBuffer(mtp_convdump_stride_ * nlayers);
         }
         CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(scratch_.p) + tables_, 0,
                                    static_cast<std::size_t>(max_seqs_) * max_blocks_ * 4U,
@@ -1056,15 +1102,10 @@ public:
             Tensor vhid(mbase + mtp_vhid_, DType::BF16, {H, 4, 1});
             Tensor vlog(mbase + mtp_vlog_, DType::BF16, {V, 4, 1});
             Tensor vtok(mbase + mtp_vtok_, DType::I32, {4, 1});
-            // Row 20b slice A: bind the conv-input dump when NINFER_SLOTS=1
-            // (exercises the dump path; commit path still legacy so the
-            // states it preserves are unused — bit-identical behavior).
-            // The column table is NOT passed until slice B (commit-by-index):
-            // col-0 in-place would clobber the lane the commit rows read.
+            // Row 20b slice A: the column table is passed to the eager verify
+            // below when NINFER_SLOTS=1 (commit-by-index lands with it in
+            // slice B; legacy path keeps null = ping/pong).
             const bool slots_on = std::getenv("NINFER_SLOTS") != nullptr;
-            Tensor convdump(mtp_convdump_store_.p, DType::BF16,
-                            {static_cast<std::int32_t>(hidden_ * 4U), 1});
-            if (slots_on) card_->set_gdn_conv_dump(&convdump, mtp_convdump_stride_);
             // Envelope mirrors the reference MTP target verify ({1, F+4}):
             // per-column masking is positional, the bound only caps the
             // kernel launch. Argmax runs inside the verify (one sync). 
@@ -1086,10 +1127,106 @@ public:
                     std::fprintf(stderr, "[vgraph] lane=%d F=%u action=%s\n", lane, F, act);
                 }
             };
-            if (vgraph_on && verify_seen_ && verify_exec_ != nullptr) {
+            // Row 20b: slots path forces eager (the table overload has no
+            // frozen graph yet) and binds the static per-lane column table.
+            const Tensor vcoltab(static_cast<char*>(mtp_coltab_store_.p) +
+                                     static_cast<std::size_t>(lane) * 16U,
+                                 DType::I32, {4, 1});
+            const Tensor* vcoltab_p = slots_on ? &vcoltab : nullptr;
+            // Row 20b oracle (NINFER_SLOT_ORACLE=1, debug only): legacy
+            // commit rows as the state oracle. presnap -> legacy verify(null)
+            // + target rows only (no refills: MTP untouched, zero residue) ->
+            // host snapA; restore -> slots verify(table) + commit-by-index ->
+            // host snapB; per-layer max-abs diff; restore for the real path.
+            // The real verify below re-runs (3rd execution, debug-only cost).
+            // Off during stream capture (WSL record-only: nothing executes
+            // under capture, so host waits/D2H inside would hang warmup).
+            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+            const bool capturing =
+                (cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess) &&
+                (cap_status != cudaStreamCaptureStatusNone);
+            if (slots_on && std::getenv("NINFER_SLOT_ORACLE") != nullptr && !capturing) {
+                std::fprintf(stderr, "[slot-oracle] enter F=%u lane=%d pool_layers=%u types=%u\n",
+                             F, lane, pool_->layer_count(),
+                             static_cast<std::uint32_t>(
+                                 parameters_.model.config().text.layer_types.size()));
+                pool_->copy_slot(lane, mtp_oracle_base_, stream);
+                card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
+                                           vhid, vlog, vtok);
+                device_.synchronize();
+                std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
+                std::int32_t o_targets[4] = {0, 0, 0, 0};
+                CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
+                                      cudaMemcpyDeviceToHost));
+                std::uint32_t aL = 0;
+                while (aL < kDrafts && host_drafts[aL] == o_targets[aL]) { ++aL; }
+                std::int32_t commitL[5];
+                commitL[0] = bonus;
+                for (std::uint32_t j = 0; j < aL; ++j) { commitL[1 + j] = host_drafts[j]; }
+                commitL[1 + aL] = o_targets[aL];
+                const std::uint32_t commit_lenL = (aL == kDrafts) ? 5 : aL + 2;
+                for (std::uint32_t j = 0; j < commit_lenL; ++j) {
+                    run_single_row(commitL[j], F + j, lane, lane, lane, hid1, log1, true);
+                }
+                const auto& o_types = parameters_.model.config().text.layer_types;
+                GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                std::fprintf(stderr, "[slot-oracle] snapA done (%u layers)\n",
+                             static_cast<std::uint32_t>(snapA.layers.size()));
+                pool_->copy_slot(mtp_oracle_base_, lane, stream);
+                card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
+                                           vhid, vlog, vtok, &vcoltab);
+                device_.synchronize();
+                std::fprintf(stderr, "[slot-oracle] slots verify done\n");
+                CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
+                                      cudaMemcpyDeviceToHost));
+                std::uint32_t aS = 0;
+                while (aS < kDrafts && host_drafts[aS] == o_targets[aS]) { ++aS; }
+                std::int32_t coltab_host_o[4];
+                coltab_host_o[0] = lane;
+                for (std::int32_t c = 1; c < 4; ++c) {
+                    coltab_host_o[c] =
+                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+                }
+                card_->commit_verify_slots(lane, coltab_host_o, aS, 4);
+                GdnSlotSnapshot snapB = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                std::fprintf(stderr,
+                             "[slot-oracle] snapB done (rec=%.1fMB conv=%.1fMB)\n",
+                             snapB.rec.size() * 4.0 / 1048576.0,
+                             snapB.conv.size() * 4.0 / 1048576.0);
+                float rec_worst = 0.0f, conv_worst = 0.0f;
+                std::uint32_t rec_L = 0, conv_L = 0;
+                for (std::size_t i = 0; i < snapA.layers.size(); ++i) {
+                    const std::size_t na = snapA.rec_off[i + 1 < snapA.rec_off.size()
+                                                             ? snapA.rec_off[i + 1]
+                                                             : snapA.rec.size()] -
+                                           snapA.rec_off[i];
+                    for (std::size_t j = 0; j < na; ++j) {
+                        float d = snapA.rec[snapA.rec_off[i] + j] - snapB.rec[snapB.rec_off[i] + j];
+                        if (d < 0) d = -d;
+                        if (d > rec_worst) { rec_worst = d; rec_L = snapA.layers[i]; }
+                    }
+                    const std::size_t ma =
+                        snapA.conv_off[i + 1 < snapA.conv_off.size() ? snapA.conv_off[i + 1]
+                                                                     : snapA.conv.size()] -
+                        snapA.conv_off[i];
+                    for (std::size_t j = 0; j < ma; ++j) {
+                        float d =
+                            snapA.conv[snapA.conv_off[i] + j] - snapB.conv[snapB.conv_off[i] + j];
+                        if (d < 0) d = -d;
+                        if (d > conv_worst) { conv_worst = d; conv_L = snapA.layers[i]; }
+                    }
+                }
+                std::fprintf(stderr,
+                             "[slot-oracle] F=%u a_leg=%u a_slot=%u %s rec_worst=%.4g@L%u "
+                             "conv_worst=%.4g@L%u\n",
+                             F, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
+                             conv_worst, conv_L);
+                pool_->copy_slot(mtp_oracle_base_, lane, stream);
+            }
+            if (vgraph_on && !slots_on && verify_seen_ && verify_exec_ != nullptr) {
                 CUDA_CHECK(cudaGraphLaunch(verify_exec_, stream));
                 vglog("replay");
-            } else if (vgraph_on && verify_seen_ && verify_exec_ == nullptr) {
+            } else if (vgraph_on && !slots_on && verify_seen_ && verify_exec_ == nullptr) {
                 cudaGraph_t vgraph = nullptr;
                 bool vok           = false;
                 if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) ==
@@ -1135,13 +1272,12 @@ public:
                 }
             } else {
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
-                                           vhid, vlog, vtok);
-                vglog(!vgraph_on ? "eager-disabled" : "eager-first");
+                                           vhid, vlog, vtok, vcoltab_p);
+                vglog(!vgraph_on ? "eager-disabled" : (slots_on ? "eager-slots" : "eager-first"));
             }
             // One sync for the whole window: hidden/logits/argmax for all
             // four columns enqueue before the host reads anything.
             device_.synchronize();
-            if (slots_on) card_->set_gdn_conv_dump(nullptr, 0);
             CUDA_CHECK(cudaMemcpy(host_targets, mbase + mtp_vtok_, sizeof(host_targets),
                                   cudaMemcpyDeviceToHost));
         }
@@ -1155,6 +1291,15 @@ public:
         while (accepted < kDrafts && host_drafts[accepted] == host_targets[accepted]) {
             ++accepted;
         }
+        // Fuzz by capping only (NINFER_MTP_MAX_ACCEPT, default 3): forced a =
+        // min(natural, target). Discarding accepted drafts is still correct
+        // output, so token-identity vs spec-off stays valid. Never raises.
+        if (const char* cap = std::getenv("NINFER_MTP_MAX_ACCEPT")) {
+            const long c = std::strtol(cap, nullptr, 10);
+            if (c >= 0 && accepted > static_cast<std::uint32_t>(c)) {
+                accepted = static_cast<std::uint32_t>(c);
+            }
+        }
         // Commit list: bonus + accepted drafts + (extra | correction).
         // Full run (a==3): out[3] is the extra bonus for slot F+4, commit
         // is [b, d0, d1, d2, out3] (5 tokens). Partial (a<3): out[a] is the
@@ -1167,6 +1312,33 @@ public:
         }
         commit[1 + accepted]       = host_targets[accepted];
         const std::uint32_t commit_len = (accepted == kDrafts) ? 5 : accepted + 2;
+        // Near-tie test (committee): top-2 logit gap of the deciding column
+        // (vcol a). Small gap at a divergence = allowed class; large gap =
+        // state bug. NINFER_MTP_LOGGAP=1, debug only (500KB D2H per step).
+        if (std::getenv("NINFER_MTP_LOGGAP") != nullptr) {
+            const std::size_t Vb =
+                static_cast<std::size_t>(text_vocab_);
+            std::vector<std::uint16_t> col(Vb);
+            CUDA_CHECK(cudaMemcpy(col.data(), mbase + mtp_vlog_ +
+                                                  static_cast<std::size_t>(accepted) * Vb * 2U,
+                                  Vb * 2U, cudaMemcpyDeviceToHost));
+            float top1 = -1e30f, top2 = -1e30f;
+            std::int32_t tok1 = -1;
+            for (std::size_t i = 0; i < Vb; ++i) {
+                std::uint32_t f = static_cast<std::uint32_t>(col[i]) << 16;
+                float v         = 0.0f;
+                std::memcpy(&v, &f, 4);
+                if (v > top1) {
+                    top2 = top1;
+                    top1 = v;
+                    tok1 = static_cast<std::int32_t>(i);
+                } else if (v > top2) {
+                    top2 = v;
+                }
+            }
+            std::fprintf(stderr, "[mtp-gap] F=%u a=%u tok=%d top=%.4g gap=%.4g\n", F, accepted,
+                         tok1, top1, top1 - top2);
+        }
         // Commit: replay the accepted rows lane-into-lane (GDN exact, KV
         // overwrite-identical) and refill the MTP KV rows they own. The MTP
         // refill follows bridge semantics (previous hidden + current token):
@@ -1175,9 +1347,20 @@ public:
         // holds the current row. Token/position/envelope are per-row: the
         // draft loop leaves tok_in/pos_t holding the LAST draft, and
         // re-running that would poison the prefix the next step drafts from.
+        //
+        // Row 20b slots path: the target rows are NOT re-run. Verify already
+        // wrote every accepted position (causal: hidden/logits/state for col
+        // j are final), so commit = (a) recurrent copy-back t[a-1]->lane
+        // (a>=1; a==0 already in place) + conv gather (ALWAYS — the lane
+        // window is pre-step, even a==0 appends x_0), (b) stage last-position
+        // hidden/logits from verify columns, (c) MTP refills only. Legacy
+        // rows stay as the state oracle (NINFER_SLOT_ORACLE) until deleted.
         CUDA_CHECK(cudaMemcpyAsync(mh[1].data, anchor_hid.data,
                                    static_cast<std::size_t>(hidden_) * 2U,
                                    cudaMemcpyDeviceToDevice, stream));
+        // slots_on lived in the verify block (now closed); re-derive here.
+        const bool slots_commit = std::getenv("NINFER_SLOTS") != nullptr;
+        if (!slots_commit) {
         for (std::uint32_t j = 0; j < commit_len; ++j) {
             run_single_row(commit[j], F + j, lane, lane, lane, hid1, log1, true);
             std::int32_t ctok = commit[j];
@@ -1193,6 +1376,57 @@ public:
                                        static_cast<std::size_t>(hidden_) * 2U,
                                        cudaMemcpyDeviceToDevice, stream));
         }
+        } else {
+            // (a) states: accept-a = t[a] (t[0]=lane: a==0 is a no-op).
+            // t[a] covers positions through F+a. The last commit token
+            // (out_a @ F+1+a) was only argmaxed, never executed, so the
+            // lane state is one position behind next_pos: (c) runs it as a
+            // single trailing M=1 row. One row instead of commit_len.
+            std::int32_t coltab_host[4];
+            coltab_host[0] = lane;
+            for (std::int32_t c = 1; c < 4; ++c) {
+                coltab_host[c] = mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+            }
+            card_->commit_verify_slots(lane, coltab_host, accepted, 4);
+            // (b) MTP refills for all but the last commit row: hidden of
+            // commit[j] is verify column min(j,a).
+            const char* vhid_base = mbase + mtp_vhid_;
+            for (std::uint32_t j = 0; j + 1 < commit_len; ++j) {
+                std::int32_t ctok = commit[j];
+                std::int32_t cpos = static_cast<std::int32_t>(F + j);
+                const ops::CausalAttentionExecutionEnvelope cenv{
+                    static_cast<std::uint32_t>(cpos + 1), static_cast<std::uint32_t>(cpos + 1)};
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ids_, &ctok, sizeof(ctok),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_pos_, &cpos, sizeof(cpos),
+                                           cudaMemcpyHostToDevice, stream));
+                card_->mtp_forward_batch(tok_in, mh[1], pos_t, cenv, mh[0], -1, nullptr, nullptr);
+                const std::uint32_t hj = (j < accepted) ? j : accepted;
+                CUDA_CHECK(cudaMemcpyAsync(mh[1].data,
+                                           vhid_base + static_cast<std::size_t>(hj) * hidden_ * 2U,
+                                           static_cast<std::size_t>(hidden_) * 2U,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+            // (c) trailing row: executes out_a, advancing lane state to
+            // F+commit_len-1. hid1/log1 come from the row (M=1 authoritative,
+            // exactly like legacy) for the stash + final refill below.
+            run_single_row(commit[commit_len - 1], F + commit_len - 1, lane, lane, lane, hid1,
+                           log1, true);
+            {
+                std::int32_t ctok = commit[commit_len - 1];
+                std::int32_t cpos = static_cast<std::int32_t>(F + commit_len - 1);
+                const ops::CausalAttentionExecutionEnvelope cenv{
+                    static_cast<std::uint32_t>(cpos + 1), static_cast<std::uint32_t>(cpos + 1)};
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ids_, &ctok, sizeof(ctok),
+                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_pos_, &cpos, sizeof(cpos),
+                                           cudaMemcpyHostToDevice, stream));
+                card_->mtp_forward_batch(tok_in, mh[1], pos_t, cenv, mh[0], -1, nullptr, nullptr);
+                CUDA_CHECK(cudaMemcpyAsync(mh[1].data, hid1.data,
+                                           static_cast<std::size_t>(hidden_) * 2U,
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+        }
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_store_.p) +
                                            static_cast<std::size_t>(lane) * hidden_ * 2U,
                                    hid1.data, static_cast<std::size_t>(hidden_) * 2U,
@@ -1205,6 +1439,12 @@ public:
         slot.anchor_valid      = true;
         slot.next_pos          = F + commit_len;
         slot.mtp_valid_pos     = slot.next_pos;
+        // Rejected positions must never become readable: both frontiers
+        // advance to the same accepted frontier, so nothing reads stale
+        // draft rows beyond it (fail-closed, both paths).
+        if (slot.mtp_valid_pos != slot.next_pos) {
+            throw std::logic_error("MTP commit left readable length past accept");
+        }
         slot.touched_as_prefill = false;
         runtime::StepDecodedPairs decoded;
         for (std::uint32_t j = 0; j < commit_len; ++j) {
@@ -1356,11 +1596,10 @@ private:
     // Row 20b layout B: base of the 4 column slots per lane (static tables,
     // init-filled once). -1 when MTP is off.
     std::int32_t mtp_column_base_ = -1;
-    // Row 20b: per-lane {4} I32 column-slot tables (device, init-filled) +
-    // per-layer {H,4} BF16 conv-input dump (device, written by Verify).
+    // Row 20b: per-lane {4} I32 column-slot tables (device, init-filled).
     DeviceBuffer mtp_coltab_store_;
-    DeviceBuffer mtp_convdump_store_;
-    std::size_t mtp_convdump_stride_ = 0;
+    // Row 20b oracle presnap slot (debug only). -1 when MTP is off.
+    std::int32_t mtp_oracle_base_ = -1;
     std::size_t mtp_ids_       = 0;
     std::size_t mtp_pos_       = 0;
     std::size_t mtp_row_       = 0;
