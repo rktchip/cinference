@@ -7,6 +7,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -16,6 +17,14 @@
 namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
+
+// Debug counter: physical KV pages materialized, process-wide. The oracle
+// prints it per step; a jump at one absolute F names a page-table event
+// (the restore covers GDN state, not the page table).
+inline std::atomic<std::uint64_t>& kv_page_materialize_total() {
+    static std::atomic<std::uint64_t> total{0};
+    return total;
+}
 
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {

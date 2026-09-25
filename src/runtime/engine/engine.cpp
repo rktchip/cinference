@@ -1686,7 +1686,7 @@ public:
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
                              "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
                              "tNaN=%.4f tVsA=%.4g@L%u copy=%.4g nanB=%llu/%llu "
-                             "vtarg=[%d %d %d %d]/[%d %d %d %d] %s\n",
+                             "vtarg=[%d %d %d %d]/[%d %d %d %d] %s pgpages=%llu\n",
                              F, lane, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
                              convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
@@ -1702,7 +1702,9 @@ public:
                               saved_targets_L[1] == o_targets[1] &&
                               saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])
                                  ? "VTARG-SAME"
-                                 : "VTARG-DIFF");
+                                 : "VTARG-DIFF",
+                             static_cast<unsigned long long>(
+                                 kv_page_materialize_total().load(std::memory_order_relaxed)));
                 // Off-GPU context dump (note 3b): conv-only singles for the
                 // lane-ahead analysis. Tags: pre (presnap), rst (post-restore
                 // lane), t1/t2/t3 (chain slots), sh0..sh3 (legacy what-ifs),

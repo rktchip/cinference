@@ -391,6 +391,7 @@ DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& res
     ++allocated_pages_;
     --reserved_pages_;
     --reservation.pages_;
+    kv_page_materialize_total().fetch_add(1, std::memory_order_relaxed);
     return DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]);
 }
 

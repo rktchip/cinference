@@ -5,9 +5,10 @@ port = sys.argv[1] if len(sys.argv) > 1 else "8902"
 tag = sys.argv[2] if len(sys.argv) > 2 else "run"
 ntok = int(sys.argv[3]) if len(sys.argv) > 3 else 40
 prompts = [
-    # F56 discriminator (prepend shifts absolute F): a split that stays at
-    # F56 is position-keyed; one that moves with content is content-driven.
-    "Yes. Write a short passage about a fox crossing a river at dawn. "
+    # F56 discriminator (prepend shifts absolute F): prepend length must be
+    # 0 mod 3 (grid is start+3k) so F56 stays visitable; verify from the
+    # req prompt-token count in the serve log, adjust once if needed.
+    "Yes indeed. Write a short passage about a fox crossing a river at dawn. "
     "Describe what it sees and hears in three sentences.",
     "Paris is the capital of France. Explain why the Eiffel Tower was "
     "built, who designed it, and when the construction finished.",
