@@ -190,7 +190,19 @@ but its post-col-0 content is absent from lane. Second, |X-A2| is
 two-regime: GDN layers 0-20 max 2.5-25.9 mean 0.26-2.2, layers 21+ at
 family noise (max<=0.25) — col-1 p is foreign in early layers only.
 Candidates: restore no-op (lane kept post-legacy-rows span), commit
-overshoot (presnap already ahead), col-0 dst miss. Decisive dump (this
+overshoot (presnap already ahead), col-0 dst miss. Race watch (layer
+split in X: foreign L0-20, noise L21+, worst always L0): error
+concentrated at low indices fits a writer working L0->L47 overlapping a
+read (next-col publish, trailing row, next-step verify) — but decode is
+single-stream (transfer stream is load-only) and snapshots fence on the
+compute stream, so a stream race needs a second writer to exist first.
+Alternative structural story: error attenuates at attention remix layers.
+Discriminators (cheap, in): transition-layer stability across two runs of
+the same binary (moves = timing, fixed = structural — note WHICH index),
+plus a sync-variant flag (full device sync before snapT/copy_slot; if X
+drops to noise it is ordering, then ask rig-vs-engine). A production-side
+race would be rare timing corruption the fuzz catches worst — hence the
+flag even though the steady-state path looks single-stream. Decisive dump (this
 build): presnap/rst/t1..t3/shadow+0..3/mid/full conv singles —
 pre[1:3]-vs-mid[0:2] checks presnap span, rst-vs-pre checks restore,
 t2-vs-full is span-matched, sh1[2]-vs-X tests M4-p identity.
