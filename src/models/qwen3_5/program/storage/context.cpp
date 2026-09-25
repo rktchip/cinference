@@ -1433,6 +1433,15 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
+    // Debug pre-reserve (allocation-causality control): map the full
+    // entitlement at first touch so no page allocates mid-sequence. If a
+    // position-keyed split disappears under this flag, mid-sequence
+    // allocation is the cause; if it persists, the jump was coincidental.
+    // Placed after the null check: sequence.kv must be valid here.
+    if (std::getenv("NINFER_PRE_RESERVE_PAGES") != nullptr) {
+        main_tokens = capacity;
+        if (sequence.kv->backend) { backend_tokens = capacity; }
+    }
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }

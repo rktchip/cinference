@@ -280,6 +280,9 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
 4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off. Drift bar:
    greedy output token-identical to spec-off; at any divergence log
    the top-2 logit gap (NINFER_MTP_LOGGAP), same as the cap verdicts.
+   Production-reach check: with lookahead W the page event recurs at
+   every 64k-W (56, 120, 184, ... for W=8). If the first divergence
+   lands on one of those positions, production has the bug too.
 5. Delete the rows (NINFER_SLOT_NOROWS becomes the only path).
 
 ## 11. Cost

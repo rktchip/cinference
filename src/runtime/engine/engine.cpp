@@ -1250,6 +1250,12 @@ public:
                 // Presnap window positions are [ring[-2], ring[-1], bonus].
                 static std::int32_t bonus_ring[4] = {0, 0, 0, 0};
                 static int bonus_n = 0;
+                // Page-alloc triple-sample (note 2 causality): which probe
+                // allocates. A jump enter->postleg = legacy probe allocated.
+                const std::uint64_t pg_enter =
+                    kv_page_materialize_total().load(std::memory_order_relaxed);
+                // Oracle-block scope (slots probe is outside rows_on).
+                std::uint64_t pg_postleg = 0;
                 // Presnap lane + spare + shadow: the legacy probe clobbers
                 // spare/shadow as ping/pong scratch, and the real path needs
                 // all three pristine.
@@ -1300,6 +1306,7 @@ public:
                 device_.synchronize();
                 std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
                 logit_top1("legacy");
+                pg_postleg = kv_page_materialize_total().load(std::memory_order_relaxed);
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
                 while (aL < kDrafts && host_drafts[aL] == o_targets[aL]) { ++aL; }
@@ -1686,7 +1693,7 @@ public:
                              "rec_mean=%.4g@L%u conv_worst=%.4g@L%u conv_mean=%.4g@L%u "
                              "convBPre=%.4g@L%u/%.4g@L%u recBPre=%.4g@L%u/%.4g@L%u "
                              "tNaN=%.4f tVsA=%.4g@L%u copy=%.4g nanB=%llu/%llu "
-                             "vtarg=[%d %d %d %d]/[%d %d %d %d] %s pgpages=%llu\n",
+                             "vtarg=[%d %d %d %d]/[%d %d %d %d] %s pgpages=%llu->%llu->%llu\n",
                              F, lane, aL, aS, (aL == aS ? "match" : "ACCEPT-DIFF"), rec_worst, rec_L,
                              rec_meanworst, rec_mL, conv_worst, conv_L, conv_meanworst, conv_mL,
                              convBPre_worst, convBPre_L, convBPre_meanworst, convBPre_mL,
@@ -1703,6 +1710,8 @@ public:
                               saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])
                                  ? "VTARG-SAME"
                                  : "VTARG-DIFF",
+                             static_cast<unsigned long long>(pg_enter),
+                             static_cast<unsigned long long>(pg_postleg),
                              static_cast<unsigned long long>(
                                  kv_page_materialize_total().load(std::memory_order_relaxed)));
                 // Off-GPU context dump (note 3b): conv-only singles for the
