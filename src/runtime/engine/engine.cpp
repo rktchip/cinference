@@ -1201,11 +1201,19 @@ public:
                 commitL[0] = bonus;
                 for (std::uint32_t j = 0; j < aL; ++j) { commitL[1 + j] = host_drafts[j]; }
                 commitL[1 + aL] = o_targets[aL];
+                const auto& o_types = parameters_.model.config().text.layer_types;
                 const std::uint32_t commit_lenL = (aL == kDrafts) ? 5 : aL + 2;
-                for (std::uint32_t j = 0; j < commit_lenL; ++j) {
+                for (std::uint32_t j = 0; j + 1 < commit_lenL; ++j) {
                     run_single_row(commitL[j], F + j, lane, lane, lane, hid1, log1, true);
                 }
-                const auto& o_types = parameters_.model.config().text.layer_types;
+                // Mid-span canonical window (span F+aL): matches t[aS] span
+                // for the off-GPU permutation test (note 3). The last legacy
+                // row runs after this snapshot.
+                GdnSlotSnapshot snapA_mid = snapshot_gdn_slot(pool_.get(), o_types, lane);
+                std::fprintf(stderr, "[slot-oracle] snapA_mid done (%u layers)\n",
+                             static_cast<std::uint32_t>(snapA_mid.layers.size()));
+                run_single_row(commitL[commit_lenL - 1], F + commit_lenL - 1, lane, lane, lane,
+                               hid1, log1, true);
                 GdnSlotSnapshot snapA = snapshot_gdn_slot(pool_.get(), o_types, lane);
                 std::int32_t saved_targets_L[4] = {o_targets[0], o_targets[1], o_targets[2],
                                                    o_targets[3]};
@@ -1460,6 +1468,38 @@ public:
                               saved_targets_L[2] == o_targets[2] && saved_targets_L[3] == o_targets[3])
                                  ? "VTARG-SAME"
                                  : "VTARG-DIFF");
+                // Off-GPU permutation test (note 3): dump chain window t[aS]
+                // and canonical mid-span window (same span F+a), first
+                // matching step only. Format: u32 nlayers; per layer: u32 L,
+                // u64 m, m floats T-chain, m floats A-canonical.
+                static bool win_dumped = false;
+                if (!win_dumped && haveT && aL == aS) {
+                    char wpath[128];
+                    std::snprintf(wpath, sizeof(wpath), "/root/oracle_win_F%u_a%u.bin", F, aS);
+                    FILE* wdf = std::fopen(wpath, "wb");
+                    if (wdf != nullptr) {
+                        const std::uint32_t wnl =
+                            static_cast<std::uint32_t>(snapA.layers.size());
+                        std::fwrite(&wnl, 4, 1, wdf);
+                        for (std::size_t wi = 0; wi < snapA.layers.size(); ++wi) {
+                            const std::uint32_t wL = snapA.layers[wi];
+                            const std::uint64_t wm =
+                                static_cast<std::uint64_t>(
+                                    ((wi + 1 < snapA.conv_off.size())
+                                         ? snapA.conv_off[wi + 1]
+                                         : snapA.conv.size()) -
+                                    snapA.conv_off[wi]);
+                            std::fwrite(&wL, 4, 1, wdf);
+                            std::fwrite(&wm, 8, 1, wdf);
+                            std::fwrite(snapT.conv.data() + snapA.conv_off[wi], 4, wm, wdf);
+                            std::fwrite(snapA_mid.conv.data() + snapA.conv_off[wi], 4, wm,
+                                        wdf);
+                        }
+                        std::fclose(wdf);
+                        std::fprintf(stderr, "[slot-oracle] window dump %s done\n", wpath);
+                        win_dumped = true;
+                    }
+                }
                 pool_->copy_slot(mtp_oracle_base_, lane, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 1, o_spare, stream);
                 pool_->copy_slot(mtp_oracle_base_ + 2, o_shadow, stream);

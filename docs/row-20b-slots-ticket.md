@@ -180,6 +180,20 @@ cols). If the accepted slot shows tNaN < 1.0 AND cols == 192/192, the
 branch wrote the slot from the right source and suspect 2 is dead on
 evidence. tNaN == 1.0 alone stays ambiguous (ran-but-missing vs
 never-ran) — the counter separates them.
+NARROWED (layout-convention class): VTARG-SAME + tNaN=0 rules out
+chained-stale (col-1 logits would move) and shifted-base (col 2 reads
+t[1]; an offset its read doesn't share breaks its logits). What survives
+is a layout the chain shares with itself but not the engine: time order
+or channels×time vs time×channels inside the window. Fits every number
+(full write, exact VTARG, wholesale conv error at activation scale,
+clean recurrent except through the trailing row) and explains the timing
+(legacy never copied a snapshot slot into the lane). Test: off-GPU
+permutation on dumped t[a] vs canonical mid-span window at the same span
+F+a — identity (baseline), time flip, ±1 shifts; a match within family
+noise names the fix side (publish vs copy-back conversion).
+Pre-registered profile: wrong at EVERY accept incl a=0 and full accept
+(col 0 publishes into the lane in the same layout) — the cap sweep is
+post-fix verification, not diagnosis.
 Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
 writes — the suspect line (gdn_conv.cuh publish address) is inside
 verify's kernel. "Verify exonerated" means logits only.
