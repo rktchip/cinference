@@ -1235,6 +1235,37 @@ public:
                                            vhid, vlog, vtok);
                 device_.synchronize();
                 std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
+                // Per-side logit top-1 (F56 discriminator): read back vlog
+                // col c on the host and argmax it. top1[c]!=vtok[c] names a
+                // write/index bug; top1 differing between sides at c names
+                // input/state at c. Both probes share every input tensor, so
+                // any split lands in exactly one of those two bins.
+                auto logit_top1 = [&](const char* side) {
+                    std::int32_t top1[4] = {-1, -1, -1, -1};
+                    for (int c = 0; c < 4; ++c) {
+                        std::vector<std::uint16_t> col(
+                            static_cast<std::size_t>(text_vocab_));
+                        CUDA_CHECK(cudaMemcpy(col.data(), mbase + mtp_vlog_ +
+                                                              static_cast<std::size_t>(c) *
+                                                                  text_vocab_ * 2U,
+                                              col.size() * 2U, cudaMemcpyDeviceToHost));
+                        float best = -1e30f;
+                        for (std::uint32_t v = 0; v < text_vocab_; ++v) {
+                            const std::uint32_t b = col[v];
+                            float f;
+                            if ((b & 0x7FFF) == 0) {
+                                f = 0.0f;
+                            } else {
+                                std::uint32_t u = (static_cast<std::uint32_t>(b) << 16);
+                                std::memcpy(&f, &u, 4);
+                            }
+                            if (f > best) { best = f; top1[c] = static_cast<std::int32_t>(v); }
+                        }
+                    }
+                    std::fprintf(stderr, "[slot-oracle] %s logits top1=[%d %d %d %d]\n",
+                                 side, top1[0], top1[1], top1[2], top1[3]);
+                };
+                logit_top1("legacy");
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
                 while (aL < kDrafts && host_drafts[aL] == o_targets[aL]) { ++aL; }
@@ -1386,6 +1417,7 @@ public:
                                            vhid, vlog, vtok, &vcoltab);
                 device_.synchronize();
                 std::fprintf(stderr, "[slot-oracle] slots verify done\n");
+                logit_top1("slots");
                 const std::uint64_t pulse_conv =
                     models::qwen3_5::execution::g_coltab_conv_cols.load();
                 const std::uint64_t pulse_rec =

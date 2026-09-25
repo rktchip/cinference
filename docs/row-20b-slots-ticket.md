@@ -122,6 +122,11 @@ tolerance AND verified near-tie on re-decode (log position, logits, delta).
 Anything else = fail, stop, no perf bands. (Byte-identical vs today is
 explicitly NOT required: today = m==1 gemv_plain family, verify = M=4
 family, bits differ on first full accept.)
+Oracle ACCEPT-DIFF bar: with bit-exact verify paths and identical inputs,
+a_leg must equal a_slot on EVERY step — count splits as failures, not
+skips; the per-run bar is zero. The span guard rightly refuses the state
+comparison, which is exactly why accept-level bugs are invisible to the
+state oracle: report the split rate and direction every run.
 
 First gate (before ANY perf numbers):
 - Slot the CONV state, not just recurrent. Each slot needs its own conv
