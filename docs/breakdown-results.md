@@ -177,7 +177,16 @@ per-layer verify.layer.*); ordinary rows share the layer ranges.
   BLOCKER independent of 20b (20b doesn't touch TTFT): at 1.5ms/tok saved
   it takes ~1000 tokens to earn back. Filed with numbers.
 
-## Conc SM-busy (both servers, nsys) + amended bars/order
+## TTFT diagnostic (committee item 2a — CLOSED, fix scoped)
+
+Prompt-length scaling on MTP server (8 gen tokens each):
+p66 → 2.2s, p120 → 3.3s, p228 → 6.2s, p444 → 11.8s.
+Linear at ~27ms/prompt-token (intercept ~0.4s) vs spec-off warm ~3ms/tok.
+9×, strictly linear ⇒ MTP prefill runs token-by-token (the "mirror
+prefill slices one row at a time" path, engine.cpp:1197+).
+FIX: batch MTP prefill into one M=N pass (mirror all rows, single
+batched MTP forward). Scoped ticket to write; likely cheaper than 20b,
+blocks ship regardless (~1000 tokens to earn back 1.5s at 12.8).
 
 Spec-off conc-2 (/root/conc2-off, makespan 2.19): ZERO gemv — all m16
 GEMMs (b4 med 42.7µs, b3 med 54µs). EXL3 ≈ 1.52s / 2.19s wall = ~70%
@@ -192,7 +201,27 @@ Verdict: committee flag resolved as graphs+math, not driver. Multi-seq
 graphs (± conc-aware MTP gating = fix-5) are the aggregate lever after
 all — row 17 "polish" verdict REVERSED, pending 20b + easy-fix order.
 
-## Next (in order — committee amended)
+## Ship math correction (post-20b tokens — committee, folded pre-build)
+
+The +1 extrapolated bonus token rides on a commit row that 20b DELETES.
+Post-20b E = mean(accepted) + 1 (not +2):
+
+- Pooled 2.82 → 36/2.82 = 12.4–12.8: MISSES 12.2 alone. Needs on-device
+  accept (gaps gone) and/or small-m to ship.
+- PARIS 2.12 → ~17: LOSES to off under 20b alone → adaptive gate (~2.5
+  rolling E → off path) is a SHIP REQUIREMENT, not optional. Gate safe
+  only once the MTP off-branch is graphed (same ticket).
+- PRIME ~3.67 → ~9.7 ✓. CODELOW 3.90 → ~9.1 ✓.
+- Small-m kernel now REQUIRED to ship: step ~21ms → 7.4 pooled, ~10 PARIS.
+- 23ms unattributed wall (86 wall-derived vs 63 buckets): likely host/sync
+  on commit rows, dies with 20b — confirm during build (compare host-gap
+  fraction pre/post on same prompt).
+- TTFT interleaved (small, parallel): launch-count-vs-prompt-length test;
+  if MTP prefill is token-by-token, batch to one M=N pass. Likely cheaper
+  than 20b. Blocks ship regardless (~1000 tokens to earn back 1.5s).
+- PARIS carries the veto alone (CODELOW is highest-accept) — add one
+  genuinely low-accept prompt. k=4 untested (histogram caps at accept-3):
+  20b k-parametric covers it; run k=4 before fixing slot count.
 
 Ship bar (prediction ≠ bar): decode ≤12.2 on high-accept regimes; TTFT at
 parity with off (BLOCKER until fixed); PARIS no worse than off; conc guard
