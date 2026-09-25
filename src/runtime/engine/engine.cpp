@@ -43,15 +43,21 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer {
-namespace {
-
 // Row 20b pulse counters (defined in text.cpp): per-column executions of
 // the coltab branches. Declared here to read + reset from the oracle.
-namespace models::qwen3_5::execution {
+namespace ninfer {
+namespace models {
+namespace qwen3_5 {
+namespace execution {
 extern std::atomic<std::uint64_t> g_coltab_conv_cols;
 extern std::atomic<std::uint64_t> g_coltab_rec_cols;
-} // namespace models::qwen3_5::execution
+}  // namespace execution
+}  // namespace qwen3_5
+}  // namespace models
+}  // namespace ninfer
+
+namespace ninfer {
+namespace {
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
