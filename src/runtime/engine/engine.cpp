@@ -445,18 +445,17 @@ public:
             mtp_enabled_ ? mtp_kv_.get() : nullptr);
         envelope_ = ops::CausalAttentionExecutionEnvelope{1, max_context_};
         {
-            // Parked default-off: checkpoint 5 failed (capture-step eager
-            // execution does not land; dry-run proves the layers-only method
-            // correct and replays bit-exact). Opt back in with
-            // NINFER_SERVE_GRAPH=1|verbose|dry for the next probe.
+            // Tier 0 (2026-09-25): default ON. NINFER_SERVE_GRAPH=0 opts out;
+            // =verbose/=dry keep their diagnose modes. Spec-off dec/M=1 seam
+            // is gated !mtp (graph_eligible); MTP keeps draft/bonus eager by
+            // construction and the ver/M=4 seam stays on under this flag.
             const char* graph_env = std::getenv("NINFER_SERVE_GRAPH");
-            const std::string graph_mode(graph_env != nullptr ? graph_env : "");
-            graphs_enabled_ = (graph_mode == "1" || graph_mode == "verbose" || graph_mode == "dry");
+            const std::string graph_mode(graph_env != nullptr ? graph_env : "1");
+            graphs_enabled_ = (graph_mode != "0");
             graph_verbose_  = (graph_mode == "verbose");
             graph_dry_      = (graph_mode == "dry");
             if (graph_dry_) {
-                graphs_enabled_ = true;
-                graph_verbose_  = true;
+                graph_verbose_ = true;
             }
         }
         {

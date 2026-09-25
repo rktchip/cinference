@@ -2,18 +2,17 @@
 
 # Cinference
 
-> **Current contract (2026-09-23, commit `66ae8c7`).** EXL3 Qwen 3.8 27B
-> serve on one RTX 5090: default context/KV **8192**, max concurrency
-> **8 seqs**, spec **off**, graphs **off**, `CUDA_EXL3_AUTOTUNE=0` +
-> `CUDA_EXL3_SPLIT_TARGET=0` required. Measured serve: **~30 ms/token**
-> solo spec-off (~33 tok/s). Gate: two-curl T=0 **Paris / Rome**, 24/24.
-> Decode rate 2026-09-24 (FOX-64 streaming, excl tok1): spec-off eager
-> **~27–30 ms/tok**; spec-off **GRAPH=1 ~14 ms/tok** after warmup
-> (replay-only; TTFT unchanged). Product path unchanged (graphs
-> default-off) until spec-on is graph-safe. Tradeoff on the record:
-> GRAPH=1 doubles spec-off decode; MTP forces graphs off (spec-on
-> stays eager) — so default-on would silently de-graph MTP users.
-> Flipping the default is a product call, deferred.
+> **Current contract (2026-09-25, Tier 0).** EXL3 Qwen 3.8 27B serve on one
+> RTX 5090: default context/KV **8192**, max concurrency **8 seqs**, spec
+> **off**, graphs **ON by default** (`NINFER_SERVE_GRAPH=0` opts out),
+> `CUDA_EXL3_AUTOTUNE=0` + `CUDA_EXL3_SPLIT_TARGET=0` required. Measured
+> serve, no env vars: spec-off **~14 ms/tok** (FOX-64 streaming, excl tok1,
+> replay after warmup; TTFT unchanged; 8/8 matrix green default-on);
+> spec-on MTP **~35 ms/tok** (verify graphed under the same flag,
+> drafts/bonus/commit rows eager; frozen Paris 6511/314/9338/369 accept-3).
+> Old eager numbers (GRAPH=0): spec-off ~27–30, spec-on ~39. No 180: that
+> band needs spec that beats one weight pass plus DFlash/graphs
+> we do not have. Gate: two-curl T=0 **Paris / Rome**, 24/24.
 > 262k context is a future planner + compressed-KV project, not a flag.
 > MTP target is decode-only **window 3** (not MTP-10). Numbers from other
 > artifacts (NVFP4 tables, scratch microbench projections, HyperQwen
