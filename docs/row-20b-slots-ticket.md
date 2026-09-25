@@ -260,7 +260,24 @@ Report median of 3 + range every cell. Low-accept veto blocks ship.
 - Any host round-trip / copy / replay on accept path in profile → kill.
 - Revert bands → revert, no second session.
 
-## 10. Cost
+## 10. Execution queue (no step skipped, rows die last)
+
+The oracle's per-step diff is isolated by construction: the block ends
+by restoring lane/spare/shadow from the presnap, so snapA-vs-snapB
+never sees compounding — even though the real path does carry
+slots-committed state forward. Isolated-step correctness is not
+trajectory correctness. Both long checks run slots-only, oracle OFF:
+
+1. Caps profile (per-layer floors + accept shape; oracle on).
+2. Verify on replay (slots path; static table makes it capturable).
+3. Mirrored ABCCBA S1 (slots / legacy / off / off / legacy / slots,
+   same binary, start+end stamps).
+4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off. Drift bar:
+   greedy output token-identical to spec-off; at any divergence log
+   the top-2 logit gap (NINFER_MTP_LOGGAP), same as the cap verdicts.
+5. Delete the rows (NINFER_SLOT_NOROWS becomes the only path).
+
+## 11. Cost
 
 One GPU session, serial. Correctness first (8/8), then metronome bands.
 No parallel sweeps, no tuning loop. Needs 5090 release.
