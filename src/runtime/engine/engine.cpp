@@ -1182,64 +1182,13 @@ public:
                              F, lane, pool_->layer_count(),
                              static_cast<std::uint32_t>(
                                  parameters_.model.config().text.layer_types.size()));
-                // Bonus ring (note 1 token-ID check): last 4 step-input IDs.
-                // Presnap window positions are [ring[-2], ring[-1], bonus].
-                static std::int32_t bonus_ring[4] = {0, 0, 0, 0};
-                static int bonus_n = 0;
-                // Presnap lane + spare + shadow: the legacy probe clobbers
-                // spare/shadow as ping/pong scratch, and the real path needs
-                // all three pristine.
-                const std::int32_t o_spare  = spare_slot_;
-                const std::int32_t o_shadow = mtp_shadow_base_ + lane;
-                pool_->copy_slot(lane, mtp_oracle_base_, stream);
-                pool_->copy_slot(o_spare, mtp_oracle_base_ + 1, stream);
-                pool_->copy_slot(o_shadow, mtp_oracle_base_ + 2, stream);
-                // Entry gap: |lane-spare| must be ~0 (spare synced above).
-                {
-                    const auto& e_types = parameters_.model.config().text.layer_types;
-                    GdnSlotSnapshot eL  = snapshot_gdn_slot(pool_.get(), e_types, lane, stream);
-                    GdnSlotSnapshot eS  = snapshot_gdn_slot(pool_.get(), e_types, o_spare, stream);
-                    float egap = 0.0f;
-                    for (std::size_t k = 0; k < eL.rec.size(); ++k) {
-                        float d = eL.rec[k] - eS.rec[k];
-                        if (d < 0) d = -d;
-                        if (d > egap) egap = d;
-                    }
-                    std::fprintf(stderr, "[slot-oracle] entry F=%u |lane-spare|=%.4g\n", F,
-                                 egap);
-                }
-                // Discriminator 1: snapshot the pre-step window itself. After
-                // the slots commit, convB-vs-Pre == 0 means the lane conv was
-                // never written (dst binding missing); != 0 but != convB-vs-A
-                // means written with wrong values (chaining/init).
-                GdnSlotSnapshot snapPre = snapshot_gdn_slot(
-                    pool_.get(), parameters_.model.config().text.layer_types, mtp_oracle_base_,
-                    stream);
-                std::fprintf(stderr, "[slot-oracle] snapPre done (%u layers)\n",
-                             static_cast<std::uint32_t>(snapPre.layers.size()));
-                // Note 3 (rows behind a flag): the legacy rows stay until the
-                // first valid S1; NINFER_SLOT_NOROWS skips them after. The
-                // slots verify below always runs (pulse + slots targets).
-                const bool rows_on = (std::getenv("NINFER_SLOT_NOROWS") == nullptr);
-                bool legacy_ok = false;
-                std::int32_t o_targets[4] = {0, 0, 0, 0};
-                std::uint32_t aL = 0;
-                const auto& o_types = parameters_.model.config().text.layer_types;
-                GdnSlotSnapshot snapA_mid;
-                GdnSlotSnapshot snapA;
-                GdnSlotSnapshot snapSH[4];
-                GdnSlotSnapshot snapR;
-                std::int32_t saved_targets_L[4] = {0, 0, 0, 0};
-                if (rows_on) {
-                card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
-                                           vhid, vlog, vtok);
-                device_.synchronize();
-                std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
                 // Per-side logit top-1 (F56 discriminator): read back vlog
                 // col c on the host and argmax it. top1[c]!=vtok[c] names a
                 // write/index bug; top1 differing between sides at c names
                 // input/state at c. Both probes share every input tensor, so
                 // any split lands in exactly one of those two bins.
+                // Oracle-block scope: legacy probe is inside rows_on, slots
+                // probe is outside it (NOROWS runs slots-only).
                 auto logit_top1 = [&](const char* side) {
                     std::int32_t top1[4] = {-1, -1, -1, -1};
                     float gap[4] = {0, 0, 0, 0};
@@ -1297,6 +1246,59 @@ public:
                                  gap[2], gap[3], maxdiff[0], maxdiff[1], maxdiff[2],
                                  maxdiff[3]);
                 };
+                // Bonus ring (note 1 token-ID check): last 4 step-input IDs.
+                // Presnap window positions are [ring[-2], ring[-1], bonus].
+                static std::int32_t bonus_ring[4] = {0, 0, 0, 0};
+                static int bonus_n = 0;
+                // Presnap lane + spare + shadow: the legacy probe clobbers
+                // spare/shadow as ping/pong scratch, and the real path needs
+                // all three pristine.
+                const std::int32_t o_spare  = spare_slot_;
+                const std::int32_t o_shadow = mtp_shadow_base_ + lane;
+                pool_->copy_slot(lane, mtp_oracle_base_, stream);
+                pool_->copy_slot(o_spare, mtp_oracle_base_ + 1, stream);
+                pool_->copy_slot(o_shadow, mtp_oracle_base_ + 2, stream);
+                // Entry gap: |lane-spare| must be ~0 (spare synced above).
+                {
+                    const auto& e_types = parameters_.model.config().text.layer_types;
+                    GdnSlotSnapshot eL  = snapshot_gdn_slot(pool_.get(), e_types, lane, stream);
+                    GdnSlotSnapshot eS  = snapshot_gdn_slot(pool_.get(), e_types, o_spare, stream);
+                    float egap = 0.0f;
+                    for (std::size_t k = 0; k < eL.rec.size(); ++k) {
+                        float d = eL.rec[k] - eS.rec[k];
+                        if (d < 0) d = -d;
+                        if (d > egap) egap = d;
+                    }
+                    std::fprintf(stderr, "[slot-oracle] entry F=%u |lane-spare|=%.4g\n", F,
+                                 egap);
+                }
+                // Discriminator 1: snapshot the pre-step window itself. After
+                // the slots commit, convB-vs-Pre == 0 means the lane conv was
+                // never written (dst binding missing); != 0 but != convB-vs-A
+                // means written with wrong values (chaining/init).
+                GdnSlotSnapshot snapPre = snapshot_gdn_slot(
+                    pool_.get(), parameters_.model.config().text.layer_types, mtp_oracle_base_,
+                    stream);
+                std::fprintf(stderr, "[slot-oracle] snapPre done (%u layers)\n",
+                             static_cast<std::uint32_t>(snapPre.layers.size()));
+                // Note 3 (rows behind a flag): the legacy rows stay until the
+                // first valid S1; NINFER_SLOT_NOROWS skips them after. The
+                // slots verify below always runs (pulse + slots targets).
+                const bool rows_on = (std::getenv("NINFER_SLOT_NOROWS") == nullptr);
+                bool legacy_ok = false;
+                std::int32_t o_targets[4] = {0, 0, 0, 0};
+                std::uint32_t aL = 0;
+                const auto& o_types = parameters_.model.config().text.layer_types;
+                GdnSlotSnapshot snapA_mid;
+                GdnSlotSnapshot snapA;
+                GdnSlotSnapshot snapSH[4];
+                GdnSlotSnapshot snapR;
+                std::int32_t saved_targets_L[4] = {0, 0, 0, 0};
+                if (rows_on) {
+                card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
+                                           vhid, vlog, vtok);
+                device_.synchronize();
+                std::fprintf(stderr, "[slot-oracle] legacy verify done\n");
                 logit_top1("legacy");
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),
                                       cudaMemcpyDeviceToHost));
