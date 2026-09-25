@@ -18,7 +18,35 @@ commit by index instead. "Replay diverged suffix" also read backwards:
 after restore-to-pre-step you replay the accepted prefix, not the rejected
 suffix. 20b fixes the wording by removing the path entirely.
 
-## 3. Design: slots-first
+## 3. Design: slots-first + layout (named explicitly)
+
+Slot count: verify has k+1 columns (bonus + k drafts); every accept
+outcome a ∈ 0..k needs the state after column a = k+1 states. Two valid
+layouts (off-by-one breaks exactly one accept value — fuzz accept-0..3
+FIRST):
+- (A) Source slot + k+1 output slots.
+- (B) Column 0 updates the lane IN PLACE + k slots. Safe: the bonus comes
+  from real target logits and is always kept.
+Layout (B) is the first cut (fewer slots, no lane move on the common path).
+
+Slot mapping: COPY-BACK first cut. After accept a: copy slot[a] (or lane
+itself under layout B for a=0) back into the fixed lane address. One
+state read + one write per step (~0.2ms at ~150MB state, ~1% of a 21ms
+step). No graph invalidation (spec-off graph, off-branch graph, commit
+exec all keep capturing against the fixed lane address). Rotating slots
+with an on-device indirection table (Phase A "F as data" rule) is the
+later optimization, NOT this ticket.
+Conv state: if gdn_input_proj_conv_snapshot can't write per-column
+destinations, DON'T block — rebuild the window after accept with a tiny
+gather: window after column a = last (kernel−1) pre-step inputs followed
+by x_0..x_a, all resident from verify. No per-column conv output needed.
+
+## 3b. Split build (committee order — bisect safety)
+
+Off-branch graphing lands + gates FIRST (independent): MTP-server conc-2
+must match spec-off (≈2.2s band), 58% penalty gone. THEN slots +
+commit-by-index against the known-good off path. Fuzz failure then
+bisects one change, not two.
 
 ### 3.1 Verify is causal, hidden/logits already correct
 

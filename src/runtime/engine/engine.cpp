@@ -1417,7 +1417,12 @@ public:
     }
 
     bool graph_eligible(std::size_t n_pref, std::size_t n_dec) const {
-        return graphs_enabled_ && !mtp_enabled_ && n_pref == 0 && n_dec == 1;
+        // Off-branch graphing (row 20b split 1): ordinary single-token
+        // decodes may graph even with MTP enabled. MTP steps never reach
+        // here (step() dispatches them to step_mtp_decode first), and the
+        // ordinary path never touches MTP rows/slots — so the !mtp gate
+        // only served to keep the MTP server's off-branch eager (the 58%).
+        return graphs_enabled_ && n_pref == 0 && n_dec == 1;
     }
 
     ServeDecodeGraph* graph_for_lane(int lane) {
@@ -1491,7 +1496,7 @@ public:
         const bool shape_ok = (n_pref == 0 && n_dec == 1 && T == 1);
         int lane = -1;
         bool seen = false;
-        if (shape_ok && graphs_enabled_ && !mtp_enabled_) {
+        if (shape_ok && graphs_enabled_) {
             lane = row_slot[n_pref];
             seen = std::find(graph_seen_lanes_.begin(), graph_seen_lanes_.end(), lane) !=
                    graph_seen_lanes_.end();
