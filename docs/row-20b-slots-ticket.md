@@ -57,7 +57,7 @@ Buffers (lane slots + one spare/shadow) allocated once at init, fixed
 addresses. Slot selection by stable index, never realloc/pointer chase.
 Assert alloc-once in code and move on.
 
-## 7. Correctness bar (8/8 required)
+## 7. Correctness bar (8/8 required) + first-gate checklist (classic misses)
 
 Greedy token sequences spec-ON must be identical to spec-OFF on: Paris,
 FOX, Rome, plus low-accept prompt (code/numbers, hostile to drafter).
@@ -66,6 +66,21 @@ tolerance AND verified near-tie on re-decode (log position, logits, delta).
 Anything else = fail, stop, no perf bands. (Byte-identical vs today is
 explicitly NOT required: today = m==1 gemv_plain family, verify = M=4
 family, bits differ on first full accept.)
+
+First gate (before ANY perf numbers):
+- Slot the CONV state, not just recurrent. Each slot needs its own conv
+  window. Wrong here doesn't crash — slow quality drift hundreds of toks
+  in, past the 8/8 matrix. Run a 500+ tok continuation and diff vs
+  spec-off, don't trust 8/8 alone.
+- Rewind the MTP layer's own cache on partial accepts. Draft positions
+  write into it — length must reset to accepted position, like target
+  attention layers.
+- Force accept-0 through accept-3 in fuzz FIRST. Slot-selected state vs
+  today's commit-row state within tolerance (not byte-identical); greedy
+  output token-identical to spec-off on Paris.
+- Rejected positions never readable: target attention length == accepted
+  position after every step. Stale draft KV beyond is harmless ONLY if
+  nothing reads past that length (assert it, don't assume it).
 
 ## 8. Perf bands (filled)
 

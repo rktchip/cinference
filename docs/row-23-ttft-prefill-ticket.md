@@ -13,11 +13,19 @@ Source: mtp_prefill_fill (engine.cpp:1213+) runs ordinary_decode_batch
 
 ## Fix (two rungs)
 
-Rung 1 (cheap, this ticket): reuse prefill hiddens. The ordinary prefill
-JUST computed every row's target hidden batched — slice per-row hidden
-from prefill output instead of re-running ordinary_decode_batch per row.
-Per-row cost drops to MTP-forward-only (~1-2ms). TTFT ≈ 0.3 + N×0.002
-(p66 → ~0.45s). MTP KV still warms sequentially (GDN trajectory exact).
+Rung 1 (stepping stone, this ticket): reuse prefill hiddens. The ordinary
+prefill JUST computed every row's target hidden batched — slice per-row
+hidden from prefill output instead of re-running ordinary_decode_batch
+per row. Per-row cost drops to MTP-forward-only (~1-2ms). TTFT ≈ 0.3 +
+N×0.002 (p66 → ~0.45s). MTP KV still warms sequentially (GDN trajectory
+exact). NOTE: rung-1 still scales linearly (~5.3ms/ptok sequential MTP
+warming): p2k would add ~10.6s, p8k ~42s. It canNOT satisfy the bar alone.
+Rung 2 (REQUIRED to ship): one batched M=N pass through the MTP layer.
+All inputs (target hiddens + next-token embeddings) are known once target
+prefill finishes; skip lm_head/logits during warming (nothing reads them).
+A few ms total, prompt-length-independent.
+Bar (amended): TTFT parity at REALISTIC length (p2k or longer) with
+explicit tolerance (state it: e.g. within 2× off warm at p2k), not p66.
 Bar: TTFT within 2× of spec-off warm on p66/p128; Paris/FOX outputs
 byte-identical vs today; 8/8 untouched.
 
