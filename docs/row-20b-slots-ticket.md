@@ -194,6 +194,10 @@ noise names the fix side (publish vs copy-back conversion).
 Pre-registered profile: wrong at EVERY accept incl a=0 and full accept
 (col 0 publishes into the lane in the same layout) — the cap sweep is
 post-fix verification, not diagnosis.
+No-match clause: if no candidate (identity/flip/transpose/transpose-flip/
+shifts) lands within family noise AND the 3x3 time matrix plus segment
+matrix show no mapping, the layout class itself is wrong — write that
+into this ticket and reopen the investigation (do not add more guesses).
 Terminology: VTARG-SAME cleared verify's LOGITS only, not its snapshot
 writes — the suspect line (gdn_conv.cuh publish address) is inside
 verify's kernel. "Verify exonerated" means logits only.
