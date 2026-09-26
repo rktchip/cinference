@@ -1294,6 +1294,143 @@
     "/root/Soff.ref",
     "/root/Son.ref"
    ]
+  },
+  {
+   "id": "S9_verify_replay",
+   "status": "SEALED_2026_09_26",
+   "gate": "bit-exact R==E char-for-char (Rgate vs mtpdet); replay live (36 replay-slots)",
+   "legs": {
+    "E1": {
+     "bin": "detsplitk",
+     "sha": "9e3847ebdc650675",
+     "steps": 106,
+     "decode_s": 5.5,
+     "ms_per_step": 51.9,
+     "regimes": {
+      "fox": [
+       15.57,
+       15.19
+      ],
+      "paris": [
+       12.81,
+       12.94
+      ],
+      "city": [
+       13.2,
+       13.88
+      ]
+     },
+     "loadclk": 2486
+    },
+    "R1": {
+     "bin": "verify-8a1c90c",
+     "sha": "a99b41e93b033df5",
+     "steps": 106,
+     "decode_s": 3.8,
+     "ms_per_step": 35.85,
+     "regimes": {
+      "fox": [
+       10.1,
+       10.17
+      ],
+      "paris": [
+       8.82,
+       9.0
+      ],
+      "city": [
+       8.89,
+       9.0
+      ]
+     },
+     "loadclk": 2326
+    },
+    "R2": {
+     "bin": "verify-8a1c90c",
+     "sha": "a99b41e93b033df5",
+     "steps": 106,
+     "decode_s": 3.8,
+     "ms_per_step": 35.85,
+     "regimes": {
+      "fox": [
+       10.35,
+       10.37
+      ],
+      "paris": [
+       9.09,
+       9.09
+      ],
+      "city": [
+       9.0,
+       9.08
+      ]
+     },
+     "loadclk": 2427
+    },
+    "E2": {
+     "bin": "detsplitk",
+     "sha": "9e3847ebdc650675",
+     "steps": 106,
+     "decode_s": 5.7,
+     "ms_per_step": 53.8,
+     "regimes": {
+      "fox": [
+       15.6,
+       16.13
+      ],
+      "paris": [
+       13.49,
+       13.25
+      ],
+      "city": [
+       13.21,
+       13.21
+      ]
+     },
+     "loadclk": 2485
+    },
+    "E3": {
+     "bin": "detsplitk",
+     "sha": "9e3847ebdc650675",
+     "steps": 106,
+     "decode_s": 5.5,
+     "ms_per_step": 51.9,
+     "regimes": {
+      "fox": [
+       15.95,
+       14.11
+      ],
+      "paris": [
+       13.92,
+       12.37
+      ],
+      "city": [
+       12.7,
+       13.9
+      ]
+     },
+     "loadclk": 2485
+    }
+   },
+   "mirrored_ms_per_step": {
+    "E": 51.9,
+    "R": 35.85,
+    "delta": -16.05,
+    "pct": -30.9
+   },
+   "prediction_check": "predicted ~38; measured 35.85 (BEATS by ~2); kill bar -10 cleared by 6",
+   "same_binary": "R1/R2 0.0%%; E1/E3 0.0%%; E2 +3.7%% one-off noise (uniform, clocks steady)",
+   "regime_avg_ms_per_tok": {
+    "MTP_R": 9.41,
+    "specoff_same_session": 13.19,
+    "delta_pct": -28.7
+   },
+   "fox_only": {
+    "MTP_R": 10.25,
+    "specoff": 13.22
+   },
+   "relative_bar_15pct": "CLEARED (-28.7%% avg, -22.5%% FOX)",
+   "open_flag": "MTP TTFT 1.0-1.2s vs spec-off 0.1-0.3s - TTFT parity NOT met, investigate",
+   "stamps": "pre all legs nproc=0; post Soff9 SEALED drift=0%%"
   }
  ],
  "map36_8a_verdict": {
