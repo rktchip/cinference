@@ -309,14 +309,18 @@ width-1 gdn_projection_snapshot per GDN layer vs legacy's ONE width-4.
 Projection is a matmul: slots re-reads projection weights up to 4x per
 verify (less what L2 holds across back-to-back calls). Layout B needs
 per-column slots only for STATE (conv window + recurrent), not the
-projection. SPLIT (original 20b mapping, not a hoisted GEMM): legacy's single
-width-4 gdn_projection_snapshot already walks the four columns inside
-the kernel (spare/shadow ping-pong) — pass it the static column table
-so column c publishes to t[c] instead of alternating. One launch,
-legacy's exact projection, no scratch round-trip for x. Consequence:
-bit-exact parity returns BY CONSTRUCTION on this route (same kernel);
-a hoisted standalone GEMM would land ~2 ULP again and the check would
-stay "diff ≤ floor", not zero.
+projection. SPLIT (layout A, 20b mapping — NOT a hoisted GEMM, NOT layout B):
+the kernel already publishes column c to base+c (gdn_conv.cuh:20), but
+t-slots are NOT consecutive (bases: lane 0, cols 17+), so base+c can't
+reach them. Publish all four columns into one consecutive 4-slot block
+(extend the column block to 17-20, same shape as legacy's shadow block
+9-12), then copy slot[a] back into the lane at every accept value,
+INCLUDING a=0 (conv runs every step; lane holds the pre-step window).
+Cost: one extra slot per lane + ~0.2 ms copy on a=0 steps. Gain: one
+width-4 launch with legacy's exact kernel, bit-exact parity BY
+CONSTRUCTION (same kernel — a hoisted standalone GEMM would land ~2
+ULP and keep the check at "diff ≤ floor"), and a lane never written
+during verify. S1 pre-split = "slots-eager" label stands.
 
 SLOTS DONE (release reviewer — four bars, then stop, no new oracle
 features, F56 closed):
@@ -348,7 +352,12 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
    own measured deltas. Every arm runs FOX + PARIS (ship bar needs PARIS
    no-worse-than-off; one extra prompt now beats a re-baselined session
    later) and logs [mtp-step] accepts + tokens (NINFER_MTP_DEBUG=1) so
-   the accept histogram travels with ms/tok.
+   the accept histogram travels with ms/tok. Debug-cost control: the
+   s1A-nodbg run is VOID (old client counted 3/64 tokens, old binary) —
+   rerun debug-off on the S1 binary with the fixed client and require
+   on-vs-off < 0.1% before using the numbers. TTFT rule (S2 note): every
+   TTFT reading travels with its prompt-token count (req line), since
+   template + thinking tokens move the slope.
 4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off. Drift bar:
    greedy output token-identical to spec-off; at any divergence log
    the top-2 logit gap (NINFER_MTP_LOGGAP), same as the cap verdicts.
