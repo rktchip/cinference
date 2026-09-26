@@ -1,6 +1,10 @@
 import re, sys
+from collections import Counter
 logpath = sys.argv[1] if len(sys.argv) > 1 else "/root/s1A.log"
 names = sys.argv[2:]
+HIST = "--hist" in names
+if HIST:
+    names.remove("--hist")
 log = open(logpath, errors="replace").read().splitlines()
 steps = []
 for line in log:
@@ -21,3 +25,5 @@ for i, t in enumerate(sel):
     toks = sum(n for _, _, n in t)
     print("%s: steps=%d tokens=%d tok/step=%.2f mean-a=%.2f" %
           (name, len(t), toks, toks / len(t), sum(acc) / len(acc)))
+    if HIST:
+        print("   hist=%s" % dict(sorted(Counter(acc).items())))
