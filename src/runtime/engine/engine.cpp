@@ -1483,16 +1483,15 @@ public:
                     }
                 }
                 std::int32_t coltab_host_o[4];
-                coltab_host_o[0] = lane;
-                for (std::int32_t c = 1; c < 4; ++c) {
+                for (std::int32_t c = 0; c < 4; ++c) {
                     coltab_host_o[c] =
-                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
                 }
                 // Sentinel readback: snapshot t[aS] before copy-back. NaN
-                // here = the write to t[aS] never happened (note 1). At
-                // aS==0 there is no slot write (col 0 in place); skip.
+                // here = the write to t[aS] never happened (note 1). Layout
+                // A writes t[0] too, so snapshot at every accept incl 0.
                 GdnSlotSnapshot snapT;
-                const bool haveT = (aS >= 1);
+                const bool haveT = true;
                 if (haveT) {
                     snapT = snapshot_gdn_slot(pool_.get(), o_types, coltab_host_o[aS], stream);
                     std::fprintf(stderr, "[slot-oracle] snapT done (slot %d)\n",
@@ -1902,13 +1901,14 @@ public:
         // draft loop leaves tok_in/pos_t holding the LAST draft, and
         // re-running that would poison the prefix the next step drafts from.
         //
-        // Row 20b slots path: the target rows are NOT re-run. Verify already
-        // wrote every accepted position (causal: hidden/logits/state for col
-        // j are final), so commit = (a) recurrent copy-back t[a-1]->lane
-        // (a>=1; a==0 already in place) + conv gather (ALWAYS — the lane
-        // window is pre-step, even a==0 appends x_0), (b) stage last-position
-        // hidden/logits from verify columns, (c) MTP refills only. Legacy
-        // rows stay as the state oracle (NINFER_SLOT_ORACLE) until deleted.
+        // Row 20b slots path (layout A): the target rows are NOT re-run.
+        // Verify wrote every accepted position into the consecutive block
+        // (causal: hidden/logits/state for col j are final), so commit =
+        // (a) copy-back slot[a]->lane at EVERY accept incl a==0 (the lane
+        // holds the pre-step window and is never written during verify) +
+        // conv runs every step, (b) stage last-position hidden/logits from
+        // verify columns, (c) MTP refills only. Legacy rows stay as the
+        // state oracle (NINFER_SLOT_ORACLE) until deleted.
         CUDA_CHECK(cudaMemcpyAsync(mh[1].data, anchor_hid.data,
                                    static_cast<std::size_t>(hidden_) * 2U,
                                    cudaMemcpyDeviceToDevice, stream));
@@ -1931,15 +1931,14 @@ public:
                                        cudaMemcpyDeviceToDevice, stream));
         }
         } else {
-            // (a) states: accept-a = t[a] (t[0]=lane: a==0 is a no-op).
-            // t[a] covers positions through F+a. The last commit token
-            // (out_a @ F+1+a) was only argmaxed, never executed, so the
-            // lane state is one position behind next_pos: (c) runs it as a
-            // single trailing M=1 row. One row instead of commit_len.
+            // (a) states: accept-a = t[a] in the consecutive column block.
+            // The last commit token (out_a @ F+1+a) was only argmaxed, never
+            // executed, so the lane state is one position behind next_pos:
+            // (c) runs it as a single trailing M=1 row. One row instead of
+            // commit_len.
             std::int32_t coltab_host[4];
-            coltab_host[0] = lane;
-            for (std::int32_t c = 1; c < 4; ++c) {
-                coltab_host[c] = mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+            for (std::int32_t c = 0; c < 4; ++c) {
+                coltab_host[c] = mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
             }
             card_->commit_verify_slots(lane, coltab_host, accepted, 4);
             // (b) MTP refills for all but the last commit row: hidden of

@@ -358,9 +358,16 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
    on-vs-off < 0.1% before using the numbers. TTFT rule (S2 note): every
    TTFT reading travels with its prompt-token count (req line), since
    template + thinking tokens move the slope.
-4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off. Drift bar:
-   greedy output token-identical to spec-off; at any divergence log
-   the top-2 logit gap (NINFER_MTP_LOGGAP), same as the cap verdicts.
+4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off — ON THE SPLIT
+   BINARY (e28cacb's job ends at the pre-split S1 baseline; the split
+   changes verify + commit, and the split is what ships). Short
+   re-verification on the split binary first: fenced warmup oracle with
+   NULL-OK, then caps 0 and 3, then 8/8 plus drift once on the final
+   binary. Drift bar: greedy output token-identical to spec-off; at any
+   divergence log the top-2 logit gap (NINFER_MTP_LOGGAP), same as the
+   cap verdicts. FREE STRONG CHECK on the split binary: both probes now
+   run the same width-4 projection, so the inter-probe logit diff must
+   read exactly 0 — any nonzero means the route diverged from legacy's.
    Production-reach check: with lookahead W the page event recurs at
    every 64k-W (56, 120, 184, ... for W=8). If the first divergence
    lands on one of those positions, production has the bug too.
