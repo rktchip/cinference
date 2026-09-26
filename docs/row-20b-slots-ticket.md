@@ -304,6 +304,34 @@ Report median of 3 + range every cell. Low-accept veto blocks ship.
 
 ## 10. Execution queue (no step skipped, rows die last)
 
+SPEED FINDING (kernel reviewer, 2026-09-25): slots verify runs FOUR
+width-1 gdn_projection_snapshot per GDN layer vs legacy's ONE width-4.
+Projection is a matmul: slots re-reads projection weights up to 4x per
+verify (less what L2 holds across back-to-back calls). Layout B needs
+per-column slots only for STATE (conv window + recurrent), not the
+projection. SPLIT: one width-4 projection -> x for all four columns,
+then the per-column conv/recurrent chain publishing slots (no weight
+reads in the chain). Expect: verify ms down (measure one layer: 4x
+width-1 vs 1x width-4, expect a few ms/step); projection interdiff ->
+0, so the zero-diff standing check RETURNS (this time on the
+projection side, by construction). Small-m speeds that width-4 later;
+width-1 would bypass it. S1 runs BEFORE the split, then again after;
+the delta is a real S-number moving.
+
+SLOTS DONE (release reviewer — four bars, then stop, no new oracle
+features, F56 closed):
+1. A stamped S1 exists (ABCCBA, same binary).
+2. The 8/8 matrix passes.
+3. PARIS-500 drift clean (divergences only at ties in the 2-ULP margin).
+4. The legacy rows are deleted.
+
+OVERLAP (one GPU: code while the GPU measures):
+- GPU 1 (now): queue item 2 (verify on replay) -> S1 ABCCBA
+  (slots/legacy/off) + 8/8 + drift + spec-off nsys per-kernel breakdown.
+- CODE (parallel, no GPU): the projection split above + row-23 rung-2.
+- GPU 2 (after split lands): S1 post-split, S2 p2k/p32k, S3 sweep.
+- ANYTIME (no GPU): S4 llama.cpp Q6_K baseline on this 5090.
+
 The oracle's per-step diff is isolated by construction: the block ends
 by restoring lane/spare/shadow from the presnap, so snapA-vs-snapB
 never sees compounding — even though the real path does carry
