@@ -6,6 +6,7 @@ port = sys.argv[1] if len(sys.argv) > 1 else "8902"
 tag = sys.argv[2] if len(sys.argv) > 2 else "s1"
 ntok = int(sys.argv[3]) if len(sys.argv) > 3 else 64
 reps = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+exe_sha = sys.argv[5] if len(sys.argv) > 5 else "unstamped"
 PROMPTS = [
     ("fox", "Write a short passage about a fox crossing a river at dawn. "
      "Describe what it sees and hears in three sentences."),
@@ -15,7 +16,7 @@ PROMPTS = [
      "its history, one about its architecture, and one about its food."),
 ]
 HASHES = {n: hashlib.sha1(p.encode()).hexdigest()[:12] for n, p in PROMPTS}
-print("%s PROMPTS %s" % (tag, " ".join("%s=%s" % (n, HASHES[n]) for n, _ in PROMPTS)),
+print("%s PROMPTS %s EXE=%s" % (tag, " ".join("%s=%s" % (n, HASHES[n]) for n, _ in PROMPTS), exe_sha),
       flush=True)
 for name, prompt in PROMPTS:
     for r in range(reps):
