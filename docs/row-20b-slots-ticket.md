@@ -332,6 +332,14 @@ features, F56 closed):
 OVERLAP (one GPU: code while the GPU measures):
 - GPU 1 (now): queue item 2 (verify on replay) -> S1 ABCCBA
   (slots/legacy/off) + 8/8 + drift + spec-off nsys per-kernel breakdown.
+  CAPTURE SCHEDULING: the node-traced rep runs AFTER arm C's timing reps,
+  same lifetime (perturbation must not land inside C's numbers). The small
+  thermal blip ahead of the mirror arms is the accepted trade for capturing
+  now instead of after the sequence. If a second-half B/A arm differs from
+  its first-half counterpart beyond noise, the capture blip is suspect #1.
+  OVERLAP: as soon as capture buckets rank, the fusion or GEMV branch starts
+  from pre-staged work while arms C/B/A run. Only the GEMV bench waits for
+  the full sequence (thermal symmetry).
 - CODE (parallel, no GPU): the projection split above + row-23 rung-2.
 - GPU 2 (after split lands): S1 post-split, S2 p2k/p32k, S3 sweep.
 - ANYTIME (no GPU): S4 llama.cpp Q6_K baseline on this 5090.
