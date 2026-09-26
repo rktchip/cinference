@@ -580,6 +580,15 @@ int pick_bm(int m)
 int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_mult = 1)
 {
     if (!allowed) return 1;
+    // Deterministic path: NINFER_EXL3_FORCE_SPLIT1=1 forces split=1, removing
+    // the cross-block atomic accumulation whose completion order varies
+    // run-to-run (fp non-associativity -> ULP noise -> 0.125-gap argmax flips
+    // in MTP verify at m<=4). Default off: zero behavior change.
+    static const bool force1 = [] {
+        const char* e = exl3_env("NINFER_EXL3_FORCE_SPLIT1");
+        return e && *e && *e != '0';
+    }();
+    if (force1) return 1;
     const int sms = exl3_dev_sms();
 
     long long blocks = (long long) (n / BN_) * ((m + bm - 1) / bm);
