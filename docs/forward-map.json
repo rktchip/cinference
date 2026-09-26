@@ -1160,6 +1160,32 @@
    "rule": "step-9 timing runs WITHOUT NINFER_EXL3_FORCE_SPLIT1 (split-1 carries the verify occupancy cliff: kv m4 8 vs ~88 blocks; slots-vs-legacy must not compare a handicapped verify)",
    "split1_gate": "verify-only tool (5x determinism proof), never for timing",
    "true_fix": "deterministic split-K with occupancy preserved (per-split partials + ordered reduce or equivalent), background write-only; step 9 uses it only if built + verified by then, else runs flag-free with noted nondeterminism (tie-class, bimodal flips)"
+  },
+  {
+   "id": "host_pipe_verdict",
+   "status": "PARKED_KILLED_AS_BUILT",
+   "branch": "host-pipe",
+   "branch_tip": "afc77ef",
+   "binaries": {
+    "pipe_off_graphed_A1": {
+     "sha": "50a69f3",
+     "ms_tok": "13.14-13.22"
+    },
+    "eager_legacy_GRAPH0": {
+     "sha": "fix1",
+     "ms_tok": "27.3-29.2"
+    },
+    "eager_pipe_B1": {
+     "sha": "7a35f785e2b8f4c8",
+     "ms_tok": "25.5-27.7"
+    }
+   },
+   "mechanism": "pipe removes ~2ms host idle on eager base but bypasses graph replay (~15ms)",
+   "kill_rule": "saves <0.5ms vs graphed -> KILL as built",
+   "fix_forward": "capture pipe body (forward+sample+D2D+D2H+event) into per-lane graph; parked",
+   "bugfix": "eligibility deref of device serve_sampling_ -> host mirror (afc77ef)",
+   "side_finding": "spec-off tie-flip pre-exists on e28cacb (5/6, char-127); exact gates need split-K + spec-off noise work",
+   "next": "small-shape concurrency inside graphed body (order #2)"
   }
  ]
 }
