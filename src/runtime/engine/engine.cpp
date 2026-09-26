@@ -296,9 +296,11 @@ public:
         spare_slot_ = mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) : -1;
         mtp_shadow_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 : -1;
-        // Row 20b layout B: 4 column slots per lane (k<=4 parametric; k=3
-        // uses the first 3). Static under copy-back: col c>=1 always writes
-        // column_base_[lane]+c-1, so tables are init-filled once, never rebuilt.
+        // Row 20b layout A: 4 consecutive column slots per lane (k<=4
+        // parametric; k=3 uses the first 3... width-4 snapshot publishes
+        // col c -> block+c, commit copies slot[a] -> lane every accept.
+        // Static: block base per lane never changes, tables init-filled
+        // once, never rebuilt.
         mtp_column_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 + static_cast<std::int32_t>(max_seqs_) : -1;
         // Row 20b oracle: three presnap slots (lane + spare + shadow: the
@@ -489,18 +491,18 @@ public:
             DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
-        // Row 20b layout B: static per-lane column-slot tables, init-filled
-        // once: t[0]=lane (col-0 writes the lane in place), t[1..3]=column
-        // slots. Lane ids never change, so no per-step rebuild, no H2D.
+        // Row 20b layout A: static per-lane column-slot tables, init-filled
+        // once: t[c] = column block, 4 consecutive slots per lane. The
+        // width-4 snapshot kernel publishes col c -> base+c, then commit
+        // copies slot[a] -> lane (every accept incl a=0). Lane ids never
+        // change, so no per-step rebuild, no H2D.
         if (mtp_enabled_) {
             mtp_coltab_store_ = DeviceBuffer(static_cast<std::size_t>(max_seqs_) * 4U * 4U);
             std::vector<std::int32_t> coltab(static_cast<std::size_t>(max_seqs_) * 4U);
             for (std::uint32_t lane = 0; lane < max_seqs_; ++lane) {
-                coltab[static_cast<std::size_t>(lane) * 4U + 0] =
-                    static_cast<std::int32_t>(lane);
-                for (std::int32_t c = 1; c < 4; ++c)
+                for (std::int32_t c = 0; c < 4; ++c)
                     coltab[static_cast<std::size_t>(lane) * 4U + static_cast<std::size_t>(c)] =
-                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + (c - 1);
+                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
             }
             CUDA_CHECK(cudaMemcpy(mtp_coltab_store_.p, coltab.data(), coltab.size() * 4U,
                                   cudaMemcpyHostToDevice));
@@ -1437,8 +1439,11 @@ public:
                     std::fprintf(stderr, "[slot-oracle] prestine |lane-pre|=%.4g %s\n",
                                  pworst, pworst == 0.0f ? "PRESTINE-OK" : "PRESTINE-DIFF");
                 }
-                // Pulse reset: the slots verify below should execute 192/192
-                // conv/rec column calls (48 GDN layers x 4). Zero = legacy.
+                // Pulse reset: the slots verify below should execute 48 conv
+                // (one width-4 launch/layer, layout A) + 192 rec (4 chained
+                // width-1/layer).
+                // conv column launches (48 GDN layers x 1, layout A) +
+                // rec column calls (48 x 4 chained width-1). Zero = legacy.
                 models::qwen3_5::execution::g_coltab_conv_cols.store(0);
                 models::qwen3_5::execution::g_coltab_rec_cols.store(0);
                 // Sentinel (note 1): NaN-fill column slots t[1..3] (rec+conv)
@@ -1464,7 +1469,7 @@ public:
                 const std::uint64_t pulse_rec =
                     models::qwen3_5::execution::g_coltab_rec_cols.load();
                 std::fprintf(stderr,
-                             "[slot-oracle] pulse cols conv=%llu rec=%llu (expect 192/192)\n",
+                             "[slot-oracle] pulse cols conv=%llu rec=%llu (expect 48/192)\n",
                              static_cast<unsigned long long>(pulse_conv),
                              static_cast<unsigned long long>(pulse_rec));
                 CUDA_CHECK(cudaMemcpy(o_targets, mbase + mtp_vtok_, sizeof(o_targets),

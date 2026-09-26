@@ -304,11 +304,10 @@ void TextContext::commit_verify_slots(std::int32_t lane, const std::int32_t* col
         accepted > static_cast<std::uint32_t>(width - 1)) {
         throw std::invalid_argument("commit_verify_slots: bad lane/table/shape");
     }
-    // Accept-a state is t[a]; t[0]=lane so a==0 is a no-op (col 0 already
-    // wrote the lane in place, recurrent and conv together). a>=1 copies the
-    // whole slot (conv window + recurrent) — each column slot holds the
-    // exact post-column state from the real width-1 kernels.
-    if (accepted == 0) { return; }
+    // Layout A: accept-a state is t[a] in the consecutive column block;
+    // copy it back into the lane at EVERY accept value, including a==0
+    // (the lane holds the pre-step window; conv runs every step, so the
+    // lane is never written during verify).
     const std::int32_t src = col_slots[accepted];
     if (src < 0 || src >= state_.slot_count()) {
         throw std::invalid_argument("commit_verify_slots: column slot OOB");
@@ -1581,29 +1580,17 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
         } else if (coltab_verify != nullptr) {
-            // Row 20b: one width-1 snapshot per column with chained slots —
-            // col c reads (c==0 ? source : t[c-1]) and writes t[c]. Each
-            // width-1 call shifts exactly one input into the window, so t[c]
-            // holds the exact post-column-c conv window from the real kernel
-            // (no gather math, no projection replication). q/k/v/z outputs
-            // are sliced per column; valid is a batch mask (shared).
-            for (std::int32_t c = 0; c < width; ++c) {
-                Tensor h_c = projection_input.slice(1, c, 1);
-                Tensor q_c = query_output.slice(1, c, 1);
-                Tensor k_c = key_output.slice(1, c, 1);
-                Tensor v_c = value_output.slice(1, c, 1);
-                Tensor z_c = gate_output.slice(1, c, 1);
-                Tensor dst_c = coltab_verify->slice(0, c, 1);
-                const Tensor* init_c = (c == 0) ? active_linear_state_source_slots_ : nullptr;
-                Tensor init_tmp;
-                if (c > 0) {
-                    init_tmp = coltab_verify->slice(0, c - 1, 1);
-                    init_c   = &init_tmp;
-                }
-                gdn_projection_snapshot(h_c, p, *config_.gdn, conv_states, valid, *init_c, dst_c,
-                                        q_c, k_c, v_c, z_c, work_, s);
-                g_coltab_conv_cols.fetch_add(1, std::memory_order_relaxed);
-            }
+            // Row 20b layout A: ONE width-4 snapshot. The kernel publishes
+            // col c -> base+c internally (same kernel as legacy), so base =
+            // t[0] lands every column in its own consecutive block slot.
+            // q/k/v/z come out width-4 directly; no per-column slicing, no
+            // weight re-reads. The recurrent chain below still walks the
+            // block column by column (it needs per-column state).
+            Tensor dst_base = coltab_verify->slice(0, 0, 1);
+            gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
+                                    *active_linear_state_source_slots_, dst_base, query_output,
+                                    key_output, value_output, gate_output, work_, s);
+            g_coltab_conv_cols.fetch_add(1, std::memory_order_relaxed);
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
