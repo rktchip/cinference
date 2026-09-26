@@ -20,7 +20,8 @@ for name, prompt in CANDS:
     b = json.dumps({
         "model": "exl3:Qwen3.8-27B-EXL3-3.5bpw",
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": ntok, "temperature": 0, "stream": True}).encode()
+        "max_tokens": ntok, "temperature": 0, "stream": True,
+        "enable_thinking": False}).encode()
     req = urllib.request.Request(
         "http://127.0.0.1:%s/v1/chat/completions" % port,
         data=b, headers={"Content-Type": "application/json"})

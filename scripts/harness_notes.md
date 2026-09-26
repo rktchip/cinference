@@ -22,6 +22,17 @@ Durable rig-debug facts. These apply to every future gate, not one ticket.
   Default queue timeout is too short for oracle-slowed steps (~1s+/step
   with 3 verifies + host snapshots).
 
+## Liveness probe (loud-or-nothing)
+
+- A check that declares a server dead must fail LOUDLY when it cannot
+  tell. 2026-09-25: a bare `pgrep -f` failed silently (tool stderr
+  hidden) and a live server was declared dead, spawning a false crash
+  item. Never trust pgrep alone.
+- Loud probe: `ps aux | grep "[n]infer-serve"` (shows the line or
+  nothing, visibly) AND `/proc/<pid>/exe` readlink AND a socket check
+  (`curl /health`). If any leg is ambiguous, the verdict is UNKNOWN —
+  never "dead". A "dead" verdict requires all three legs to agree.
+
 ## gdb recipe (WSL)
 
 gdb -batch -ex run -ex bt --args ./apps/ninfer-serve <model> [flags] \

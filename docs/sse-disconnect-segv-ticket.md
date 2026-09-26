@@ -36,24 +36,22 @@ memory). Add a cancel-mid-stream regression test: abandon a request
 after N chunks, follow with a clean request, assert the server survives
 (scripts/cancel_repro.py already drives exactly this).
 
-## Second crash (2026-09-25, different signature — NOT the same path)
+## Second crash (2026-09-25) — CLOSED 2026-09-25, was the FIRST SSE crash
 
-- S1 arm-A server (e28cacb, slots-eager, `--pending-timeout-ms 600000`,
-  15 clean sequential reqs, no 503, no cancel) died after going idle:
-  WSL dmesg `fatal signal 11`, no FATAL, and NO crash-handler trace in
-  the serve log (handler printed for both earlier crashes).
-- Dead process's CUDA context stuck unreclaimed (31.5 GB held, compute
-  app `[Not Found]`): WSL did not release VRAM on this death. Next
-  server cannot start until it frees; if it sticks, only `wsl --shutdown`
-  reclaims (kills builds + downloads too).
-- Consequence for S1: /proc pin impossible (process gone AND build dir
-  already relinked to the split). Arms B-F run a fresh e28cacb rebuild
-  (isolated worktree, same flags/toolchain); S-lines stamp exe sha256 +
-  build dir. Speed-risk of the rebuild is argued nil (Release, identical
-  codegen inputs; only path strings differ) — recorded, not hidden.
-- The idle-death itself is open: no trigger identified (no cancel, no
-  timeout, handler silent). If it repeats on arms B-F, it becomes its own
-  ticket ahead of the SSE one.
+- WSL dmesg `fatal signal 11` at boot+9298.33s = 17:35:51, matching the
+  mtpA SSE crash to the second (req#1 503 at 17:35:50, crash after).
+  The "idle death" never happened: PID 1110 was alive the whole time
+  (idle in accept()); the pgrep probe failed silently and the conclusion
+  was wrong. Correction kept in the record.
+- Handler hardening (sigaltstack + SA_ONSTACK) stays — it was a real gap
+  regardless. Stats-reporter chase dropped: no crash, no suspect.
+- Liveness-probe rule (scripts/harness_notes.md): a check that declares
+  a server dead must fail LOUDLY when it cannot tell (never trust a bare
+  pgrep with stderr hidden; confirm via /proc/PID/exe + a socket check).
+- S1 consequence: pin RECOVERED (/root/ninfer-serve-e28cacb,
+  sha256 e71d9919c21d0e1c99235da832bfdc02bd0ed627559ca1656e0e8f61ab1d4605);
+  all six arms run from that file with the sha stamped per S-line. The
+  worktree rebuild is a spare.
 
 ## Workaround (gates only, hides nothing)
 
