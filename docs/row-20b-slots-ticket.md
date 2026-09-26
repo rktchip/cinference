@@ -348,8 +348,14 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
    same binary, start+end stamps). Arm A label: "slots-eager" — 260d6cf
    runs slots verify eager (item 2 never landed; replay branch requires
    !slots_on), so arm A measures slots + eager-verify tax vs legacy's
-   replayed verify. Replay and the projection split then read as their
-   own measured deltas. Every arm runs FOX + PARIS (ship bar needs PARIS
+   replayed verify. ARM A RESULT (e28cacb, slots-eager, server-canonical
+   counts): FOX decode ~19.2 ms/tok (TTFT 2.0-2.3s @ prompt 75, tok/step
+   3.56, mean a 1.5); PARIS decode ~16.6 ms/tok (TTFT 2.1s @ prompt 77,
+   tok/step 3.88, mean a 1.9). NO INVERSION: PARIS accepted more this
+   run, so it's faster/tok; step time reconciles (FOX 19.2x3.56=68ms vs
+   PARIS 16.6x3.88=64ms). Canonical counting = SERVER output counts for
+   all six arms (client undercounts ~3% via chunk coalescing; same client
+   everywhere, server numbers in the record). Every arm runs FOX + PARIS (ship bar needs PARIS
    no-worse-than-off; one extra prompt now beats a re-baselined session
    later) and logs [mtp-step] accepts + tokens (NINFER_MTP_DEBUG=1) so
    the accept histogram travels with ms/tok. Debug-cost control: the
