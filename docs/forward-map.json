@@ -1212,6 +1212,75 @@
    "step9_caveat": "replay must cover GDN layers (45 ranges in span); check probe branch",
    "split_in_binary": "8b6ff35 ancestor of det-splitk HEAD; exe 9e3847ebdc650675",
    "trace": "/root/slotsmtp_node.nsys-rep + /root/slotsmtp.sqlite, drift 0%"
+  },
+  {
+   "id": "S_split_ABBA",
+   "status": "SEALED_2026_09_26",
+   "metric": "ms/step = sum(wall-ttft)/serve-mtp-line-delta, script 3 regimes x2 reps",
+   "legs": {
+    "A1": {
+     "bin": "/root/ninfer-serve-e28cacb",
+     "sha": "e71d9919c21d0e1c",
+     "steps": 109,
+     "decode_s": 7.0,
+     "ms_per_step": 64.2,
+     "fox": [
+      22.12,
+      20.06
+     ],
+     "loadclk": 2497
+    },
+    "B1": {
+     "bin": "/root/ninfer-serve-detsplitk-528b29e",
+     "sha": "9e3847ebdc650675",
+     "steps": 106,
+     "decode_s": 5.5,
+     "ms_per_step": 51.9,
+     "fox": [
+      14.94,
+      17.15
+     ],
+     "loadclk": 2419
+    },
+    "B2": {
+     "bin": "/root/ninfer-serve-detsplitk-528b29e",
+     "sha": "9e3847ebdc650675",
+     "steps": 105,
+     "decode_s": 5.6,
+     "ms_per_step": 53.3,
+     "fox": [
+      14.61,
+      14.19
+     ],
+     "loadclk": 2421
+    },
+    "A2": {
+     "bin": "/root/ninfer-serve-e28cacb",
+     "sha": "e71d9919c21d0e1c",
+     "steps": 103,
+     "decode_s": 7.3,
+     "ms_per_step": 70.9,
+     "fox": [
+      19.63,
+      20.56
+     ],
+     "loadclk": 2498
+    }
+   },
+   "mirrored_ms_per_step": {
+    "A": 67.6,
+    "B": 52.6,
+    "delta": -14.95,
+    "pct": -22.1
+   },
+   "fox_only_ms_per_tok": {
+    "A": 20.59,
+    "B": 15.22
+   },
+   "prediction_check": "predicted 62.5 -> ~45 (save ~17.5); measured 67.6 -> 52.6 (save ~15.0)",
+   "stamps": "pre all 4 legs nproc=0 no-spill; post live A2 SEALED drift=0%%; A1/B1/B2 posts lost (bad post chain + servers down) - documented",
+   "identity": "explicit sha256 per binary file + launcher paths; preflight HASH tracks pinned exe only, NOT leg binding",
+   "caveat": "B binary delta = split-K + dormant det scaffolding (flag off); attribution to split is conservative"
   }
  ],
  "map36_8a_verdict": {
