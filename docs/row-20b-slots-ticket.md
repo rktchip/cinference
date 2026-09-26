@@ -127,10 +127,24 @@ slots top1 279 (draft, accepted) gap 0.0, inter-side max-abs-diff 0.125
 (one bf16 ULP), prestine-OK, positions 1-3 bit-identical. Verdict:
 genuine sub-ULP near-tie flipped by probe-side rounding noise (Rome
 class), not input/state. Gap series: tiny gaps also at F37/F52
-(matched) — not F56-specific. Interdiff series: 0.125 at every step,
-every column, both prompts — constant 1-ULP probe offset (Rome class),
-so the flip needs gap < 0.125, nothing position-keyed. Run C (prepend)
-stays as the direct test.
+(matched) — not F56-specific. Interdiff series: 0.125 max-abs-diff at
+every step, every column, both prompts. That max is over the whole
+vocabulary, not an offset on the top two: each logit can move ±1 ULP
+independently, so a top-2 margin can shift by up to 2 ULP (0.25 here;
+more where top logits exceed 32 and 1 ULP = 0.25). F37/F52 held partly
+by luck. Future accept-rate comparisons budget 2 ULP on the margin,
+scaled to top-logit magnitude. Rome confirmation: one solo (single-lane)
+request must read interdiff exactly 0 (warmup was bit-exact single-seq).
+If solo still reads 0.125, the source isn't lane batching — suspect
+eager vs graph replay — and that must be known before small-m changes
+numerics again. SOLO RESULT (2026-09-25, req#4 alone on idle server):
+interdiff still 0.125-0.875, not 0 — lane batching RULED OUT. Prime
+suspect confirmed by mechanism: legacy probe replays its verify graph
+while slots probe runs verify eager (queue item 2 open), a systematic
+numerics-family difference, constant ~1 ULP everywhere. Prediction:
+queue item 2 (verify back on replay for slots) drives interdiff to 0;
+check it there. The 2-ULP margin budget stands regardless. Run C
+(prepend) stays as the direct test.
 Teacher-forced spec-off reading (pre-registered): spec-off numerics
 differ from both probes, so at a 0-1 ULP gap it picks by noise — the
 reference cannot settle a sub-ULP tie and does not block. Reference
