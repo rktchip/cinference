@@ -71,21 +71,21 @@ else
 fi
 NSERV="$(echo "$CAPPS" | grep -c 'ninfer-serve' || true)"
 
-# Shared (sysmem-spill) check: adapter-total SharedUsage in MiB. Any paging
-# voids the window (>100MB). Powershell takes seconds; pre/post only.
+# Shared (sysmem-spill) check: adapter-total SharedUsage in MiB.
+# Powershell takes seconds; pre/post only.
 # NOTE: ref files must live under /root/ (proven persistent); /tmp does NOT
 # persist across wsl.exe invocations (s1A/s1B refs lost, 2026-09-25).
-SHARED_RAW="$(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Measure-Object SharedUsage -Sum).Sum" 2>/dev/null | tr -d ' \r\n' || echo "")"
+# Ghost rule (2026-09-26): subtract ONLY known ghosts (empty-PID rows already
+# present at preflight, saved to ref). Any NEW row counts (fail-closed: a live
+# WSL co-tenant can also lack a mappable PID). Single PS call returns
+# "total_shared ghost_shared max_dedicated_row".
+MEMQ="$(powershell.exe -NoProfile -Command "\$p=Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GpuProcessMemory; \$t=(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Measure-Object SharedUsage -Sum).Sum; \$g=(\$p | Where-Object { -not \$_.ProcessId } | Measure-Object SharedUsage -Sum).Sum; \$m=(\$p | Measure-Object DedicatedUsage -Maximum).Maximum; \"\$t \$g \$m\"" 2>/dev/null | tr -d '\r\n' || echo "")"
+SHARED_RAW="$(echo "$MEMQ" | cut -d' ' -f1)"
+GHOST_RAW="$(echo "$MEMQ" | cut -d' ' -f2)"
+SRVROW_RAW="$(echo "$MEMQ" | cut -d' ' -f3)"
 case "$SHARED_RAW" in ''|*[!0-9]*) SHARED=-1;; *) SHARED=$(( SHARED_RAW / 1048576 ));; esac
-# Ghost-row correction (2026-09-26): dead processes leave stale SharedUsage
-# rows with empty ProcessId (e.g. 1.48GB ghost at arm-C end stamp while the
-# server held 80MB and 14GB dedicated sat free). Gate on live shared only.
-GHOST_RAW="$(powershell.exe -NoProfile -Command "Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GpuProcessMemory | Where-Object { -not \$_.ProcessId } | Measure-Object SharedUsage -Sum | Select-Object -ExpandProperty Sum" 2>/dev/null | tr -d ' \r\n' || echo "")"
-case "$GHOST_RAW" in ''|*[!0-9]*) GHOST=0;; *) GHOST=$(( GHOST_RAW / 1048576 ));; esac
-if [ "$SHARED" -ge 0 ]; then
-  SHARED=$(( SHARED - GHOST ))
-  [ "$SHARED" -lt 0 ] && SHARED=0
-fi
+case "$GHOST_RAW" in ''|*[!0-9]*) GHOST_KNOWN=0;; *) GHOST_KNOWN=$(( GHOST_RAW / 1048576 ));; esac
+case "$SRVROW_RAW" in ''|*[!0-9]*) SRVROW=-1;; *) SRVROW=$(( SRVROW_RAW / 1048576 ));; esac
 
 save_ref() {
   # $1=file
@@ -95,7 +95,9 @@ save_ref() {
     echo "pids=$PIDS"
     echo "smclk=$SMCLK"
     echo "temp=$TEMP"
-    echo "shared=$SHARED"
+    echo "ghost=$GHOST_KNOWN"
+    echo "ded0=$MEMUSED"
+    echo "shared_raw=$SHARED"
   } > "$1"
 }
 
@@ -107,18 +109,20 @@ pct_diff() {
   echo $(( d * 100 / $1 ))
 }
 
-# 3x1s idle samples catch display/compositor activity on the 5090
+# Live shared: at pre, all current ghosts are pre-existing by definition.
+LIVE=$(( SHARED - GHOST_KNOWN ))
+[ "$LIVE" -lt 0 ] && LIVE=0
 if [ "$MODE" = "pre" ]; then
   S1="$UTIL"
   sleep 1
   S2="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
   sleep 1
   S3="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
-  echo "STAMP hash=$HASH head=$HEAD mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared=${SHARED}MiB"
+  echo "STAMP hash=$HASH head=$HEAD mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared_live=${LIVE}MiB(ghosts=${GHOST_KNOWN}) srvrow=${SRVROW}MiB"
   [ -n "$OUT" ] && save_ref "$OUT"
   FAIL=""
   [ "$NPROC" -gt "$ALLOW" ] && FAIL="compute_procs=${NPROC}>${ALLOW}"
-  { [ "$SHARED" -ge 0 ] && [ "$SHARED" -gt 512 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared=${SHARED}MiB>512MiB(spill)"
+  { [ "$LIVE" -gt 512 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared_live=${LIVE}MiB>512MiB(spill)"
   for s in "$S1" "$S2" "$S3"; do
     case "$s" in ''|*[!0-9]*) continue;; esac
     [ "$s" -gt "$MAXIDLE" ] && FAIL="${FAIL:+$FAIL }idle_util=${s}>${MAXIDLE}"
@@ -131,12 +135,17 @@ fi
 if [ "$MODE" = "post" ]; then
   echo "STAMP hash=$HASH head=$HEAD mode=end nproc=$NPROC ninfer=$NSERV pids=[$PIDS] util=${UTIL}% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared=${SHARED}MiB"
   if [ -z "$REF" ] || [ ! -f "$REF" ]; then echo "VOID no-start-stamp"; exit 1; fi
-  RNPROC=""; RPIDS=""; RSM=""; RHASH=""; RSHARED=""
+  RNPROC=""; RPIDS=""; RSM=""; RHASH=""; RGHOST=""; RDED0=""; RSHARED_RAW=""
   while IFS='=' read -r k v; do
     case "$k" in
-      nproc) RNPROC="$v";; pids) RPIDS="$v";; smclk) RSM="$v";; hash) RHASH="$v";; shared) RSHARED="$v";;
+      nproc) RNPROC="$v";; pids) RPIDS="$v";; smclk) RSM="$v";; hash) RHASH="$v";; ghost) RGHOST="$v";; ded0) RDED0="$v";; shared_raw) RSHARED_RAW="$v";;
     esac
   done < "$REF"
+  # Post live-shared: subtract ONLY ref-known ghosts; any new row counts.
+  case "$RGHOST" in ''|*[!0-9]*) RGHOST=0;; esac
+  LIVEE=$(( SHARED - RGHOST ))
+  [ "$LIVEE" -lt 0 ] && LIVEE=0
+  echo "POST shared_live=${LIVEE}MiB(known_ghosts=${RGHOST}) srvrow=${SRVROW}MiB ded0=${RDED0}"
   VOID=""
   # nproc/pids are INFO-ONLY (2026-09-26): WSL nvidia-smi cannot map PIDs
   # across the VM boundary (everything reads [Not Found]), so this leg can
@@ -147,8 +156,16 @@ if [ "$MODE" = "post" ]; then
   [ "$PIDS" != "$RPIDS" ] && NOTE="${NOTE:+$NOTE }pids [${RPIDS}]->[${PIDS}]"
   [ -n "$NOTE" ] && echo "NOTE $NOTE"
   [ "$HASH" != "$RHASH" ] && VOID="${VOID:+$VOID }exe ${RHASH}->${HASH} (binary swapped mid-run)"
-  case "$RSHARED" in ''|-1) ;; *) [ "$RSHARED" -gt 512 ] && VOID="${VOID:+$VOID }start-shared=${RSHARED}MiB>512MiB(spill)";; esac
-  case "$SHARED" in -1) ;; *) [ "$SHARED" -gt 512 ] && VOID="${VOID:+$VOID }end-shared=${SHARED}MiB>512MiB(spill)";; esac
+  case "$RSHARED_RAW" in ''|-1) ;; *) [ "$RSHARED_RAW" -gt 512 ] && VOID="${VOID:+$VOID }start-shared-live=${RSHARED_RAW}MiB>512MiB(spill, ghosts already removed at pre)";; esac
+  case "$SHARED" in -1) ;; *) [ "$LIVEE" -gt 512 ] && VOID="${VOID:+$VOID }end-shared-live=${LIVEE}MiB>512MiB(spill)";; esac
+  # Memory co-tenant check (no PIDs needed): adapter dedicated, minus the
+  # server row (max dedicated row), minus the pre display baseline, must not
+  # grow >1GB during the run. Catches a mid-run co-tenant that idle-util and
+  # load clocks can miss.
+  case "$RDED0/$SRVROW/$MEMUSED" in *[!0-9/]*|*/) COCHECK="non-numeric-mem";; *)
+    COGROW=$(( MEMUSED - SRVROW - RDED0 ))
+    [ "$COGROW" -gt 1024 ] && VOID="${VOID:+$VOID }dedicated-grew=${COGROW}MiB>1024MiB(co-tenant? ded ${RDED0}->${MEMUSED} minus srvrow ${SRVROW})"
+  ;; esac
   DRIFT="$(pct_diff "$RSM" "$SMCLK")"
   # Idle clocks are INFO-ONLY (2026-09-26): P-state bounce of hundreds of MHz
   # at idle means nothing. Arm comparison uses LOADCLK under load (client).
