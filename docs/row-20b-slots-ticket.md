@@ -356,7 +356,10 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
    (regime labels are meaningless under thinking-on preambles, which
    draft easily and flatten accepts) on the pinned e28cacb executable,
    INCLUDING a fresh first A. The thinking-on arm A stays as a
-   cross-condition check only. The original arm A (first binary)
+   cross-condition check only. REPORT BOTH: regime rows thinking-off
+   (separates the regimes) PLUS the thinking-on row as the as-deployed
+   number (default template = high-accept preamble = the MTP gain real
+   users see). The original arm A (first binary)
    stays as a cross-binary check: match within noise certifies the
    rebuild equivalent. Arm A label: "slots-eager" — 260d6cf
    runs slots verify eager (item 2 never landed; replay branch requires

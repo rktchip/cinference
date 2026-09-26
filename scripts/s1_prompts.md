@@ -13,3 +13,8 @@ add a NEW name — never edit text under an existing name.
 - `paris-city`: medium-accept prose regime (added for S1 arm A; kept for
   continuity).
   `Describe the city of Paris in three sentences: one about its history, one about its architecture, and one about its food.`
+
+Screen rule: the winner of a ~10-step screen is NOT frozen until a
+rerun confirms it (minimum-of-noisy picks for luck). Screen runs
+thinking-OFF (preambles flatten); the frozen lowaccept regime is the
+confirmed minimum-mean-accept candidate.
