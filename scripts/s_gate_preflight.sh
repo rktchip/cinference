@@ -97,7 +97,7 @@ save_ref() {
     echo "temp=$TEMP"
     echo "ghost=$GHOST_KNOWN"
     echo "ded0=$MEMUSED"
-    echo "shared_raw=$SHARED"
+    echo "shared_raw=$LIVE"
   } > "$1"
 }
 
