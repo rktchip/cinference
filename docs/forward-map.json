@@ -1153,6 +1153,13 @@
    "measured": "upstream 1.5.1 (.pyd, tabby cu132 torch): kv 21.5-22.1us (92-123 GB/s), qk 21.5-22.5us (176-236 GB/s); ours: kv 12.6/11.9, qk 13.1/12.4-19.8",
    "verdict": "best speedup 0.61x -> DROP porting for good per 1.5x rule; upstream gemm~=gemv, no small-shape advantage; our small-shape excess is ours to fix via concurrency",
    "env_note": "stock venv ships torch+cpu so .pyd never loads there; runs under tabby-exl3 venv (cu132) with cublas preload wrapper scripts/run_upstream_bench.py (MSYS PATH entries unusable by Win loader, preload by full path)"
+  },
+  {
+   "id": "step9_timing_rule",
+   "status": "SEALED_2026_09_26_RULE_SET",
+   "rule": "step-9 timing runs WITHOUT NINFER_EXL3_FORCE_SPLIT1 (split-1 carries the verify occupancy cliff: kv m4 8 vs ~88 blocks; slots-vs-legacy must not compare a handicapped verify)",
+   "split1_gate": "verify-only tool (5x determinism proof), never for timing",
+   "true_fix": "deterministic split-K with occupancy preserved (per-split partials + ordered reduce or equivalent), background write-only; step 9 uses it only if built + verified by then, else runs flag-free with noted nondeterminism (tie-class, bimodal flips)"
   }
  ]
 }
