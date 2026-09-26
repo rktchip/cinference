@@ -1196,6 +1196,35 @@
    "syncs_per_step": "5 blocking (bonus+3 drafts+verify); trailing sync-free",
    "H0": "trailing-eager half CONTRADICTED by code; 8a capture decides",
    "next": "8a node-traced slots MTP capture + det-splitk verify, same window"
+  },
+  {
+   "id": "8a_mtp_slots_capture",
+   "status": "SEALED_2026_09_26_H0_HOLDS_LOW_END",
+   "h0": "HOLDS (low end)",
+   "verify_span_ms": "16 full-layer ranges/step, 16-24 (median ~22), ~1200 kern ~8ms, graph=0 all-individual; GDN (45 ranges) overlaps span",
+   "trailing": "ONE graph launch, 1922 kern, 11.5-11.6ms every step",
+   "drafts": "mtp.forward 5-8/step ~2-3ms; gap individuals ~500-770 kern ~5.5-6.9ms",
+   "step_ms": "~51 = verify ~22 + gap ~29 (graph 11.6 + indiv ~6 + overhead ~10-11)",
+   "d2h_per_step": 11,
+   "blocking_syncs": "16B accept 0.8-1.6ms + 3x draft tokens 0.8-1.5ms; 7 small pipelined 25-250us",
+   "sync_reconciliation": "static ~5 vs design 2 settled: design missed 3 draft readbacks; fold chaining into on-device accept (after step 9)",
+   "step9_repredict": "verify kernel ~8ms floor ~6.5 -> graphed ~9ms; saves ~13/step; step ~51->~38; FOX ~11.3 vs 13.2. Kill<10 CLEARED margin ~3 [medium: M=4 capturability untested]",
+   "step9_caveat": "replay must cover GDN layers (45 ranges in span); check probe branch",
+   "split_in_binary": "8b6ff35 ancestor of det-splitk HEAD; exe 9e3847ebdc650675",
+   "trace": "/root/slotsmtp_node.nsys-rep + /root/slotsmtp.sqlite, drift 0%"
   }
- ]
+ ],
+ "map36_8a_verdict": {
+  "h0": "HOLDS-low-end",
+  "verify_span_ms": "16-24 (median ~22), 16 full-layer ranges, ~1200 kern ~8ms, all individual",
+  "trailing": "ONE graph launch, 1922 kern, 11.5-11.6ms every step",
+  "drafts": "mtp.forward 5-8/step ~2-3ms; gap individuals ~6ms",
+  "step_ms": "~51 = verify ~22 + gap ~29 (graph 11.6 + indiv ~6 + overhead ~10-11)",
+  "d2h_per_step": 11,
+  "blocking_syncs": "16B accept 0.8-1.6ms + 3x draft tokens 0.8-1.5ms; 7 small pipelined",
+  "step9": "verify 22->~9, saves ~13/step, step ~51->~38, FOX ~11.3 vs 13.2. Kill<10 CLEARED [medium]",
+  "step9_caveat": "replay must cover GDN layers (45 ranges in span)",
+  "split_in_binary": "8b6ff35 ancestor of HEAD; exe 9e3847ebdc650675",
+  "trace": "/root/slotsmtp_node.nsys-rep + /root/slotsmtp.sqlite, drift 0%"
+ }
 }
