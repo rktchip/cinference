@@ -1281,6 +1281,19 @@
    "stamps": "pre all 4 legs nproc=0 no-spill; post live A2 SEALED drift=0%%; A1/B1/B2 posts lost (bad post chain + servers down) - documented",
    "identity": "explicit sha256 per binary file + launcher paths; preflight HASH tracks pinned exe only, NOT leg binding",
    "caveat": "B binary delta = split-K + dormant det scaffolding (flag off); attribution to split is conservative"
+  },
+  {
+   "id": "det_splitk_specoff_long_8x8",
+   "status": "SEALED_2026_09_26",
+   "off_8x": "2 texts (375/385 chars, 4/4 split, diverge char 127); reproduces earlier 5/6 flip exactly - short-prompt clean was luck",
+   "on_8x": "8/8 IDENTICAL, pins the 385-char variant (member of off set)",
+   "verdict": "fix removes the atomic race and pins one deterministic result; det-splitk on spec-off CLOSED",
+   "artifacts": [
+    "/root/det_specoffL0.json",
+    "/root/det_specoffL1.json",
+    "/root/Soff.ref",
+    "/root/Son.ref"
+   ]
   }
  ],
  "map36_8a_verdict": {
