@@ -309,14 +309,14 @@ width-1 gdn_projection_snapshot per GDN layer vs legacy's ONE width-4.
 Projection is a matmul: slots re-reads projection weights up to 4x per
 verify (less what L2 holds across back-to-back calls). Layout B needs
 per-column slots only for STATE (conv window + recurrent), not the
-projection. SPLIT: one width-4 projection -> x for all four columns,
-then the per-column conv/recurrent chain publishing slots (no weight
-reads in the chain). Expect: verify ms down (measure one layer: 4x
-width-1 vs 1x width-4, expect a few ms/step); projection interdiff ->
-0, so the zero-diff standing check RETURNS (this time on the
-projection side, by construction). Small-m speeds that width-4 later;
-width-1 would bypass it. S1 runs BEFORE the split, then again after;
-the delta is a real S-number moving.
+projection. SPLIT (original 20b mapping, not a hoisted GEMM): legacy's single
+width-4 gdn_projection_snapshot already walks the four columns inside
+the kernel (spare/shadow ping-pong) — pass it the static column table
+so column c publishes to t[c] instead of alternating. One launch,
+legacy's exact projection, no scratch round-trip for x. Consequence:
+bit-exact parity returns BY CONSTRUCTION on this route (same kernel);
+a hoisted standalone GEMM would land ~2 ULP again and the check would
+stay "diff ≤ floor", not zero.
 
 SLOTS DONE (release reviewer — four bars, then stop, no new oracle
 features, F56 closed):

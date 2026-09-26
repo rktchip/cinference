@@ -23,6 +23,7 @@ for name, prompt in PROMPTS:
             data=b, headers={"Content-Type": "application/json"})
         t0 = time.time()
         n = 0
+        t_first = None
         try:
             with urllib.request.urlopen(req, timeout=900) as f:
                 for line in f:
@@ -32,12 +33,19 @@ for name, prompt in PROMPTS:
                             m = json.loads(s[5:])
                         except Exception:
                             continue
-                        if m["choices"][0]["delta"].get("content"):
+                        d = m["choices"][0].get("delta", {})
+                        if d.get("content") or d.get("reasoning_content"):
                             n += 1
+                            if t_first is None:
+                                t_first = time.time()
         except Exception as e:
             print("%s %s rep %d FAILED: %s" % (tag, name, r, e), flush=True)
             continue
         dt = time.time() - t0
-        print("%s %s rep %d: %d toks in %.1fs = %.2f ms/tok" % (tag, name, r, n, dt, dt / n * 1000),
-              flush=True)
+        if n == 0:
+            print("%s %s rep %d: 0 toks, FAILED" % (tag, name, r), flush=True)
+            continue
+        ttft = (t_first - t0) if t_first else dt
+        print("%s %s rep %d: %d toks wall %.1fs ttft %.1fs decode %.2f ms/tok" % (
+            tag, name, r, n, dt, ttft, (dt - ttft) / n * 1000), flush=True)
 print("%s DONE" % tag, flush=True)
