@@ -1186,6 +1186,16 @@
    "bugfix": "eligibility deref of device serve_sampling_ -> host mirror (afc77ef)",
    "side_finding": "spec-off tie-flip pre-exists on e28cacb (5/6, char-127); exact gates need split-K + spec-off noise work",
    "next": "small-shape concurrency inside graphed body (order #2)"
+  },
+  {
+   "id": "mtp_first_static",
+   "status": "SEALED",
+   "verify_slots": "EAGER (eager-slots :1827, graph gated !slots_on :1779)",
+   "trailing_row": "REPLAYS commit_exec_ (:1966 allow_graph=true, no slots gate)",
+   "commit_rows": "SKIPPED in slots (copy-back :1934+)",
+   "syncs_per_step": "5 blocking (bonus+3 drafts+verify); trailing sync-free",
+   "H0": "trailing-eager half CONTRADICTED by code; 8a capture decides",
+   "next": "8a node-traced slots MTP capture + det-splitk verify, same window"
   }
  ]
 }
