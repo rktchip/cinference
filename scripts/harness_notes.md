@@ -49,3 +49,22 @@ FUNCTION is usually enough; rebuild with debug symbols only if it isn't.
   freed/recycled mid-oracle-step, touched by request #2.
 - If clean: rerun deliberate cancel-then-request under gdb before
   calling it fixed.
+
+## S-gate rules (2026-09-26 corrections)
+
+- Run identity = pinned exe sha256 (preflight `hash=`); HEAD is info
+  only (`head=`). Doc/code commits during arms do NOT void the window;
+  only a binary swap does. No commit freeze needed: the code lane stays
+  open during timing.
+- nproc counts compute apps MINUS known display noise
+  (explorer/SearchHost/Widgets/etc, fail-closed). The 5090 drives the
+  desktop, so raw nproc is inherently noisy.
+- Compare SM clocks UNDER LOAD (client LOADCLK line), not idle stamps.
+  Idle clocks bounce hundreds of MHz and mean nothing.
+- Mode compare on ms/step, not ms/token: slots-vs-legacy texts diverge
+  (width-1 vs width-4 one-ULP tie flips), so ms/token compares different
+  workloads. Slots-eager 62.5 vs legacy 64.6 ms/step: slots ~3% cheaper
+  per step despite eager verify.
+- Token-stream compare protocol: find the FIRST divergence, read the
+  logit gap there. Tie = benign. Clear gap = bug, MTP cache first
+  suspect. Post-split, divergence should get much rarer.

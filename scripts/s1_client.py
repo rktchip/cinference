@@ -1,6 +1,21 @@
-import sys, json, time, hashlib, urllib.request
+import sys, json, time, hashlib, urllib.request, subprocess, threading
 # S1 decode arm: frozen prompts (see s1_prompts.md), greedy, conc-1.
 # Each S-line stamps the prompt sha1: names map to exactly one text.
+# Load-clock sampler: mean SM clock under load prints at DONE; arm
+# comparison uses load clocks (idle clocks bounce hundreds of MHz).
+_load_clocks = []
+_load_stop = False
+def _sampler():
+    while not _load_stop:
+        try:
+            o = subprocess.run(["nvidia-smi", "--query-gpu=clocks.current.sm",
+                "--format=csv,noheader,nounits"], capture_output=True,
+                text=True, timeout=10).stdout.strip()
+            _load_clocks.append(int(o.split()[0]))
+        except Exception:
+            pass
+        time.sleep(2)
+threading.Thread(target=_sampler, daemon=True).start()
 # Usage: s1_client.py <port> <tag> [ntok=64] [reps=3]
 port = sys.argv[1] if len(sys.argv) > 1 else "8902"
 tag = sys.argv[2] if len(sys.argv) > 2 else "s1"
@@ -58,3 +73,8 @@ for name, prompt in PROMPTS:
         print("%s %s[%s] rep %d: %d toks wall %.1fs ttft %.1fs decode %.2f ms/tok" % (
             tag, name, HASHES[name], r, n, dt, ttft, (dt - ttft) / n * 1000), flush=True)
 print("%s DONE" % tag, flush=True)
+_load_stop = True
+if _load_clocks:
+    print("%s LOADCLK n=%d mean=%dMHz min=%d max=%d" % (tag, len(_load_clocks),
+        sum(_load_clocks) // len(_load_clocks), min(_load_clocks),
+        max(_load_clocks)), flush=True)
