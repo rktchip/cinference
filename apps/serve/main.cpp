@@ -12,6 +12,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <vector>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -45,11 +46,23 @@ void handle_crash(int sig) {
     ::signal(sig, SIG_DFL);
     ::raise(sig);
 }
+// Alternate stack: a stack-overflow segfault leaves no stack for the
+// handler itself, which would explain a missing trace. 64KB, installed
+// once at startup; SA_ONSTACK on both crash signals.
+void install_crash_altstack() {
+    static std::vector<char> altstack(SIGSTKSZ);
+    stack_t ss;
+    ss.ss_sp    = altstack.data();
+    ss.ss_size  = altstack.size();
+    ss.ss_flags = 0;
+    if (::sigaltstack(&ss, nullptr) != 0) { return; }
+}
 void install_crash_handler() {
+    install_crash_altstack();
     struct sigaction sa;
     sa.sa_handler = handle_crash;
     ::sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND | SA_NODEFER;
+    sa.sa_flags = SA_RESETHAND | SA_NODEFER | SA_ONSTACK;
     ::sigaction(SIGSEGV, &sa, nullptr);
     ::sigaction(SIGABRT, &sa, nullptr);
 }

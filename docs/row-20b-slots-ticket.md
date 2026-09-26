@@ -352,7 +352,10 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
 1. Caps profile (per-layer floors + accept shape; oracle on).
 2. Verify on replay (slots path; static table makes it capturable).
 3. Mirrored ABCCBA S1 (slots / legacy / off / off / legacy / slots,
-   same binary, start+end stamps). Arm A label: "slots-eager" — 260d6cf
+   same binary, start+end stamps). FULL ABCCBA runs on the e28cacb
+   rebuild, INCLUDING a fresh first A. The original arm A (first binary)
+   stays as a cross-binary check: match within noise certifies the
+   rebuild equivalent. Arm A label: "slots-eager" — 260d6cf
    runs slots verify eager (item 2 never landed; replay branch requires
    !slots_on), so arm A measures slots + eager-verify tax vs legacy's
    replayed verify. ARM A RESULT (e28cacb, slots-eager, server-canonical
