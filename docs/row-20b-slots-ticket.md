@@ -141,9 +141,18 @@ numerics again. SOLO RESULT (2026-09-25, req#4 alone on idle server):
 interdiff still 0.125-0.875, not 0 — lane batching RULED OUT. Prime
 suspect confirmed by mechanism: legacy probe replays its verify graph
 while slots probe runs verify eager (queue item 2 open), a systematic
-numerics-family difference, constant ~1 ULP everywhere. Prediction:
-queue item 2 (verify back on replay for slots) drives interdiff to 0;
-check it there. The 2-ULP margin budget stands regardless. Run C
+numerics-family difference, constant ~1 ULP everywhere. SOURCE NAMED
+(text.cpp:1583-1610 vs 1611-1615): legacy runs ONE width-4
+gdn_projection_snapshot; slots runs FOUR width-1 snapshots (layout B
+requires per-column slots). Same weights, same exact-arithmetic math,
+different launch width — M=4-vs-M=1 rounding, i.e. the pre-registered
+conv floor showing up in logits. Recurrent both sides uses the same
+width-1 kernel (text.cpp:1662+), so the offset is projection-side.
+CORRECTED prediction for queue item 2: capture freezes launches, so
+replayed slots still runs 4xwidth-1 vs legacy 1xwidth-4 — interdiff
+stays ~1-2 ULP BY DESIGN, and that is correct, not a failure. The
+standing check is diff <= floor (2 ULP scaled), never 0. Warmup was
+bit-exact because it compared legacy width-4 to itself. Run C
 (prepend) stays as the direct test.
 Teacher-forced spec-off reading (pre-registered): spec-off numerics
 differ from both probes, so at a 0-1 ULP gap it picks by noise — the
