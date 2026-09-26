@@ -335,6 +335,13 @@ OVERLAP (one GPU: code while the GPU measures):
 - CODE (parallel, no GPU): the projection split above + row-23 rung-2.
 - GPU 2 (after split lands): S1 post-split, S2 p2k/p32k, S3 sweep.
 - ANYTIME (no GPU): S4 llama.cpp Q6_K baseline on this 5090.
+  S4 provenance: third-party GGUF (Chungulus vanilla Q6_K of Qwen3.8-27B)
+  is fine for SPEED (architecture + quant types, not weight values) —
+  after download, run gguf-dump and confirm per-tensor types are standard
+  Q6_K (reject Q8_0/F16 embed/output holdouts: they change size+speed).
+  For any QUALITY comparison later, quantize from base weights yourself.
+  Use a current llama.cpp build (older GGUF parsers had malformed-file
+  vulnerabilities).
 
 The oracle's per-step diff is isolated by construction: the block ends
 by restoring lane/spare/shadow from the presnap, so snapA-vs-snapB
@@ -350,12 +357,11 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
    !slots_on), so arm A measures slots + eager-verify tax vs legacy's
    replayed verify. ARM A RESULT (e28cacb, slots-eager, server-canonical
    counts): FOX decode ~19.2 ms/tok (TTFT 2.0-2.3s @ prompt 75, tok/step
-   3.56, mean a 1.5); PARIS decode ~16.6 ms/tok (TTFT 2.1s @ prompt 77,
-   tok/step 3.88, mean a 1.9). NO INVERSION: PARIS accepted more this
-   run, so it's faster/tok; step time reconciles (FOX 19.2x3.56=68ms vs
-   PARIS 16.6x3.88=64ms). Canonical counting = SERVER output counts for
-   all six arms (client undercounts ~3% via chunk coalescing; same client
-   everywhere, server numbers in the record). Every arm runs FOX + PARIS (ship bar needs PARIS
+   3.56, mean a 1.5); PARIS-CITY decode ~16.6 ms/tok (TTFT 2.1s @ prompt
+   77, tok/step 3.88, mean a 1.9) — the S1 "paris" prompt is NOT the
+   historical low-accept PARIS (Eiffel text, scripts/s1_prompts.md); arm
+   A is rerun with all three frozen prompts (fox/paris/paris-city, hashes
+   stamped per S-line), and arms B-F run all three. Every arm runs FOX + PARIS (ship bar needs PARIS
    no-worse-than-off; one extra prompt now beats a re-baselined session
    later) and logs [mtp-step] accepts + tokens (NINFER_MTP_DEBUG=1) so
    the accept histogram travels with ms/tok. Debug-cost control: the
