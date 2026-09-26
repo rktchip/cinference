@@ -122,6 +122,13 @@ tolerance AND verified near-tie on re-decode (log position, logits, delta).
 Anything else = fail, stop, no perf bands. (Byte-identical vs today is
 explicitly NOT required: today = m==1 gemv_plain family, verify = M=4
 family, bits differ on first full accept.)
+Oracle near-tie log (2026-09-25, F56 FOX): legacy top1 3808 gap 0.125 vs
+slots top1 279 (draft, accepted) gap 0.0, inter-side max-abs-diff 0.125
+(one bf16 ULP), prestine-OK, positions 1-3 bit-identical. Verdict:
+genuine sub-ULP near-tie flipped by probe-side rounding noise (Rome
+class), not input/state. Gap series: tiny gaps also at F37/F52
+(matched) — not F56-specific. Teacher-forced spec-off at the F56
+prefix still open: decides whether slots' 279 is correct.
 Oracle ACCEPT-DIFF bar: with bit-exact verify paths and identical inputs,
 a_leg must equal a_slot on EVERY step — count splits as failures, not
 skips; the per-run bar is zero. The span guard rightly refuses the state

@@ -13,6 +13,14 @@ Durable rig-debug facts. These apply to every future gate, not one ticket.
 - `ninfer-serve` installs a crash handler (SIGSEGV/SIGABRT): it flushes
   stderr, prints a `backtrace_symbols_fd` trace, and re-raises. A crash
   outside gdb — including production — still names its frame.
+- Known serve bug (2026-09-25, out of slots scope): a client disconnect
+  mid-stream (e.g. after a 503 queue-timeout) segfaults later in the SSE
+  write path (`handle_chat_completions` streaming lambda via
+  `write_response_core`). Two crashes, both after a 503-cancelled first
+  request; five clean requests with no cancel. Oracle gates work around
+  it with `--pending-timeout-ms 600000` (no 503 => no disconnect).
+  Default queue timeout is too short for oracle-slowed steps (~1s+/step
+  with 3 verifies + host snapshots).
 
 ## gdb recipe (WSL)
 
