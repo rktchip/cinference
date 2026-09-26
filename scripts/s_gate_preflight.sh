@@ -58,6 +58,13 @@ else
 fi
 NSERV="$(echo "$CAPPS" | grep -c 'ninfer-serve' || true)"
 
+# Shared (sysmem-spill) check: adapter-total SharedUsage in MiB. Any paging
+# voids the window (>100MB). Powershell takes seconds; pre/post only.
+# NOTE: ref files must live under /root/ (proven persistent); /tmp does NOT
+# persist across wsl.exe invocations (s1A/s1B refs lost, 2026-09-25).
+SHARED_RAW="$(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Measure-Object SharedUsage -Sum).Sum" 2>/dev/null | tr -d ' \r\n' || echo "")"
+case "$SHARED_RAW" in ''|*[!0-9]*) SHARED=-1;; *) SHARED=$(( SHARED_RAW / 1048576 ));; esac
+
 save_ref() {
   # $1=file
   {
@@ -66,6 +73,7 @@ save_ref() {
     echo "pids=$PIDS"
     echo "smclk=$SMCLK"
     echo "temp=$TEMP"
+    echo "shared=$SHARED"
   } > "$1"
 }
 
@@ -84,10 +92,11 @@ if [ "$MODE" = "pre" ]; then
   S2="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
   sleep 1
   S3="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
-  echo "STAMP hash=$HASH mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB"
+  echo "STAMP hash=$HASH mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared=${SHARED}MiB"
   [ -n "$OUT" ] && save_ref "$OUT"
   FAIL=""
   [ "$NPROC" -gt "$ALLOW" ] && FAIL="compute_procs=${NPROC}>${ALLOW}"
+  { [ "$SHARED" -ge 0 ] && [ "$SHARED" -gt 100 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared=${SHARED}MiB>100MiB(spill)"
   for s in "$S1" "$S2" "$S3"; do
     case "$s" in ''|*[!0-9]*) continue;; esac
     [ "$s" -gt "$MAXIDLE" ] && FAIL="${FAIL:+$FAIL }idle_util=${s}>${MAXIDLE}"
@@ -98,18 +107,20 @@ if [ "$MODE" = "pre" ]; then
 fi
 
 if [ "$MODE" = "post" ]; then
-  echo "STAMP hash=$HASH mode=end nproc=$NPROC ninfer=$NSERV pids=[$PIDS] util=${UTIL}% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB"
+  echo "STAMP hash=$HASH mode=end nproc=$NPROC ninfer=$NSERV pids=[$PIDS] util=${UTIL}% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared=${SHARED}MiB"
   if [ -z "$REF" ] || [ ! -f "$REF" ]; then echo "VOID no-start-stamp"; exit 1; fi
-  RNPROC=""; RPIDS=""; RSM=""; RHASH=""
+  RNPROC=""; RPIDS=""; RSM=""; RHASH=""; RSHARED=""
   while IFS='=' read -r k v; do
     case "$k" in
-      nproc) RNPROC="$v";; pids) RPIDS="$v";; smclk) RSM="$v";; hash) RHASH="$v";;
+      nproc) RNPROC="$v";; pids) RPIDS="$v";; smclk) RSM="$v";; hash) RHASH="$v";; shared) RSHARED="$v";;
     esac
   done < "$REF"
   VOID=""
   [ "$NPROC" != "$RNPROC" ] && VOID="nproc ${RNPROC}->${NPROC}"
   [ "$PIDS" != "$RPIDS" ] && VOID="${VOID:+$VOID }pids [${RPIDS}]->[${PIDS}]"
   [ "$HASH" != "$RHASH" ] && VOID="${VOID:+$VOID }hash ${RHASH}->${HASH} (rebuilt mid-run)"
+  case "$RSHARED" in ''|-1) ;; *) [ "$RSHARED" -gt 100 ] && VOID="${VOID:+$VOID }start-shared=${RSHARED}MiB>100MiB(spill)";; esac
+  case "$SHARED" in -1) ;; *) [ "$SHARED" -gt 100 ] && VOID="${VOID:+$VOID }end-shared=${SHARED}MiB>100MiB(spill)";; esac
   DRIFT="$(pct_diff "$RSM" "$SMCLK")"
   # Idle P-state wobble (±15MHz at ~200MHz) is meaningless; void only on a
   # real excursion: >3% AND >100MHz absolute. Under load (~2.5GHz) the 3%

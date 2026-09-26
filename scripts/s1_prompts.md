@@ -18,3 +18,8 @@ Screen rule: the winner of a ~10-step screen is NOT frozen until a
 rerun confirms it (minimum-of-noisy picks for luck). Screen runs
 thinking-OFF (preambles flatten); the frozen lowaccept regime is the
 confirmed minimum-mean-accept candidate.
+
+LOWACCEPT (frozen 2026-09-25): `fox`. Thinking-off mean-a 0.95, most
+partial accepts in the set, already hashed, runs in every arm. Stands
+unless rand-nums reads clearly lower at 100 steps (screen4). Ship bar
+reads "lowaccept no worse than off"; drift check runs on FOX.
