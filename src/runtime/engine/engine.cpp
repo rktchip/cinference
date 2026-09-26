@@ -1988,6 +1988,11 @@ public:
         slot.anchor_valid      = true;
         slot.next_pos          = F + commit_len;
         slot.mtp_valid_pos     = slot.next_pos;
+        // S1 workload check: per-step accepts + tokens alongside ms/tok.
+        // Gated on NINFER_MTP_DEBUG (stderr only, no GPU effect).
+        if (mtp_dbg) {
+            std::fprintf(stderr, "[mtp-step] F=%u a=%u n=%u\n", F, accepted, commit_len);
+        }
         // Rejected positions must never become readable: both frontiers
         // advance to the same accepted frontier, so nothing reads stale
         // draft rows beyond it (fail-closed, both paths).

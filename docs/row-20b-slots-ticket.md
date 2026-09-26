@@ -341,7 +341,14 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
 1. Caps profile (per-layer floors + accept shape; oracle on).
 2. Verify on replay (slots path; static table makes it capturable).
 3. Mirrored ABCCBA S1 (slots / legacy / off / off / legacy / slots,
-   same binary, start+end stamps).
+   same binary, start+end stamps). Arm A label: "slots-eager" — 260d6cf
+   runs slots verify eager (item 2 never landed; replay branch requires
+   !slots_on), so arm A measures slots + eager-verify tax vs legacy's
+   replayed verify. Replay and the projection split then read as their
+   own measured deltas. Every arm runs FOX + PARIS (ship bar needs PARIS
+   no-worse-than-off; one extra prompt now beats a re-baselined session
+   later) and logs [mtp-step] accepts + tokens (NINFER_MTP_DEBUG=1) so
+   the accept histogram travels with ms/tok.
 4. 8/8 matrix + PARIS-500 drift, slots-only, oracle off. Drift bar:
    greedy output token-identical to spec-off; at any divergence log
    the top-2 logit gap (NINFER_MTP_LOGGAP), same as the cap verdicts.
