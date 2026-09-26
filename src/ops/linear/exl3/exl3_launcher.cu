@@ -44,7 +44,7 @@ __global__ void exl3_cast16_to_bf16(const half* __restrict__ c16,
         out16[i] = __bfloat16_as_ushort(__nv_bfloat16(__half2float(c16[i])));
 }
 
-__host__ inline bool exl3_gemv_run(const Exl3GemvPlan& p, const half* A,
+__host__ bool exl3_gemv_run(const Exl3GemvPlan& p, const half* A,
                                    const uint16_t* B, void* C, cudaStream_t stream)
 {
     dim3 g(p.grid), th(p.block_dim);

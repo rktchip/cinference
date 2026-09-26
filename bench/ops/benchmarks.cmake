@@ -61,3 +61,4 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
+ninfer_add_op_bench(ninfer_exl3_gemv_width_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/exl3_gemv_width_bench.cu")
