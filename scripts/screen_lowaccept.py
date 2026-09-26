@@ -1,11 +1,16 @@
 import sys, json, time, urllib.request
-# Low-accept screen: 4 hostile candidates, short runs. Mean accept comes
-# from the server's [mtp-step] lines after the run (values stand under
-# load; timing here is meaningless). Freeze the winner into s1_prompts.md
-# as "lowaccept" — never reuse a name for edited text.
+# Low-accept screen: 4 hostile candidates, LONG runs (~100 steps each,
+# SE~0.1). Short screens (32 toks, ~11 steps, SE~0.3) cannot rank
+# candidates — screen1-3 retired as unevidenced. Winner confirmed by
+# rerun before freezing (minimum-of-noisy picks for luck).
+# NOTE 2026-09-25: the "thinking flattens accepts" claim was struck —
+# screen2-rand thinking-off 1.14 sits ABOVE screen1 thinking-on 1.00,
+# opposite to the prediction, and all short-screen gaps are inside SE.
+# Thinking-off stands on historical-gate grounds (matches the gate
+# conditions), not on screen evidence.
 port = sys.argv[1] if len(sys.argv) > 1 else "8902"
 tag = sys.argv[2] if len(sys.argv) > 2 else "screen"
-ntok = int(sys.argv[3]) if len(sys.argv) > 3 else 32
+ntok = int(sys.argv[3]) if len(sys.argv) > 3 else 300
 CANDS = [
     ("rand-nums", "Continue this sequence of random integers with the next "
      "five, separated by commas: 847293, 510382, 774916, 203957, 619048,"),

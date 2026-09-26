@@ -353,8 +353,9 @@ trajectory correctness. Both long checks run slots-only, oracle OFF:
 2. Verify on replay (slots path; static table makes it capturable).
 3. Mirrored ABCCBA S1 (slots / legacy / off / off / legacy / slots,
    same binary, start+end stamps). FULL ABCCBA runs thinking-OFF
-   (regime labels are meaningless under thinking-on preambles, which
-   draft easily and flatten accepts) on the pinned e28cacb executable,
+   (matches the historical gate conditions; the "preambles flatten"
+   mechanism claim was struck 2026-09-25 — screens 1-3 are inside
+   SE~0.3 and point the wrong way) on the pinned e28cacb executable,
    INCLUDING a fresh first A. The thinking-on arm A stays as a
    cross-condition check only. REPORT BOTH: regime rows thinking-off
    (separates the regimes) PLUS the thinking-on row as the as-deployed
