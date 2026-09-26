@@ -77,6 +77,15 @@ NSERV="$(echo "$CAPPS" | grep -c 'ninfer-serve' || true)"
 # persist across wsl.exe invocations (s1A/s1B refs lost, 2026-09-25).
 SHARED_RAW="$(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Measure-Object SharedUsage -Sum).Sum" 2>/dev/null | tr -d ' \r\n' || echo "")"
 case "$SHARED_RAW" in ''|*[!0-9]*) SHARED=-1;; *) SHARED=$(( SHARED_RAW / 1048576 ));; esac
+# Ghost-row correction (2026-09-26): dead processes leave stale SharedUsage
+# rows with empty ProcessId (e.g. 1.48GB ghost at arm-C end stamp while the
+# server held 80MB and 14GB dedicated sat free). Gate on live shared only.
+GHOST_RAW="$(powershell.exe -NoProfile -Command "Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GpuProcessMemory | Where-Object { -not \$_.ProcessId } | Measure-Object SharedUsage -Sum | Select-Object -ExpandProperty Sum" 2>/dev/null | tr -d ' \r\n' || echo "")"
+case "$GHOST_RAW" in ''|*[!0-9]*) GHOST=0;; *) GHOST=$(( GHOST_RAW / 1048576 ));; esac
+if [ "$SHARED" -ge 0 ]; then
+  SHARED=$(( SHARED - GHOST ))
+  [ "$SHARED" -lt 0 ] && SHARED=0
+fi
 
 save_ref() {
   # $1=file
@@ -129,22 +138,27 @@ if [ "$MODE" = "post" ]; then
     esac
   done < "$REF"
   VOID=""
-  [ "$NPROC" != "$RNPROC" ] && VOID="nproc ${RNPROC}->${NPROC}"
-  [ "$PIDS" != "$RPIDS" ] && VOID="${VOID:+$VOID }pids [${RPIDS}]->[${PIDS}]"
+  # nproc/pids are INFO-ONLY (2026-09-26): WSL nvidia-smi cannot map PIDs
+  # across the VM boundary (everything reads [Not Found]), so this leg can
+  # never distinguish a co-tenant from display noise. Co-tenant guard is
+  # idle_util (pre) + LOADCLK under load (client) instead.
+  NOTE=""
+  [ "$NPROC" != "$RNPROC" ] && NOTE="nproc ${RNPROC}->${NPROC}"
+  [ "$PIDS" != "$RPIDS" ] && NOTE="${NOTE:+$NOTE }pids [${RPIDS}]->[${PIDS}]"
+  [ -n "$NOTE" ] && echo "NOTE $NOTE"
   [ "$HASH" != "$RHASH" ] && VOID="${VOID:+$VOID }exe ${RHASH}->${HASH} (binary swapped mid-run)"
   case "$RSHARED" in ''|-1) ;; *) [ "$RSHARED" -gt 512 ] && VOID="${VOID:+$VOID }start-shared=${RSHARED}MiB>512MiB(spill)";; esac
   case "$SHARED" in -1) ;; *) [ "$SHARED" -gt 512 ] && VOID="${VOID:+$VOID }end-shared=${SHARED}MiB>512MiB(spill)";; esac
   DRIFT="$(pct_diff "$RSM" "$SMCLK")"
-  # Idle P-state wobble (±15MHz at ~200MHz) is meaningless; void only on a
-  # real excursion: >3% AND >100MHz absolute. Under load (~2.5GHz) the 3%
-  # binds; at idle the floor absorbs P-state bounce.
+  # Idle clocks are INFO-ONLY (2026-09-26): P-state bounce of hundreds of MHz
+  # at idle means nothing. Arm comparison uses LOADCLK under load (client).
   SMVOID=""
   if [ "$DRIFT" -ge 0 ] && [ "$DRIFT" -gt "$MAXDRIFT" ]; then
     ABS="$(( RSM > SMCLK ? RSM - SMCLK : SMCLK - RSM ))"
-    case "$RSM$SMCLK" in ''|*[!0-9]*) SMVOID="non-numeric-clock";; *) [ "$ABS" -gt 100 ] && SMVOID="sm_clock ${RSM}->${SMCLK}MHz (${DRIFT}%>${MAXDRIFT}%, ${ABS}MHz>100MHz)";; esac
+    case "$RSM$SMCLK" in ''|*[!0-9]*) SMVOID="non-numeric-clock";; *) [ "$ABS" -gt 100 ] && SMVOID="sm_clock ${RSM}->${SMCLK}MHz (${DRIFT}%>${MAXDRIFT}%, ${ABS}MHz>100MHz, idle-info-only)";; esac
   fi
-  [ -n "$SMVOID" ] && VOID="${VOID:+$VOID }$SMVOID"
-  if [ "$NPROC" -gt "$ALLOW" ]; then VOID="${VOID:+$VOID }compute_procs=${NPROC}>${ALLOW}"; fi
+  [ -n "$SMVOID" ] && echo "NOTE $SMVOID"
+  if [ "$NPROC" -gt "$ALLOW" ]; then echo "NOTE compute_procs=${NPROC}>${ALLOW} (info-only, blind leg)"; fi
   if [ -n "$VOID" ]; then echo "VOID $VOID"; exit 1; fi
   echo "SEALED drift=${DRIFT}%"
   exit 0
