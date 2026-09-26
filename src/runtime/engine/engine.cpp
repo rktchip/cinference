@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
@@ -272,6 +273,7 @@ public:
         }
         max_seqs_    = options.max_concurrency;
         max_context_ = options.max_context;
+        warm_chunk_  = options.prefill_chunk;
         // S7 MTP-3 serve residency: --spec mtp --draft-tokens 3 admits the
         // in-checkpoint MTP head (bound at startup in exl3_program.cpp). The
         // window is pinned to kMtpSpecDecodeDrafts (3, full proposal head);
@@ -558,6 +560,14 @@ public:
         mtp_fill_log_ = off;
         off += align_up(static_cast<std::size_t>(text_vocab_) * 8U * 2U);
         mtp_fill_mh_ = off; off += align_up(static_cast<std::size_t>(hidden_) * 8U * 2U);
+        // Row-23 rung-2: batched warming works one prefill_chunk-wide slice
+        // at a time over prefill hidden columns (no assembly copy: a slice
+        // span is already a contiguous {H,T} block). Discard output + H2D
+        // id/pos staging live here.
+        mtp_batch_ids_ = off; off += align_up(static_cast<std::size_t>(warm_chunk_) * 4U);
+        mtp_batch_pos_ = off; off += align_up(static_cast<std::size_t>(warm_chunk_) * 4U);
+        mtp_batch_out_ = off;
+        off += align_up(static_cast<std::size_t>(hidden_) * warm_chunk_ * 2U);
         scratch_ = DeviceBuffer(off);
         // Per-lane committed target hidden (MTP draft chain anchor) plus the
         // anchor-as-input target logits (verify row 0 without re-running the
@@ -931,8 +941,9 @@ public:
             // S7 MTP-KV fill: the ordinary forward above advanced text KV
             // and GDN only. Mirror each prefill slice through the MTP layer
             // (chunked to the single-row helper width) so the MTP KV prefix
-            // stays warm for later decode-only MTP steps.
-            mtp_prefill_fill(plan, batch, row_slot, pos);
+            // stays warm for later decode-only MTP steps. tensors.hidden
+            // still holds every prefill row's target hidden (rung-1 input).
+            mtp_prefill_fill(plan, batch, row_slot, pos, tensors.hidden);
         }
         if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
             for (std::size_t d = 0; d < decoded.size(); ++d) {
@@ -1121,6 +1132,51 @@ public:
             CUDA_CHECK(cudaMemcpy(&host_targets[0], mbase + mtp_tok_, sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost));
         }
+        // Row-23 tie-class probe (diagnosis only, NINFER_LOG_TAIL_GAP=1):
+        // top-2 of the stashed anchor logits (the bonus distribution).
+        // Synchronous 0.5 MB D2H; never on the hot path.
+        if (stash_live && std::getenv("NINFER_LOG_TAIL_GAP") != nullptr) {
+            const std::size_t n_vocab = static_cast<std::size_t>(text_vocab_);
+            std::vector<std::uint16_t> tail_host(n_vocab);
+            CUDA_CHECK(cudaMemcpy(tail_host.data(), anchor_log.data, n_vocab * 2U,
+                                  cudaMemcpyDeviceToHost));
+            auto bf16_to_float = [](std::uint16_t b) {
+                const std::uint32_t exp = (b >> 7) & 0xFFU;
+                const std::uint32_t mant = b & 0x7FU;
+                std::uint32_t f;
+                if (exp == 0) {
+                    f = mant << 16;
+                } else {
+                    f = ((exp + 112U) << 23) | (mant << 16);
+                }
+                if (b & 0x8000U) { f |= 0x80000000U; }
+                float out;
+                std::memcpy(&out, &f, sizeof(out));
+                return out;
+            };
+            std::int32_t top1_id = -1, top2_id = -1;
+            float top1_v = -1e30f, top2_v = -1e30f;
+            for (std::size_t i = 0; i < n_vocab; ++i) {
+                const float v = bf16_to_float(tail_host[i]);
+                if (v > top1_v) {
+                    top2_v = top1_v; top2_id = top1_id;
+                    top1_v = v; top1_id = static_cast<std::int32_t>(i);
+                } else if (v > top2_v) {
+                    top2_v = v; top2_id = static_cast<std::int32_t>(i);
+                }
+            }
+            const float gap = top1_v - top2_v;
+            // bf16 ULP of |top1|: 2^(exp-7).
+            int exp1 = 0;
+            std::frexp(std::fabs(top1_v) > 0.0f ? top1_v : 1.0f, &exp1);
+            const float ulp1 = std::ldexp(1.0f, exp1 - 8);
+            std::fprintf(stderr,
+                         "[tail-gap] seq=%llu lane=%d F=%u top1=%d top2=%d gap=%.6f ulp=%.6f ulps=%.1f %s\n",
+                         (unsigned long long)slot.seq_id, lane, F, top1_id, top2_id, gap,
+                         ulp1, ulp1 > 0.0f ? gap / ulp1 : -1.0f,
+                         (ulp1 > 0.0f && gap <= 2.0f * ulp1) ? "TIE-CLASS" : "NOT-TIE");
+            std::fflush(stderr);
+        }
         // Draft-3 from the in-checkpoint MTP head. One host round-trip per
         // draft: the next AR input is the previous draft id. Draft j runs at
         // F+j (draft 0 consumes the bonus token at F over the anchor hidden,
@@ -1238,8 +1294,9 @@ public:
                     std::fprintf(stderr, "[vgraph] lane=%d F=%u action=%s\n", lane, F, act);
                 }
             };
-            // Row 20b: slots path forces eager (the table overload has no
-            // frozen graph yet) and binds the static per-lane column table.
+            // Map step 5: slots path captures the table overload below
+            // (verify_slots_exec_, lane-keyed); the static per-lane column
+            // table is bound here.
             const Tensor vcoltab(static_cast<char*>(mtp_coltab_store_.p) +
                                      static_cast<std::size_t>(lane) * 16U,
                                  DType::I32, {4, 1});
@@ -1899,6 +1956,84 @@ public:
                                                venv, vhid, vlog, vtok);
                     vglog("capture-fail");
                 }
+            } else if (vgraph_on && slots_on && !capturing &&
+                       std::getenv("NINFER_SLOT_ORACLE") == nullptr && !verify_slots_dead_ &&
+                       verify_slots_exec_ != nullptr && lane == verify_slots_lane_) {
+                // Map step 5 probe: replay the frozen slots-verify graph.
+                // Per-step device-data (vids/vpos/vrow/vsrc/vdst/vval
+                // contents at fixed mbase offsets, pool slot contents via
+                // the lane->spare copy above) was uploaded eagerly before
+                // this point; only this launch replays.
+                CUDA_CHECK(cudaGraphLaunch(verify_slots_exec_, stream));
+                vglog("replay-slots");
+            } else if (vgraph_on && slots_on && !capturing &&
+                       std::getenv("NINFER_SLOT_ORACLE") == nullptr && !verify_slots_dead_) {
+                // Map step 5 probe: capture the table overload only
+                // (UpdateInPlace + dst + vcoltab). Pre-work (copy_slot, H2D
+                // uploads) stays eager outside capture; post-work (sync +
+                // D2H of vtok) stays outside below. Seen rule: first slots
+                // verify runs eager, capture on the 2nd+, immediate replay
+                // (WSL record-only rule). Lane-keyed: the vcoltab slice
+                // address (lane*16) bakes in, so a lane change destroys and
+                // recaptures. Draft shapes (bonus argmax, 3x
+                // mtp_forward_ar_step with per-step ar_env, all host
+                // syncs/D2H) never enter capture: MTP decode keeps
+                // --no-cuda-graph semantics (program_impl.cpp:49,80-84).
+                if (!verify_slots_seen_) {
+                    card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst,
+                                               venv, vhid, vlog, vtok, vcoltab_p);
+                    verify_slots_seen_ = true;
+                    vglog("eager-slots-first");
+                } else {
+                    if (verify_slots_exec_ != nullptr && lane != verify_slots_lane_) {
+                        cudaGraphExecDestroy(verify_slots_exec_);
+                        verify_slots_exec_ = nullptr;
+                    }
+                    cudaGraph_t sgraph = nullptr;
+                    bool sok           = false;
+                    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) ==
+                        cudaSuccess) {
+                        try {
+                            card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc,
+                                                       vdst, venv, vhid, vlog, vtok, vcoltab_p);
+                        } catch (...) {
+                            cudaStreamEndCapture(stream, &sgraph);
+                            if (sgraph != nullptr) cudaGraphDestroy(sgraph);
+                            verify_slots_dead_ = true;
+                            throw;
+                        }
+                        if (cudaStreamEndCapture(stream, &sgraph) == cudaSuccess &&
+                            sgraph != nullptr) {
+                            cudaGraphExec_t sexec = nullptr;
+                            if (cudaGraphInstantiate(&sexec, sgraph, nullptr, nullptr, 0) ==
+                                    cudaSuccess &&
+                                sexec != nullptr) {
+                                cudaGraphDestroy(sgraph);
+                                verify_slots_exec_ = sexec;
+                                verify_slots_lane_ = lane;
+                                // WSL record-only: the capture pass never
+                                // executed, so this step's outputs come from
+                                // an immediate replay (same rule as ver/M=4).
+                                CUDA_CHECK(cudaGraphLaunch(verify_slots_exec_, stream));
+                                vglog("capture-slots");
+                                sok = true;
+                            } else {
+                                if (sexec != nullptr) cudaGraphExecDestroy(sexec);
+                                cudaGraphDestroy(sgraph);
+                            }
+                        } else if (sgraph != nullptr) {
+                            cudaGraphDestroy(sgraph);
+                        }
+                    }
+                    if (!sok) {
+                        // Capture failed without throwing: park dead and run
+                        // this step eager (capture didn't execute).
+                        verify_slots_dead_ = true;
+                        card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst,
+                                                   venv, vhid, vlog, vtok, vcoltab_p);
+                        vglog("capture-slots-fail");
+                    }
+                }
             } else {
                 card_->target_verify_batch(vids, vpos, vpos, vval, vrow, vsrc, vdst, venv,
                                            vhid, vlog, vtok, vcoltab_p);
@@ -2123,11 +2258,35 @@ public:
     // stashed so the first MTP step needs no replay.
     void mtp_prefill_fill(const batch::StepPlan& plan, const batch::RaggedBatch& batch,
                           const std::vector<std::int32_t>& row_slot,
-                          const std::vector<std::int32_t>& pos) {
+                          const std::vector<std::int32_t>& pos, const Tensor& prefill_hidden) {
         cudaStream_t stream = device_.stream;
         char* mbase         = static_cast<char*>(scratch_.p);
         const std::int32_t H     = static_cast<std::int32_t>(hidden_);
         const std::int32_t V     = static_cast<std::int32_t>(text_vocab_);
+        // Row-23 rung-1 (DEFAULT ON since consolidation;
+        // NINFER_MTP_WARM_HIDDENS=0 opts out): the ordinary prefill forward
+        // above already computed every row's target hidden into prefill_hidden
+        // ({H,T}, still live: nothing overwrote it since). Reuse the column
+        // per row and skip the mirrored ordinary row (and its per-row
+        // logits) entirely. GDN shadow chaining is untouched; text KV keeps
+        // the prefill writes (overwrite-identical). Only the slice tail pays
+        // one lm_head projection for its anchor logits (bonus token).
+        const char* warm_hiddens_env = std::getenv("NINFER_MTP_WARM_HIDDENS");
+        const bool warm_hiddens =
+            warm_hiddens_env == nullptr || std::string(warm_hiddens_env) != "0";
+        // Row-23 rung-2 (DEFAULT ON since consolidation;
+        // NINFER_MTP_WARM_BATCHED=0 opts out): one batched MTP pass per
+        // prefill_chunk-wide span instead of the sequential per-row forwards.
+        // Rung-1 (above) is the fallback and the tail-anchor source in both
+        // modes.
+        const char* warm_batched_env = std::getenv("NINFER_MTP_WARM_BATCHED");
+        const bool warm_batched =
+            warm_hiddens &&
+            (warm_batched_env == nullptr || std::string(warm_batched_env) != "0");
+        const char* prefill_base =
+            warm_hiddens ? static_cast<const char*>(prefill_hidden.data) : nullptr;
+        const std::uint32_t chunk =
+            warm_chunk_ != 0 ? warm_chunk_ : 1U;
         for (std::size_t r = 0; r < plan.prefill.size(); ++r) {
             const std::int32_t lane   = row_slot[r];
             const std::int32_t shadow = mtp_shadow_base_ + lane;
@@ -2135,7 +2294,44 @@ public:
                                        cudaMemcpyHostToDevice, stream));
             const std::uint32_t off   = batch.seq_offsets[r];
             const std::uint32_t count = batch.seq_offsets[r + 1] - off;
+            if (warm_batched && count > 0) {
+                // Batched warming: chunk the slice span. Hidden columns are
+                // already a contiguous {H,T} block; ids/positions stage
+                // through the batch regions. Outputs are discard (KV fill is
+                // the product). Envelope is the tight per-chunk span, same
+                // convention as the per-row loop.
+                for (std::uint32_t base = 0; base < count;) {
+                    std::uint32_t span = count - base;
+                    if (span > chunk) { span = chunk; }
+                    const std::int32_t T = static_cast<std::int32_t>(span);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        mbase + mtp_batch_ids_, batch.tokens.data() + off + base,
+                        static_cast<std::size_t>(span) * sizeof(TokenId),
+                        cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        mbase + mtp_batch_pos_, pos.data() + off + base,
+                        static_cast<std::size_t>(span) * 4U, cudaMemcpyHostToDevice,
+                        stream));
+                    const Tensor ids_b(mbase + mtp_batch_ids_, DType::I32, {T});
+                    const Tensor pos_b(mbase + mtp_batch_pos_, DType::I32, {T});
+                    const Tensor hid_b(
+                        const_cast<char*>(prefill_base) +
+                            (static_cast<std::size_t>(off) + base) * hidden_ * 2U,
+                        DType::BF16, {H, T});
+                    Tensor out_b(mbase + mtp_batch_out_, DType::BF16, {H, T});
+                    const std::uint32_t p_first = pos[off + base];
+                    const std::uint32_t p_last  = pos[off + base + span - 1];
+                    const ops::CausalAttentionExecutionEnvelope batch_env{
+                        p_first + 1, p_last + 1};
+                    card_->mtp_forward_batch(ids_b, hid_b, pos_b, batch_env, out_b, -1,
+                                             nullptr, nullptr);
+                    base += span;
+                }
+            }
             for (std::uint32_t base = 0; base < count; ++base) {
+                // Rung-2: the batched block above already filled MTP KV for
+                // every row; only the tail anchor still runs per slice.
+                if (warm_batched && base + 1 != count) { continue; }
                 const std::int32_t one = 1;
                 std::int32_t h_ids     = static_cast<std::int32_t>(batch.tokens[off + base]);
                 std::int32_t h_pos     = pos[off + base];
@@ -2162,13 +2358,31 @@ public:
                 Tensor mh_t(mbase + mtp_fill_mh_, DType::BF16, {H, one});
                 const ops::CausalAttentionExecutionEnvelope fill_env{
                     static_cast<std::uint32_t>(h_pos + 1), static_cast<std::uint32_t>(h_pos + 1)};
-                card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, ssrc_t, sdst_t,
-                                             fill_env, hid_t, log_t);
-                card_->mtp_forward_batch(ids_t, hid_t, pos_t, fill_env, mh_t, -1, nullptr,
-                                         nullptr);
+                if (warm_hiddens) {
+                    // Rung-1: copy this row's prefill hidden column in (one
+                    // HxBF16 D2D); no ordinary row, no per-row logits.
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        hid_t.data,
+                        prefill_base +
+                            (static_cast<std::size_t>(off) + base) * hidden_ * 2U,
+                        static_cast<std::size_t>(hidden_) * 2U, cudaMemcpyDeviceToDevice,
+                        stream));
+                } else {
+                    card_->ordinary_decode_batch(ids_t, pos_t, pos_t, row_t, ssrc_t, sdst_t,
+                                                 fill_env, hid_t, log_t);
+                }
+                if (!warm_batched) {
+                    card_->mtp_forward_batch(ids_t, hid_t, pos_t, fill_env, mh_t, -1, nullptr,
+                                             nullptr);
+                }
                 if (base + 1 == count) {
                     // Slice tail is the anchor: stash its exact hidden and
                     // as-input logits for the first MTP step (no replay).
+                    if (warm_hiddens) {
+                        // Rung-1: the one projection per request. Warming
+                        // fills MTP KV only; per-row logits are skipped.
+                        card_->project_target_tail(hid_t, log_t);
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_store_.p) +
                                                        static_cast<std::size_t>(lane) *
                                                            hidden_ * 2U,
@@ -2282,6 +2496,10 @@ private:
     std::size_t mtp_fill_hid_  = 0;
     std::size_t mtp_fill_log_  = 0;
     std::size_t mtp_fill_mh_   = 0;
+    std::size_t mtp_batch_ids_ = 0;
+    std::size_t mtp_batch_pos_ = 0;
+    std::size_t mtp_batch_out_ = 0;
+    std::uint32_t warm_chunk_  = 0;
     DeviceBuffer pool_store_;
     DeviceBuffer round_store_;
     std::unique_ptr<DeviceArena> work_;
@@ -2333,6 +2551,14 @@ private:
     cudaGraphExec_t verify_exec_ = nullptr;
     bool verify_seen_            = false;
     bool verify_dead_            = false;
+    // Map step 5 (slots-verify probe, NINFER_SLOTS=1): one frozen ver/M=4
+    // exec for the column-table overload (GLOBAL shape, lane-keyed address:
+    // the vcoltab slice address lane*16 is baked at capture). Fail-closed
+    // to eager; never touches the legacy verify_exec_ above.
+    cudaGraphExec_t verify_slots_exec_ = nullptr;
+    bool verify_slots_seen_            = false;
+    bool verify_slots_dead_            = false;
+    int verify_slots_lane_             = -1;
     // Row-18: one frozen dec/M=1 commit exec (GLOBAL). Commit rows share
     // hid1/log1; the anchor replay's anchor_hid never enters (allow_graph).
     cudaGraphExec_t commit_exec_ = nullptr;
@@ -2351,6 +2577,10 @@ public:
         if (verify_exec_ != nullptr) {
             cudaGraphExecDestroy(verify_exec_);
             verify_exec_ = nullptr;
+        }
+        if (verify_slots_exec_ != nullptr) {
+            cudaGraphExecDestroy(verify_slots_exec_);
+            verify_slots_exec_ = nullptr;
         }
         if (commit_exec_ != nullptr) {
             cudaGraphExecDestroy(commit_exec_);

@@ -693,6 +693,18 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     proposal_argmax(mtp_hidden, logits, draft_token);
 }
 
+void TextContext::project_target_tail(const Tensor& hidden_col, Tensor& logits) {
+    if (lm_head_ == nullptr) {
+        throw std::logic_error("project_target_tail requires a bound lm_head");
+    }
+    const std::int32_t hidden_dim = dimension(config_.hidden_size);
+    const std::int32_t vocab      = dimension(config_.vocab_size);
+    require_tensor_shape(hidden_col, DType::BF16, {hidden_dim, 1}, "warming tail hidden");
+    require_tensor_shape(logits, DType::BF16, {vocab, 1}, "warming tail logits");
+    auto scope = work_.scope();
+    project(hidden_col, *lm_head_, logits, work_, ctx_.stream);
+}
+
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_source_slots,

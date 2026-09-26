@@ -240,6 +240,11 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+    // Row-23 rung-1: project one target hidden column through lm_head_.
+    // Warming fills MTP KV only, so per-row target logits are skipped;
+    // the slice tail still needs its anchor logits (bonus token), via
+    // exactly one projection per request.
+    void project_target_tail(const Tensor& hidden_col, Tensor& logits);
 private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
