@@ -227,6 +227,28 @@ public:
                 throw std::logic_error("serve forward MTP needs bound MTP parameters");
             }
         }
+        // Row-23 conc resume (task 8, default off): mid-request spec toggle.
+        // NINFER_MTP_TOGGLE_AFTER=K runs K pure-decode steps on the lane,
+        // then NINFER_MTP_TOGGLE_OFF=N forces the next N steps onto the
+        // ordinary (spec-off) path, then spec resumes with a batched
+        // catch-up fill over the skipped positions. Unset (both zero) means
+        // no toggle: dispatch is exactly as before. Parsed once at startup;
+        // per-lane counters reset on lane admission. OFF is clamped so the
+        // catch-up staging bound below stays sane.
+        toggle_after_ = 0;
+        toggle_off_   = 0;
+        if (mtp_enabled_) {
+            if (const char* a = std::getenv("NINFER_MTP_TOGGLE_AFTER")) {
+                long v = std::strtol(a, nullptr, 10);
+                if (v > 1000000) { v = 1000000; }
+                if (v > 0) { toggle_after_ = static_cast<std::uint32_t>(v); }
+            }
+            if (const char* o = std::getenv("NINFER_MTP_TOGGLE_OFF")) {
+                long v = std::strtol(o, nullptr, 10);
+                if (v > 4096) { v = 4096; }
+                if (v > 0) { toggle_off_ = static_cast<std::uint32_t>(v); }
+            }
+        }
         text_vocab_ = text_config.vocab_size;
         if (mtp_enabled_ && text_vocab_ == 0) {
             throw std::logic_error("serve forward MTP needs a vocabulary");
@@ -511,6 +533,14 @@ public:
             DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
+        // Row-23 conc resume (task 8): per-lane staging for the forced-off
+        // window's target-hidden columns (OFF steps x H per lane). Zero bytes
+        // unless the toggle is armed; decode steps never touch the rung-2
+        // batch regions while staging here, and the fill never touches this.
+        if (mtp_enabled_ && toggle_off_ > 0) {
+            catchup_store_ = DeviceBuffer(static_cast<std::size_t>(hidden_) *
+                                          toggle_off_ * max_seqs_ * 2U);
+        }
         // Row 20b layout A: static column-slot tables, init-filled
         // once: t[c] = column block, 4 consecutive slots per group. The
         // width-4 snapshot kernel publishes col c -> base+c, then commit
@@ -620,6 +650,17 @@ public:
         device_.synchronize();
     }
 
+    // Row-23 conc resume (task 8): helpers defined after mtp_prefill_fill.
+    // (No forward declarations: in-class call sites resolve at the
+    // complete-class context, and separate declarations trip the
+    // overload checker on this toolchain.)
+    [[nodiscard]] bool toggle_armed() const noexcept {
+        return mtp_enabled_ && toggle_off_ > 0;
+    }
+    [[nodiscard]] bool in_toggle_window(std::uint32_t toggle_seen) const noexcept {
+        return toggle_seen > toggle_after_ && toggle_seen <= toggle_after_ + toggle_off_;
+    }
+
     runtime::StepDecodedPairs step(const batch::StepPlan& plan,
                                    const batch::StepDispatch& dispatch) {
         // Same pins as run_step_forward: M == prefill + n_decode, rows == M,
@@ -689,6 +730,12 @@ public:
                 slot.touched_as_prefill = false;
                 slot.mtp_valid_pos      = 0;
                 slot.anchor_valid       = false;
+                slot.mtp_toggle_seen    = 0;
+                slot.stage_start        = 0;
+                slot.staged_n           = 0;
+                slot.staged_overflow    = false;
+                slot.staged_ids.clear();
+                slot.staged_pos.clear();
                 std::vector<DeviceKVPageHandle> pages;
                 pages.reserve(pages_per_slot_);
                 for (std::uint32_t l = 0; l < pages_per_slot_; ++l) {
@@ -763,14 +810,44 @@ public:
         // fallback + kill switch; default unset = spec allowed). Read once
         // per step (cheap getenv; correctness over caching).
         const bool mtp_force_off = std::getenv("NINFER_MTP_FORCE_OFF") != nullptr;
+        // Row-23 conc resume (task 8): mid-request toggle + gap resume. When
+        // disarmed (default) the block below reduces to the gate above.
+        const bool armed = toggle_armed();
         if (mtp_enabled_ && !mtp_force_off && n_pref == 0 && n_dec == 1) {
             const std::int32_t mtp_lane = row_slot[0];
-            const ServeSlot& mslot = slots_[static_cast<std::size_t>(mtp_lane)];
+            ServeSlot& mslot = slots_[static_cast<std::size_t>(mtp_lane)];
             const std::uint32_t frontier = mslot.next_pos - 1;
-            if (mslot.next_pos >= 1 && mslot.mtp_valid_pos == frontier &&
+            bool window = false;
+            if (armed) {
+                toggle_tick_lane(mtp_lane);
+                window = in_toggle_window(mslot.mtp_toggle_seen);
+            }
+            if (!window && mslot.next_pos >= 1 && mslot.mtp_valid_pos == frontier &&
                 frontier + models::qwen3_5::execution::kMtpSpecDecodeDrafts + 1 <=
                     max_context_) {
                 return step_mtp_decode(batch, row_slot);
+            }
+            if (!window && armed && mslot.next_pos >= 1 && mslot.mtp_valid_pos < frontier &&
+                frontier + models::qwen3_5::execution::kMtpSpecDecodeDrafts + 1 <=
+                    max_context_) {
+                // Resume after the forced-off window (or any staged gap): the
+                // staged history exactly covers [mtp_valid_pos, frontier), so
+                // rebuild the MTP KV prefix + anchor stash with one batched
+                // fill and run the MTP step. Coverage mismatch fails closed
+                // to the ordinary path below (today's behavior).
+                if (mtp_resume_catchup(
+                        mtp_lane, batch.tokens[batch.seq_offsets[0]], frontier)) {
+                    return step_mtp_decode(batch, row_slot);
+                }
+            }
+            // Window (forced spec-off) and gate misses fall through to the
+            // ordinary path; window steps stage hidden below for the resume.
+        } else if (armed && !mtp_force_off && n_pref == 0 && n_dec > 1) {
+            // Conc-N decode steps are shape-ineligible for MTP but still
+            // advance MTP holes: tick every lane so a window spanning conc-2
+            // stages the same per-lane history.
+            for (std::size_t i = 0; i < n_dec; ++i) {
+                toggle_tick_lane(row_slot[n_pref + i]);
             }
         }
         cudaStream_t stream = device_.stream;
@@ -877,6 +954,12 @@ public:
             }
         }
         decoded = step_decode_layers(plan, batch, view, tensors, row_slot, n_pref, n_dec);
+        if (armed && n_pref == 0 && n_dec > 0) {
+            // Forced-off window steps leave MTP KV behind but keep the true
+            // target hidden live in tensors.hidden: stage each in-window
+            // lane's column for the batched resume fill.
+            mtp_stage_decode_hidden(batch, row_slot, n_pref, n_dec, pos, tensors.hidden);
+        }
         if (mtp_enabled_ && n_pref > 0) {
             // S7 MTP-KV fill: the ordinary forward above advanced text KV
             // and GDN only. Mirror each prefill slice through the MTP layer
@@ -884,6 +967,24 @@ public:
             // stays warm for later decode-only MTP steps. tensors.hidden
             // still holds every prefill row's target hidden (rung-1 input).
             mtp_prefill_fill(plan, batch, row_slot, pos, tensors.hidden);
+            if (armed) {
+                // The fill rewarmed every prefill lane (mtp_valid_pos held at
+                // next_pos, fresh anchor): staged window history for those
+                // lanes is stale, drop it. Decode rows riding a mixed step
+                // advanced without staging: their coverage is unrecoverable,
+                // fail those lanes closed (resume falls back to ordinary).
+                for (std::size_t r = 0; r < plan.prefill.size(); ++r) {
+                    ServeSlot& pslot = slots_[static_cast<std::size_t>(row_slot[r])];
+                    pslot.staged_n        = 0;
+                    pslot.staged_overflow = false;
+                    pslot.staged_ids.clear();
+                    pslot.staged_pos.clear();
+                    pslot.stage_start = pslot.mtp_valid_pos;
+                }
+                for (std::size_t i = 0; i < n_dec; ++i) {
+                    slots_[static_cast<std::size_t>(row_slot[n_pref + i])].staged_overflow = true;
+                }
+            }
         }
         if (std::getenv("NINFER_SERVE_STEP_TRACE") != nullptr) {
             for (std::size_t d = 0; d < decoded.size(); ++d) {
@@ -1697,6 +1798,163 @@ public:
         }
     }
 
+    // Row-23 conc resume (task 8): count one pure-decode step on the lane.
+    // On window entry the gap starts at the current MTP frontier; a lane
+    // that enters with a pre-existing (unstaged) hole can never match
+    // coverage and fails closed at resume via staged_overflow below.
+    void toggle_tick_lane(std::int32_t lane) {
+        ServeSlot& slot = slots_[static_cast<std::size_t>(lane)];
+        ++slot.mtp_toggle_seen;
+        if (slot.staged_n == 0 && !slot.staged_overflow &&
+            in_toggle_window(slot.mtp_toggle_seen)) {
+            slot.stage_start = slot.mtp_valid_pos;
+        }
+    }
+
+    // Stage one in-window lane column per decode row: the ordinary forward's
+    // target hidden (device D2D into the lane's catchup_store_ block) plus
+    // the row's (token, pos) on host. Positions must extend the staged span
+    // contiguously; anything else (overflow, non-unit rows, out-of-window)
+    // marks the lane so resume fails closed to the ordinary path.
+    void mtp_stage_decode_hidden(const batch::RaggedBatch& batch,
+                                 const std::vector<std::int32_t>& row_slot, std::size_t n_pref,
+                                 std::size_t n_dec, const std::vector<std::int32_t>& pos,
+                                 const Tensor& hidden) {
+        cudaStream_t stream = device_.stream;
+        char* cbase         = static_cast<char*>(catchup_store_.p);
+        for (std::size_t i = 0; i < n_dec; ++i) {
+            const std::size_t s    = n_pref + i;
+            const std::int32_t lane = row_slot[s];
+            ServeSlot& slot         = slots_[static_cast<std::size_t>(lane)];
+            if (!in_toggle_window(slot.mtp_toggle_seen) || slot.staged_overflow) { continue; }
+            const std::uint32_t flat  = batch.seq_offsets[s];
+            const std::uint32_t width = batch.seq_offsets[s + 1] - flat;
+            const std::int32_t p      = pos[flat];
+            if (width != 1 || slot.staged_n >= toggle_off_ ||
+                p != static_cast<std::int32_t>(slot.stage_start + slot.staged_n)) {
+                slot.staged_overflow = true;
+                continue;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                cbase +
+                    (static_cast<std::size_t>(lane) * toggle_off_ + slot.staged_n) * hidden_ *
+                        2U,
+                static_cast<const char*>(hidden.data) +
+                    static_cast<std::size_t>(flat) * hidden_ * 2U,
+                static_cast<std::size_t>(hidden_) * 2U, cudaMemcpyDeviceToDevice, stream));
+            slot.staged_ids.push_back(static_cast<std::int32_t>(batch.tokens[flat]));
+            slot.staged_pos.push_back(p);
+            ++slot.staged_n;
+        }
+    }
+
+    // Batched catch-up over the skipped span [mtp_valid_pos, frontier),
+    // reusing the rung-2 chunked-mtp_forward_batch shape (tight per-chunk
+    // envelope, discard output; KV fill is the product), then the resume
+    // anchor row (ordinary M=1 lane-into-lane, eager) + its MTP refill +
+    // anchor stash, mirroring the commit tail. On success the lane meets
+    // the MTP dispatch preconditions exactly (mtp_valid_pos == frontier,
+    // live stash on the resume input). Returns false without touching
+    // device state when coverage is inexact; the caller then runs the
+    // ordinary path (today's behavior).
+    bool mtp_resume_catchup(std::int32_t lane, TokenId anchor_tok, std::uint32_t frontier) {
+        ServeSlot& slot = slots_[static_cast<std::size_t>(lane)];
+        if (slot.staged_overflow || slot.staged_n == 0 ||
+            slot.stage_start != slot.mtp_valid_pos ||
+            slot.stage_start + slot.staged_n != frontier) {
+            return false;
+        }
+        cudaStream_t stream = device_.stream;
+        char* mbase         = static_cast<char*>(scratch_.p);
+        const char* cbase   = static_cast<const char*>(catchup_store_.p);
+        const std::int32_t H     = static_cast<std::int32_t>(hidden_);
+        const std::int32_t V     = static_cast<std::int32_t>(text_vocab_);
+        const std::uint32_t chunk = warm_chunk_ != 0 ? warm_chunk_ : 1U;
+        CUDA_CHECK(cudaMemcpyAsync(io_->backend_kv_table_row.data, &lane, sizeof(lane),
+                                   cudaMemcpyHostToDevice, stream));
+        for (std::uint32_t base = 0; base < slot.staged_n;) {
+            std::uint32_t span = slot.staged_n - base;
+            if (span > chunk) { span = chunk; }
+            const std::int32_t T = static_cast<std::int32_t>(span);
+            CUDA_CHECK(cudaMemcpyAsync(
+                mbase + mtp_batch_ids_, slot.staged_ids.data() + base,
+                static_cast<std::size_t>(span) * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                mbase + mtp_batch_pos_, slot.staged_pos.data() + base,
+                static_cast<std::size_t>(span) * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            const Tensor ids_b(mbase + mtp_batch_ids_, DType::I32, {T});
+            const Tensor pos_b(mbase + mtp_batch_pos_, DType::I32, {T});
+            const Tensor hid_b(
+                const_cast<char*>(cbase) +
+                    (static_cast<std::size_t>(lane) * toggle_off_ + base) * hidden_ * 2U,
+                DType::BF16, {H, T});
+            Tensor out_b(mbase + mtp_batch_out_, DType::BF16, {H, T});
+            const std::uint32_t p_first =
+                static_cast<std::uint32_t>(slot.staged_pos[base]);
+            const std::uint32_t p_last =
+                static_cast<std::uint32_t>(slot.staged_pos[base + span - 1]);
+            const ops::CausalAttentionExecutionEnvelope batch_env{p_first + 1, p_last + 1};
+            card_->mtp_forward_batch(ids_b, hid_b, pos_b, batch_env, out_b, -1, nullptr,
+                                     nullptr);
+            base += span;
+        }
+        // Anchor row: the resume input was never executed (the ordinary path
+        // below never ran for this step), so execute it lane-into-lane here.
+        // The lane holds the prefix through frontier - 1, exactly the commit
+        // trailing-row precondition.
+        Tensor hid1(mbase + mtp_hid1_, DType::BF16, {H, 1});
+        Tensor log1(mbase + mtp_log1_, DType::BF16, {V, 1});
+        run_single_row(static_cast<std::int32_t>(anchor_tok), frontier, lane, lane, lane,
+                       hid1, log1);
+        // Anchor MTP refill: consumes the last skipped hidden (bridge
+        // semantics: previous hidden + current token), same as the commit's
+        // final refill.
+        {
+            const Tensor tok_in(mbase + mtp_ids_, DType::I32, {1});
+            const Tensor pos_t(mbase + mtp_pos_, DType::I32, {1});
+            Tensor mh0(mbase + mtp_mha_, DType::BF16, {H, 1});
+            Tensor mh1(mbase + mtp_mhb_, DType::BF16, {H, 1});
+            CUDA_CHECK(cudaMemcpyAsync(
+                mh1.data,
+                cbase +
+                    (static_cast<std::size_t>(lane) * toggle_off_ + slot.staged_n - 1) *
+                        hidden_ * 2U,
+                static_cast<std::size_t>(hidden_) * 2U, cudaMemcpyDeviceToDevice, stream));
+            const std::int32_t atok = static_cast<std::int32_t>(anchor_tok);
+            const std::int32_t apos = static_cast<std::int32_t>(frontier);
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_ids_, &atok, sizeof(atok),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mbase + mtp_pos_, &apos, sizeof(apos),
+                                       cudaMemcpyHostToDevice, stream));
+            const ops::CausalAttentionExecutionEnvelope cenv{frontier + 1, frontier + 1};
+            card_->mtp_forward_batch(tok_in, mh1, pos_t, cenv, mh0, -1, nullptr, nullptr);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_store_.p) +
+                                           static_cast<std::size_t>(lane) * hidden_ * 2U,
+                                   hid1.data, static_cast<std::size_t>(hidden_) * 2U,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(anchor_logits_.p) +
+                                           static_cast<std::size_t>(lane) * text_vocab_ * 2U,
+                                   log1.data,
+                                   static_cast<std::size_t>(text_vocab_) * 2U,
+                                   cudaMemcpyDeviceToDevice, stream));
+        slot.anchor_token  = anchor_tok;
+        slot.anchor_valid  = true;
+        slot.mtp_valid_pos = frontier;
+        if (std::getenv("NINFER_MTP_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[mtp-resume] lane=%d F=%u gap=%u\n", lane, frontier,
+                         slot.staged_n);
+            std::fflush(stderr);
+        }
+        slot.staged_n = 0;
+        slot.staged_ids.clear();
+        slot.staged_pos.clear();
+        slot.stage_start = frontier;
+        return true;
+    }
+
 private:
     struct ServeSlot {
         bool in_use             = false;
@@ -1708,6 +1966,17 @@ private:
         std::uint32_t mtp_valid_pos = 0;
         TokenId anchor_token        = 0;
         bool anchor_valid           = false;
+        // Row-23 conc resume (task 8, default off): mid-request spec toggle
+        // bookkeeping. mtp_toggle_seen counts pure-decode steps on this lane
+        // while armed; stage_* records the forced-off window's (token, pos)
+        // plus staged target-hidden columns in catchup_store_ for the batched
+        // resume fill. All zero/unused unless NINFER_MTP_TOGGLE_OFF is set.
+        std::uint32_t mtp_toggle_seen = 0;
+        std::uint32_t stage_start     = 0;
+        std::uint32_t staged_n        = 0;
+        bool staged_overflow          = false;
+        std::vector<std::int32_t> staged_ids;
+        std::vector<std::int32_t> staged_pos;
     };
 
     DeviceContext& device_;
@@ -1791,6 +2060,10 @@ private:
     std::size_t mtp_batch_pos_ = 0;
     std::size_t mtp_batch_out_ = 0;
     std::uint32_t warm_chunk_  = 0;
+    // Row-23 conc resume (task 8): toggle window + catch-up staging store.
+    std::uint32_t toggle_after_ = 0;
+    std::uint32_t toggle_off_   = 0;
+    DeviceBuffer catchup_store_;
     DeviceBuffer pool_store_;
     DeviceBuffer round_store_;
     std::unique_ptr<DeviceArena> work_;
