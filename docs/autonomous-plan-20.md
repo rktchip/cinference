@@ -45,7 +45,9 @@ MTP PATH
 12. Delete legacy rows; free shadow; oracle slots only when oracle on.
 13. Small-m ONLY if step 3 shows v3 M=4 >1.3x floor. Route verify M=4 AND
     m=2..8. Predict verify ~25-30 -> ~10-12ms (medium).
-14. Adaptive gate (rolling E<2.5 -> off) + k resweep (2/3/4). Lowaccept >= off.
+14. DEMOTED 2026-09-27 (FOX wins by 22.5%; lowaccept premise gone). Safety net
+    only for pathological prompts: adaptive gate (rolling E<2.5 -> off) +
+    k resweep (2/3/4). Lowaccept >= off.
 15. On-device accept ONLY if capture shows sync gaps >=1ms/step.
 
 LONG CONTEXT / CONCURRENCY
