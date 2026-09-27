@@ -291,23 +291,43 @@ public:
         if (mtp_enabled_ && text_vocab_ == 0) {
             throw std::logic_error("serve forward MTP needs a vocabulary");
         }
+        // Memory diet: the MTP decode step is single-row (only n_dec==1
+        // dispatches step_mtp_decode; every other mix stays spec-off), so at
+        // most one lane's verify columns are live at a time. With <=2 spec
+        // lanes the 4 verify column slots are one shared pool instead of 4
+        // per lane; wider configs keep per-lane columns.
+        mtp_column_groups_ =
+            mtp_enabled_ ? (max_seqs_ <= 2 ? 1U : max_seqs_) : 0U;
+        // Oracle presnap slots exist only when the oracle runs (debug only,
+        // NINFER_SLOT_ORACLE set at startup). Otherwise zero bytes.
+        mtp_oracle_on_ =
+            mtp_enabled_ && std::getenv("NINFER_SLOT_ORACLE") != nullptr;
+        mtp_extra_pool_slots_ =
+            mtp_enabled_ ? (1U + max_seqs_ + 4U * mtp_column_groups_ +
+                            (mtp_oracle_on_ ? 3U : 0U))
+                         : 0U;
         public_tokens_ =
             static_cast<std::int32_t>(dimension(parameters_.model.resources().public_token_count));
         spare_slot_ = mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) : -1;
         mtp_shadow_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 : -1;
-        // Row 20b layout A: 4 consecutive column slots per lane (k<=4
+        // Row 20b layout A: 4 consecutive column slots per group (k<=4
         // parametric; k=3 uses the first 3... width-4 snapshot publishes
         // col c -> block+c, commit copies slot[a] -> lane every accept.
-        // Static: block base per lane never changes, tables init-filled
-        // once, never rebuilt.
+        // Static: block base never changes, tables init-filled
+        // once, never rebuilt. One group is shared by all lanes when
+        // mtp_column_groups_==1 (<=2 spec lanes); otherwise one group
+        // per lane (see mtp_column_slot).
         mtp_column_base_ =
             mtp_enabled_ ? static_cast<std::int32_t>(max_seqs_) + 1 + static_cast<std::int32_t>(max_seqs_) : -1;
         // Row 20b oracle: three presnap slots (lane + spare + shadow: the
         // legacy probe clobbers spare/shadow as ping/pong scratch, and the
-        // real path needs all three pristine). Debug only.
+        // real path needs all three pristine). Debug only: allocated only
+        // when NINFER_SLOT_ORACLE was set at startup (-1 otherwise, and the
+        // step gate additionally requires a live base so a late-set env can
+        // never index an unallocated slot).
         mtp_oracle_base_ =
-            mtp_enabled_ ? mtp_column_base_ + 4 * static_cast<std::int32_t>(max_seqs_) : -1;
+            mtp_oracle_on_ ? mtp_column_base_ + 4 * static_cast<std::int32_t>(mtp_column_groups_) : -1;
         hidden_      = static_cast<std::uint32_t>(dimension(text_config.hidden_size));
         max_tokens_  = options.prefill_chunk + max_seqs_;
         max_blocks_  = (max_context_ + 15U) / 16U;
@@ -340,6 +360,63 @@ public:
         kv_store_ = DeviceBuffer(kv_builder.finish(256));
         kv_       = std::make_unique<models::qwen3_5::PagedKVCache>(
             DeviceSpan{kv_store_.p, kv_store_.bytes}, kv_layout.text_kv);
+        // Memory diet (b): pool+KV sizing is derived from the memory budget.
+        // NINFER_MTP_BUDGET_MIB caps the MTP device residency (MTP KV pages +
+        // MTP-extra GDN pool slots + column tables); unset/0 = uncapped and
+        // the sizes stay as derived above. A configuration that would exceed
+        // the budget is refused here with the byte breakdown -- over-budget
+        // requests are never spilled/demoted to host to make room.
+        if (mtp_enabled_) {
+            const std::size_t mtp_kv_bytes =
+                kv_layout.mtp_kv ? kv_layout.mtp_kv->payload_bytes() : 0;
+            std::size_t gdn_slot_bytes = 0;
+            if (text_config.gdn && text_config.linear_attention_layers != 0) {
+                const Tensor conv1(
+                    nullptr, DType::BF16,
+                    {static_cast<std::int32_t>(dimension(text_config.gdn->conv_channels())),
+                     static_cast<std::int32_t>(
+                         dimension(text_config.gdn->linear_conv_kernel_dim)) -
+                         1,
+                     1});
+                const Tensor rec1(
+                    nullptr, DType::FP32,
+                    {static_cast<std::int32_t>(
+                         dimension(text_config.gdn->linear_key_head_dim)),
+                     static_cast<std::int32_t>(
+                         dimension(text_config.gdn->linear_value_head_dim)),
+                     static_cast<std::int32_t>(
+                         dimension(text_config.gdn->linear_num_value_heads)),
+                     1});
+                gdn_slot_bytes = (conv1.bytes() + rec1.bytes()) *
+                                 text_config.linear_attention_layers;
+            }
+            const std::size_t mtp_pool_bytes =
+                static_cast<std::size_t>(mtp_extra_pool_slots_) * gdn_slot_bytes;
+            const std::size_t mtp_coltab_bytes =
+                static_cast<std::size_t>(max_seqs_) * 4U * 4U;
+            const std::size_t mtp_residency_bytes =
+                mtp_kv_bytes + mtp_pool_bytes + mtp_coltab_bytes;
+            std::uint64_t budget_mib = 0;
+            if (const char* budget_env = std::getenv("NINFER_MTP_BUDGET_MIB")) {
+                budget_mib = std::strtoull(budget_env, nullptr, 10);
+            }
+            if (budget_mib != 0 &&
+                mtp_residency_bytes > budget_mib * (1ULL << 20)) {
+                throw std::invalid_argument(
+                    "serve forward MTP residency " + std::to_string(mtp_residency_bytes) +
+                    "B (kv=" + std::to_string(mtp_kv_bytes) + " pool=" +
+                    std::to_string(mtp_pool_bytes) + " coltab=" +
+                    std::to_string(mtp_coltab_bytes) + ") exceeds NINFER_MTP_BUDGET_MIB=" +
+                    std::to_string(budget_mib) + " (refused, never spilled)");
+            }
+            std::fprintf(stderr,
+                         "[mtp-budget] lanes=%u colgroups=%u oracle=%d extraslots=%u "
+                         "pool=%zuB kv=%zuB coltab=%zuB total=%zuB budget=%lluMiB\n",
+                         max_seqs_, mtp_column_groups_, mtp_oracle_on_ ? 1 : 0,
+                         mtp_extra_pool_slots_, mtp_pool_bytes, mtp_kv_bytes,
+                         mtp_coltab_bytes, mtp_residency_bytes,
+                         static_cast<unsigned long long>(budget_mib));
+        }
         if (mtp_enabled_) {
             // S7 MTP KV: one layer, one private page range per lane, lane L
             // owning the same page indices as its text range. Execution row
@@ -393,9 +470,7 @@ public:
                     .key_head_dim   = text_config.gdn ? static_cast<std::int32_t>(
                         dimension(text_config.gdn->linear_key_head_dim)) : 0,
                     .slot_count     = static_cast<std::int32_t>(max_seqs_) +
-                                    (mtp_enabled_ ? 1 + static_cast<std::int32_t>(max_seqs_) +
-                                                        4 * static_cast<std::int32_t>(max_seqs_) + 3
-                                     : 0),
+                                    static_cast<std::int32_t>(mtp_extra_pool_slots_),
                     .conv_dtype     = DType::BF16,
                 });
         pool_store_ = DeviceBuffer(pool_builder.finish(256));
@@ -491,18 +566,20 @@ public:
             DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
-        // Row 20b layout A: static per-lane column-slot tables, init-filled
-        // once: t[c] = column block, 4 consecutive slots per lane. The
+        // Row 20b layout A: static column-slot tables, init-filled
+        // once: t[c] = column block, 4 consecutive slots per group. The
         // width-4 snapshot kernel publishes col c -> base+c, then commit
-        // copies slot[a] -> lane (every accept incl a=0). Lane ids never
-        // change, so no per-step rebuild, no H2D.
+        // copies slot[a] -> lane (every accept incl a=0). With a shared
+        // pool (<=2 spec lanes) every lane's row points at the same 4
+        // slots, safe because the MTP step is single-row: one lane's
+        // snapshot+commit completes before the next lane starts.
         if (mtp_enabled_) {
             mtp_coltab_store_ = DeviceBuffer(static_cast<std::size_t>(max_seqs_) * 4U * 4U);
             std::vector<std::int32_t> coltab(static_cast<std::size_t>(max_seqs_) * 4U);
             for (std::uint32_t lane = 0; lane < max_seqs_; ++lane) {
                 for (std::int32_t c = 0; c < 4; ++c)
                     coltab[static_cast<std::size_t>(lane) * 4U + static_cast<std::size_t>(c)] =
-                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
+                        mtp_column_slot(static_cast<std::int32_t>(lane), c);
             }
             CUDA_CHECK(cudaMemcpy(mtp_coltab_store_.p, coltab.data(), coltab.size() * 4U,
                                   cudaMemcpyHostToDevice));
@@ -1179,7 +1256,8 @@ public:
             const bool capturing =
                 (cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess) &&
                 (cap_status != cudaStreamCaptureStatusNone);
-            if (slots_on && std::getenv("NINFER_SLOT_ORACLE") != nullptr && !capturing) {
+            if (slots_on && mtp_oracle_base_ >= 0 &&
+                std::getenv("NINFER_SLOT_ORACLE") != nullptr && !capturing) {
                 std::fprintf(stderr, "[slot-oracle] enter F=%u lane=%d pool_layers=%u types=%u\n",
                              F, lane, pool_->layer_count(),
                              static_cast<std::uint32_t>(
@@ -1450,8 +1528,7 @@ public:
                 // so a missing write reads back as NaN, not stale contents.
                 // 0xFF bytes = NaN for both fp32 and bf16.
                 for (std::int32_t psc = 1; psc < 4; ++psc) {
-                    const std::int32_t pslot = mtp_column_base_ +
-                                               static_cast<std::int32_t>(lane) * 4 + (psc - 1);
+                    const std::int32_t pslot = mtp_column_slot(static_cast<std::int32_t>(lane), psc - 1);
                     for (std::uint32_t gix = 0; gix < pool_->layer_count(); ++gix) {
                         Tensor prec = pool_->recurrent_slot(gix, pslot);
                         Tensor pcon = pool_->conv_slot(gix, pslot);
@@ -1484,8 +1561,7 @@ public:
                 }
                 std::int32_t coltab_host_o[4];
                 for (std::int32_t c = 0; c < 4; ++c) {
-                    coltab_host_o[c] =
-                        mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
+                    coltab_host_o[c] = mtp_column_slot(lane, c);
                 }
                 // Sentinel readback: snapshot t[aS] before copy-back. NaN
                 // here = the write to t[aS] never happened (note 1). Layout
@@ -1938,7 +2014,7 @@ public:
             // commit_len.
             std::int32_t coltab_host[4];
             for (std::int32_t c = 0; c < 4; ++c) {
-                coltab_host[c] = mtp_column_base_ + static_cast<std::int32_t>(lane) * 4 + c;
+                coltab_host[c] = mtp_column_slot(lane, c);
             }
             card_->commit_verify_slots(lane, coltab_host, accepted, 4);
             // (b) MTP refills for all but the last commit row: hidden of
@@ -2151,12 +2227,33 @@ private:
     // the max_seqs_ lane slots: [max_seqs_] is the verify spare, then one
     // shadow per lane.
     std::int32_t mtp_shadow_base_ = -1;
-    // Row 20b layout B: base of the 4 column slots per lane (static tables,
-    // init-filled once). -1 when MTP is off.
+    // Row 20b layout B: base of the column slots (static tables,
+    // init-filled once). -1 when MTP is off. With a shared pool
+    // (mtp_column_groups_==1) all lanes map into the same 4 slots via
+    // mtp_column_slot; otherwise group g serves lane g.
     std::int32_t mtp_column_base_ = -1;
+    // Number of 4-slot column groups: 1 shared pool when max_seqs_<=2,
+    // else one group per lane. 0 when MTP is off.
+    std::uint32_t mtp_column_groups_ = 0;
+    // MTP-extra GDN pool slots: 1 verify spare + 1 shadow per lane + 4
+    // column slots per group + 3 oracle presnaps (only when the oracle
+    // runs). 0 when MTP is off. The pool holds max_seqs_ lane slots plus
+    // these extras.
+    std::uint32_t mtp_extra_pool_slots_ = 0;
+    // True when NINFER_SLOT_ORACLE was set at startup (oracle presnaps
+    // allocated). A late-set env never activates the oracle: the step
+    // gate also requires mtp_oracle_base_ >= 0.
+    bool mtp_oracle_on_ = false;
+    // Column slot for (lane, c): the shared pool base when grouped,
+    // the lane's own group otherwise. Call only when MTP is on.
+    [[nodiscard]] std::int32_t mtp_column_slot(std::int32_t lane, std::int32_t c) const noexcept {
+        const std::int32_t group = (mtp_column_groups_ <= 1) ? 0 : lane;
+        return mtp_column_base_ + group * 4 + c;
+    }
     // Row 20b: per-lane {4} I32 column-slot tables (device, init-filled).
     DeviceBuffer mtp_coltab_store_;
-    // Row 20b oracle presnap slot (debug only). -1 when MTP is off.
+    // Row 20b oracle presnap slots, all three (debug only). -1 when MTP is
+    // off or NINFER_SLOT_ORACLE was unset at startup.
     std::int32_t mtp_oracle_base_ = -1;
     std::size_t mtp_ids_       = 0;
     std::size_t mtp_pos_       = 0;
