@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do
     --max-clock-drift) MAXDRIFT="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
     --ref) REF="$2"; shift 2;;
+    --port) PORT_ARG="$2"; shift 2;;
     *) shift;;
   esac
 done
@@ -70,6 +71,17 @@ else
   PIDS="$(echo "$CAPPS_F" | tr '\n' ';')"
 fi
 NSERV="$(echo "$CAPPS" | grep -c 'ninfer-serve' || true)"
+# Port rule (2026-09-26): a differently named binary can survive a
+# name-based kill and share :8902, silently cross-serving requests.
+# Attribute by socket, not by name: pre refuses on any holder.
+PORT="${PORT:-8902}"
+[ -n "${PORT_ARG:-}" ] && PORT="$PORT_ARG"
+PORT_HOLDERS="$(ss -ltnp 2>/dev/null | grep ":$PORT" | grep -o 'users:(("[^"]*",pid=[0-9]*[^)]*))' || true)"
+if [ -z "$(echo "$PORT_HOLDERS" | tr -d ' \n\r')" ]; then
+  NPORT=0
+else
+  NPORT="$(echo "$PORT_HOLDERS" | grep -c .)"
+fi
 
 # Shared (sysmem-spill) check: adapter-total SharedUsage in MiB.
 # Powershell takes seconds; pre/post only.
@@ -121,7 +133,8 @@ if [ "$MODE" = "pre" ]; then
   echo "STAMP hash=$HASH head=$HEAD mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared_live=${LIVE}MiB(ghosts=${GHOST_KNOWN}) srvrow=${SRVROW}MiB"
   [ -n "$OUT" ] && save_ref "$OUT"
   FAIL=""
-  [ "$NPROC" -gt "$ALLOW" ] && FAIL="compute_procs=${NPROC}>${ALLOW}"
+  [ "$NPORT" -gt 0 ] && FAIL="port_${PORT}_held=[${PORT_HOLDERS}]"
+  [ "$NPROC" -gt "$ALLOW" ] && FAIL="${FAIL:+$FAIL }compute_procs=${NPROC}>${ALLOW}"
   { [ "$LIVE" -gt 512 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared_live=${LIVE}MiB>512MiB(spill)"
   for s in "$S1" "$S2" "$S3"; do
     case "$s" in ''|*[!0-9]*) continue;; esac
@@ -129,6 +142,26 @@ if [ "$MODE" = "pre" ]; then
   done
   if [ -n "$FAIL" ]; then echo "REFUSE $FAIL"; exit 1; fi
   echo "GO"
+  exit 0
+fi
+
+#   s_gate_preflight.sh teardown [--port P]  # kill by PORT, not by name:
+#     SIGINT every :8902 holder, wait, verify free, SIGKILL stragglers.
+#     A name-based pkill can miss a differently named binary (2026-09-26:
+#     verify-8a1c90c survived a rung2-pattern kill and co-served :8902).
+if [ "$MODE" = "teardown" ]; then
+  for round in 1 2; do
+    PIDS="$(ss -ltnp 2>/dev/null | grep ":$PORT" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)"
+    [ -z "$(echo "$PIDS" | tr -d ' \n\r')" ] && { echo "PORT-FREE :$PORT"; exit 0; }
+    SIG="INT"; [ "$round" -eq 2 ] && SIG="KILL"
+    for p in $PIDS; do echo "TEARDOWN -$SIG $p"; kill "-$SIG" "$p" 2>/dev/null || true; done
+    sleep 8
+  done
+  LEFT="$(ss -ltnp 2>/dev/null | grep ":$PORT" || true)"
+  if [ -n "$(echo "$LEFT" | tr -d ' \n\r')" ]; then
+    echo "TEARDOWN-FAILED :$PORT still held: $LEFT"; exit 1
+  fi
+  echo "PORT-FREE :$PORT"
   exit 0
 fi
 
