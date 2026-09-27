@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/ladder_trace.h"
+#include "models/qwen3_5/execution/tail_state_diff.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
@@ -49,10 +50,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -866,6 +870,109 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::sample_decode_rows(
     CUDA_CHECK(cudaMemcpyAsync(host_tokens.data(), out.data,
                                n_dec * sizeof(TokenId), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Forced-token decode (adjudication/long-horizon harness,
+    // NINFER_FORCE_TOKENS=<ids file>, debug only): at each spec-off decode
+    // step, logs top-2 ids + values + bf16-ULP gap per row, then feeds the
+    // LISTED token as this step's decoded output (hence the next step's
+    // input) instead of the argmax. KV/GDN/state still advance through the
+    // real decode math from the forced tokens. Unset flag = zero behavior
+    // change (single getenv gate). File format: whitespace-separated decimal
+    // token ids; per-seq index 0 = that seq's first decode output.
+    if (const char* force_path = std::getenv("NINFER_FORCE_TOKENS")) {
+        struct ForceState {
+            std::string path;
+            std::vector<std::int32_t> ids;
+            std::unordered_map<std::uint64_t, std::size_t> next;
+            bool load_warned = false;
+        };
+        static ForceState force_state;
+        static std::mutex force_mu;
+        std::lock_guard force_lock(force_mu);
+        if (force_state.path != force_path) {
+            force_state.path = force_path;
+            force_state.ids.clear();
+            force_state.next.clear();
+            force_state.load_warned = false;
+            if (std::ifstream force_in(force_path); force_in) {
+                std::int32_t force_id = 0;
+                while (force_in >> force_id) { force_state.ids.push_back(force_id); }
+            }
+            if (force_state.ids.empty() && !force_state.load_warned) {
+                force_state.load_warned = true;
+                std::fprintf(stderr, "[force-tok] WARN cannot load ids from %s: forcing off\n",
+                             force_path);
+                std::fflush(stderr);
+            }
+        }
+        if (!force_state.ids.empty()) {
+            const std::size_t force_elems = static_cast<std::size_t>(vocab) * n_dec;
+            std::vector<std::uint16_t> force_host(force_elems);
+            CUDA_CHECK(cudaMemcpyAsync(force_host.data(), logits.data,
+                                       force_elems * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (std::size_t force_i = 0; force_i < n_dec; ++force_i) {
+                const std::uint64_t force_seq  = plan.decode_seq_ids[force_i];
+                const std::size_t force_k      = force_state.next[force_seq]++;
+                const std::uint16_t* force_col =
+                    force_host.data() + force_i * static_cast<std::size_t>(vocab);
+                std::int32_t force_top_ids[5] = {-1, -1, -1, -1, -1};
+                float force_top_vs[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+                for (std::int32_t force_v = 0; force_v < domain; ++force_v) {
+                    const std::uint32_t force_bits =
+                        static_cast<std::uint32_t>(force_col[force_v]) << 16;
+                    float force_x = 0.0F;
+                    std::memcpy(&force_x, &force_bits, sizeof(force_x));
+                    if (force_x != force_x) { continue; }
+                    for (int force_t = 0; force_t < 5; ++force_t) {
+                        if (force_x > force_top_vs[force_t]) {
+                            for (int force_s = 4; force_s > force_t; --force_s) {
+                                force_top_vs[force_s]  = force_top_vs[force_s - 1];
+                                force_top_ids[force_s] = force_top_ids[force_s - 1];
+                            }
+                            force_top_vs[force_t]  = force_x;
+                            force_top_ids[force_t] = force_v;
+                            break;
+                        }
+                    }
+                }
+                const float force_gap = force_top_vs[0] - force_top_vs[1];
+                int force_exp         = 0;
+                std::frexp(std::fabs(force_top_vs[0]) > 0.0F ? force_top_vs[0] : 1.0F, &force_exp);
+                const float force_ulp = std::ldexp(1.0F, force_exp - 8);
+                const std::int32_t force_in_tok =
+                    batch.tokens[batch.seq_offsets[n_pref_seqs + force_i]];
+                if (force_k < force_state.ids.size()) {
+                    const std::int32_t force_tok = force_state.ids[force_k];
+                    std::fprintf(stderr,
+                                 "[force-tok] seq=%llu row=%zu k=%zu in_tok=%d argmax=%d "
+                                 "t1=%d:%.6f t2=%d:%.6f t3=%d:%.6f t4=%d:%.6f t5=%d:%.6f "
+                                 "gap=%.6f ulp=%.6f ulps=%.1f %s "
+                                 "forced=%d\n",
+                                 (unsigned long long)force_seq, force_i, force_k,
+                                 (int)force_in_tok, (int)host_tokens[force_i],
+                                 force_top_ids[0], (double)force_top_vs[0],
+                                 force_top_ids[1], (double)force_top_vs[1],
+                                 force_top_ids[2], (double)force_top_vs[2],
+                                 force_top_ids[3], (double)force_top_vs[3],
+                                 force_top_ids[4], (double)force_top_vs[4],
+                                 (double)force_gap, (double)force_ulp,
+                                 force_ulp > 0.0F ? (double)(force_gap / force_ulp) : -1.0,
+                                 (force_ulp > 0.0F && force_gap <= 2.0F * force_ulp)
+                                     ? "TIE-CLASS"
+                                     : "NOT-TIE",
+                                 (int)force_tok);
+                    host_tokens[force_i] = force_tok;
+                } else {
+                    std::fprintf(stderr,
+                                 "[force-tok] seq=%llu row=%zu k=%zu EXHAUSTED: keeping argmax=%d\n",
+                                 (unsigned long long)force_seq, force_i, force_k,
+                                 (int)host_tokens[force_i]);
+                }
+                std::fflush(stderr);
+            }
+        }
+    }
     // DIAGNOSTIC-ONLY trace (env-gated, no numeric effect): per-decode-row
     // top-8 logits + distribution stats; optional full-domain u16 append to
     // NINFER_LOGITS_DUMP_PATH for offline solo-vs-mixed maxAbs. Reads the
@@ -1090,6 +1197,12 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
                              next_projection_hints(static_cast<int>(layer)));
                     ladder::ladder_dump(x, full ? "layer-full" : "layer-gdn",
                                         static_cast<int>(layer), stream);
+                    // Spec-off ticket step (b): tail-row state-diff probe.
+                    // Handoff tail = last prefill column. Env-gated, print-only.
+                    if (n_pref > 0 && prefill_tokens > 0) {
+                        taildiff::dump_tail_column(x, "serve", static_cast<int>(layer),
+                                                   prefill_tokens - 1, stream);
+                    }
                     if (layer <= 1) {
                         ladder::ladder_dump_raw(x, layer == 0 ? "bisect_b0_out" : "bisect_b1_out",
                                                 static_cast<int>(layer), stream);
@@ -1790,6 +1903,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto scope = work_.scope();
                 mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
             }
+            // Spec-off ticket step (b): folded-prefill / verify tail reference.
+            // Tail = last column. Env-gated, print-only; safe: all run_layers
+            // callers are eager (prefill chunks, ordinary decode, MTP verify).
+            taildiff::dump_tail_column(x, prefill ? "prefill" : "verify",
+                                       static_cast<int>(layer), x.ne[1] - 1, ctx_.stream);
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }

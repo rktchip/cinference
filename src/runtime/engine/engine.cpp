@@ -1141,15 +1141,7 @@ public:
             CUDA_CHECK(cudaMemcpy(tail_host.data(), anchor_log.data, n_vocab * 2U,
                                   cudaMemcpyDeviceToHost));
             auto bf16_to_float = [](std::uint16_t b) {
-                const std::uint32_t exp = (b >> 7) & 0xFFU;
-                const std::uint32_t mant = b & 0x7FU;
-                std::uint32_t f;
-                if (exp == 0) {
-                    f = mant << 16;
-                } else {
-                    f = ((exp + 112U) << 23) | (mant << 16);
-                }
-                if (b & 0x8000U) { f |= 0x80000000U; }
+                const std::uint32_t f = static_cast<std::uint32_t>(b) << 16;
                 float out;
                 std::memcpy(&out, &f, sizeof(out));
                 return out;
@@ -2076,32 +2068,61 @@ public:
         }
         commit[1 + accepted]       = host_targets[accepted];
         const std::uint32_t commit_len = (accepted == kDrafts) ? 5 : accepted + 2;
-        // Near-tie test (committee): top-2 logit gap of the deciding column
-        // (vcol a). Small gap at a divergence = allowed class; large gap =
-        // state bug. NINFER_MTP_LOGGAP=1, debug only (500KB D2H per step).
+        // Near-tie test (committee): top-5 logits at every verify column
+        // (vcol 0..3 = positions 0-3 along the window; the deciding column
+        // is vcol a, where host_targets[a] is the correction/extra and
+        // host_drafts[c] vs host_targets[c] names a divergence at c).
+        // Small top1-top2 gap at a divergence = allowed class; large gap =
+        // state bug. NINFER_MTP_LOGGAP=1, debug only (print-only: reads
+        // vlog, never writes device state; ~600KB D2H per column).
         if (std::getenv("NINFER_MTP_LOGGAP") != nullptr) {
             const std::size_t Vb =
                 static_cast<std::size_t>(text_vocab_);
             std::vector<std::uint16_t> col(Vb);
-            CUDA_CHECK(cudaMemcpy(col.data(), mbase + mtp_vlog_ +
-                                                  static_cast<std::size_t>(accepted) * Vb * 2U,
-                                  Vb * 2U, cudaMemcpyDeviceToHost));
-            float top1 = -1e30f, top2 = -1e30f;
-            std::int32_t tok1 = -1;
-            for (std::size_t i = 0; i < Vb; ++i) {
-                std::uint32_t f = static_cast<std::uint32_t>(col[i]) << 16;
-                float v         = 0.0f;
-                std::memcpy(&v, &f, 4);
-                if (v > top1) {
-                    top2 = top1;
-                    top1 = v;
-                    tok1 = static_cast<std::int32_t>(i);
-                } else if (v > top2) {
-                    top2 = v;
+            for (std::uint32_t c = 0; c < 4; ++c) {
+                CUDA_CHECK(cudaMemcpy(col.data(), mbase + mtp_vlog_ +
+                                                          static_cast<std::size_t>(c) * Vb * 2U,
+                                      Vb * 2U, cudaMemcpyDeviceToHost));
+                float tops[5]     = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+                std::int32_t toks[5] = {-1, -1, -1, -1, -1};
+                for (std::size_t i = 0; i < Vb; ++i) {
+                    std::uint32_t f = static_cast<std::uint32_t>(col[i]) << 16;
+                    float v         = 0.0f;
+                    std::memcpy(&v, &f, 4);
+                    if (v != v) { continue; }
+                    for (int t = 0; t < 5; ++t) {
+                        if (v > tops[t]) {
+                            for (int s = 4; s > t; --s) {
+                                tops[s] = tops[s - 1];
+                                toks[s] = toks[s - 1];
+                            }
+                            tops[t] = v;
+                            toks[t] = static_cast<std::int32_t>(i);
+                            break;
+                        }
+                    }
                 }
+                // bf16 ULP of |top1|: 2^(exp-7). DIVERGED names a spec-off
+                // divergence (draft[c] != target[c]); c==a is the deciding col.
+                const float gap5 = tops[0] - tops[1];
+                int exp5         = 0;
+                std::frexp(std::fabs(tops[0]) > 0.0f ? tops[0] : 1.0f, &exp5);
+                const float ulp5 = std::ldexp(1.0f, exp5 - 8);
+                const bool diverged5 = (host_drafts[c] != host_targets[c]);
+                std::fprintf(stderr,
+                             "[mtp-gap] F=%u c=%u%s t1=%d:%.6f t2=%d:%.6f t3=%d:%.6f "
+                             "t4=%d:%.6f t5=%d:%.6f gap=%.6f ulp=%.6f ulps=%.1f %s%s "
+                             "draft=%d target=%d\n",
+                             F, c, (c == accepted ? "[a]" : ""), toks[0], (double)tops[0],
+                             toks[1], (double)tops[1], toks[2], (double)tops[2],
+                             toks[3], (double)tops[3], toks[4], (double)tops[4],
+                             (double)gap5, (double)ulp5,
+                             ulp5 > 0.0f ? (double)(gap5 / ulp5) : -1.0,
+                             (ulp5 > 0.0f && gap5 <= 2.0f * ulp5) ? "TIE-CLASS" : "NOT-TIE",
+                             diverged5 ? " DIVERGED" : " agree", (int)host_drafts[c],
+                             (int)host_targets[c]);
             }
-            std::fprintf(stderr, "[mtp-gap] F=%u a=%u tok=%d top=%.4g gap=%.4g\n", F, accepted,
-                         tok1, top1, top1 - top2);
+            std::fflush(stderr);
         }
         // Commit: replay the accepted rows lane-into-lane (GDN exact, KV
         // overwrite-identical) and refill the MTP KV rows they own. The MTP

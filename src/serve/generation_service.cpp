@@ -519,6 +519,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     const std::shared_ptr<ServeRequestState> state = prepared.stream_state;
     if (state == nullptr) { throw std::logic_error("PreparedRequest has no stream state"); }
     const std::uint64_t own_req = prepared.req_id;
+    // Disconnect contract: every run() exit that does not transfer ownership
+    // (cancel / deadline / dead-sink publish below) aborts the owning
+    // request FIRST, so no scheduler slot, KV block, or stream state can
+    // outlive the HTTP response. pump_mutex_ is free at all three sites.
+    const auto abort_own_request = [&] {
+        std::lock_guard pump_lock(pump_mutex_);
+        hook_loop_->abort_request(own_req);
+    };
     // TTFT clock: first published content token for the owning request.
     // Stamped at the first non-empty content publish (or first decoded
     // content piece when no streaming sink is attached), so
@@ -541,7 +549,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                 ninfer::OutputDelta delta;
                 delta.channel = ninfer::OutputChannel::Content;
                 delta.text    = piece;
-                public_sink->publish(std::move(delta));
+                try {
+                    public_sink->publish(std::move(delta));
+                } catch (const std::exception&) {
+                    // Own sink already dead (disconnect between prepare and
+                    // run): fall through to the pump, whose loop-top
+                    // cancellation check aborts the request and throws.
+                    break;
+                }
                 if (!have_first_token) {
                     first_token_at = Clock::now();
                     have_first_token = true;
@@ -552,10 +567,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     for (;;) {
         if (cancellation.requested()) {
+            abort_own_request();
             throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::Cancelled,
                                                      "inference request cancelled"));
         }
         if (Clock::now() >= prepared.lifetime->deadline) {
+            abort_own_request();
             throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::QueueTimeout,
                                                      "inference request expired during generation"));
         }
@@ -643,7 +660,27 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                 ninfer::OutputDelta delta;
                 delta.channel = ninfer::OutputChannel::Content;
                 delta.text    = std::move(deposit);
-                live->publish(std::move(delta));
+                try {
+                    live->publish(std::move(delta));
+                } catch (const std::exception&) {
+                    // Dead sink: the owning client disconnected mid-stream.
+                    // Detach + abort that request so its slot is reclaimed
+                    // next step. A foreign pump must never die for another
+                    // request's disconnect (that cascade wedged the server:
+                    // every slot zombied in turn). Own disconnect rethrows
+                    // after the abort so the HTTP layer logs it correctly.
+                    const std::uint64_t dead_req = target->req_id;
+                    {
+                        std::lock_guard state_lock(target->mutex);
+                        target->sink     = nullptr;
+                        target->finished = true;
+                    }
+                    {
+                        std::lock_guard pump_lock(pump_mutex_);
+                        hook_loop_->abort_request(dead_req);
+                    }
+                    if (dead_req == own_req) { throw; }
+                }
             }
             if (!have_first_token && target->req_id == own_req && !piece.empty()) {
                 first_token_at = Clock::now();

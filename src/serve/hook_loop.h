@@ -197,6 +197,17 @@ public:
     // Remove stream states for finished req ids. MUST be called with
     // pump_mutex_ held.
     void erase_states_for_reqs(const std::vector<std::uint64_t>& finished_reqs);
+    // Abort a waiting/running request and detach its stream state. MUST be
+    // called with pump_mutex_ held (takes inbox_mutex_ + per-state locks in
+    // the established pump -> inbox/state order). Covers all three
+    // homes of a request: the admission inbox (swept, so a request aborted
+    // before its first drain can never be admitted later), the seq-state
+    // registry (states marked finished + sink detached + erased, so no
+    // pump can publish to a dead sink again), and the scheduler (abort()
+    // marks Aborted; storage is reclaimed on the next schedule_step and
+    // find_request reads null, so owning pumps observe own_done and exit).
+    // Idempotent: unknown req ids are a no-op.
+    void abort_request(std::uint64_t req_id);
 
 private:
     HookLoopConfig config_;

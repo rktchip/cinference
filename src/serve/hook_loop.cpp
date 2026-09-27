@@ -202,4 +202,35 @@ void ServeHookLoop::erase_states_for_reqs(const std::vector<std::uint64_t>& fini
     }
 }
 
+void ServeHookLoop::abort_request(std::uint64_t req_id) {
+    // Inbox first: a request aborted before its first drain must never be
+    // admitted by a later pump (scheduler_->abort would miss it there).
+    {
+        std::lock_guard inbox_lock(inbox_mutex_);
+        for (auto it = inbox_.begin(); it != inbox_.end();) {
+            if (it->request.req_id == req_id) {
+                it = inbox_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Detach stream states: mark finished + null the live sink under the
+    // state lock (a foreign pump holding a shared_ptr then buffers to
+    // pending instead of throwing into a dead socket), then erase.
+    for (auto it = seq_states_.begin(); it != seq_states_.end();) {
+        if (it->second->req_id == req_id) {
+            {
+                std::lock_guard state_lock(it->second->mutex);
+                it->second->finished = true;
+                it->second->sink     = nullptr;
+            }
+            it = seq_states_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    (void)scheduler_->abort(req_id);
+}
+
 } // namespace ninfer::serve
