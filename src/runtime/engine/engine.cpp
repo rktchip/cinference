@@ -1663,6 +1663,9 @@ public:
         // logits) entirely. GDN scratch chaining is untouched; text KV keeps
         // the prefill writes (overwrite-identical). Only the slice tail pays
         // one lm_head projection for its anchor logits (bonus token).
+        // Spec-off-matching split: the tail column reused here is the
+        // ordinary width-1 Verify row computed by forward_serve_step
+        // (NINFER_MTP_SPLIT_TAIL=0 restores the scan-tail column).
         const char* warm_hiddens_env = std::getenv("NINFER_MTP_WARM_HIDDENS");
         const bool warm_hiddens =
             warm_hiddens_env == nullptr || std::string(warm_hiddens_env) != "0";

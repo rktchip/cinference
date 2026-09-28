@@ -1129,6 +1129,25 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
     }
     const std::int32_t prefill_tokens = static_cast<std::int32_t>(host_seq_offsets[n_pref]);
 
+    // Spec-off-matching split (default ON; NINFER_MTP_SPLIT_TAIL=0 opts
+    // out): each prefill slice covers positions [begin, end-1) through the
+    // Prefill scan as before; the slice's LAST column runs the ordinary
+    // width-1 Verify route on its own lane (batch=1, width=1,
+    // src=dst=lane) instead of the scan tail. That is the exact GDN
+    // computation an ordinary decode row performs
+    // (TextContext::ordinary_decode_batch via run_layers Phase::Verify:
+    // gdn_projection_snapshot + width-1 gated_delta_net_batch_update), so
+    // the stranded tail hidden now matches the sequential decode
+    // trajectory. Rung-1/rung-2 warming and the anchor stash consume that
+    // tail column unchanged (engine mtp_prefill_fill: no fill changes).
+    // Full-attention layers already run Verify jointly over all T and
+    // MLP/norms are column-wise, so prefix columns keep their exact
+    // computation. Gated on MTP: non-MTP serve is bit-identical.
+    const char* split_tail_env = std::getenv("NINFER_MTP_SPLIT_TAIL");
+    const bool split_tail =
+        mtp_enabled() &&
+        (split_tail_env == nullptr || std::string(split_tail_env) != "0");
+
     cudaStream_t stream = ctx_.stream;
     work_.reset();
     set_ragged_batch(&ragged, host_seq_offsets);
@@ -1158,7 +1177,10 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
                     } else {
                         // GDN rows: one Prefill-phase update per prefill row
                         // over its slice with its persistent slot, then one
-                        // width-1 Verify batch over the decode suffix.
+                        // width-1 Verify batch over the decode suffix. With
+                        // the spec-off-matching split, the Prefill scan stops
+                        // at end-1 and the slice tail runs as an ordinary
+                        // width-1 Verify row on the lane (see split_tail).
                         if (n_pref > 0) {
                             ScopedValue<std::int32_t> batch_off(active_sequence_batch_, 0);
                             ScopedValue<std::int32_t> width_off(active_sequence_width_, 0);
@@ -1175,9 +1197,36 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::forward_serve_step(
                                     throw std::logic_error(
                                         "forward_serve_step ragged row is empty");
                                 }
+                                const std::int32_t body = split_tail ? span - 1 : span;
                                 set_linear_state_slots(row_slots[r], row_slots[r]);
-                                Tensor xs = x.slice(1, begin, span);
-                                gdn_mix(block, xs, compact, Phase::Prefill);
+                                if (body > 0) {
+                                    Tensor xs = x.slice(1, begin, body);
+                                    gdn_mix(block, xs, compact, Phase::Prefill);
+                                }
+                                if (split_tail) {
+                                    // Last prompt token as an ordinary decode
+                                    // row on the lane itself: batch=1,
+                                    // width=1, src=dst=lane. Same bindings an
+                                    // ordinary_decode_batch row carries, so
+                                    // the lane ends with the exact sequential
+                                    // state (no double-apply: the scan above
+                                    // excluded this column).
+                                    const std::int32_t lane = row_slots[r];
+                                    Tensor tail_src = work_.alloc(DType::I32, {1});
+                                    Tensor tail_dst = work_.alloc(DType::I32, {1});
+                                    copy_i32(&lane, tail_src, stream);
+                                    copy_i32(&lane, tail_dst, stream);
+                                    ScopedValue<std::int32_t> batch_1(active_sequence_batch_,
+                                                                      1);
+                                    ScopedValue<std::int32_t> width_1(active_sequence_width_,
+                                                                      1);
+                                    ScopedValue<const Tensor*> src_1(
+                                        active_linear_state_source_slots_, &tail_src);
+                                    ScopedValue<const Tensor*> dst_1(
+                                        active_linear_state_destination_slots_, &tail_dst);
+                                    Tensor xt = x.slice(1, begin + body, 1);
+                                    gdn_mix(block, xt, compact, Phase::Verify);
+                                }
                             }
                         }
                         if (ndec > 0) {
