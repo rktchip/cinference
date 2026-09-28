@@ -2290,8 +2290,10 @@ public:
         if (hit == nullptr) {
             // No live exec and lane not dead: capture the layers-only call.
             // Embed runs eager first (outside the capture); uploads already
-            // ran above. Capture failure parks the lane dead and falls back
-            // to sampling whatever hidden holds (stale on this platform).
+            // ran above. Capture failure parks the lane dead and recomputes
+            // the step eager (same as the dry-run path below): work launched
+            // under capture records but never executes, so no state was
+            // applied and the layers call is safe to re-invoke eagerly.
             Tensor x = card_->embed_serve_input(tensors);
             if (graph_dry_) {
                 // Diagnosis only: run the layers eagerly with no capture.
@@ -2344,8 +2346,14 @@ public:
                 }
             }
             graph_mark_dead(lane);
+            // Fail closed: recompute the step eager instead of sampling the
+            // stale hidden. Captured work never executes (see PLATFORM note
+            // above), so the layers call applies state exactly once here.
+            card_->forward_serve_decode_layers(plan, batch, view,
+                                               batch.seq_offsets.data(), row_slot.data(),
+                                               tensors, x, envelope_);
             auto out = card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
-            vlog_step("capture-fail", out);
+            vlog_step("capture-fail-eager", out);
             return out;
         }
         // Replay: embed stays eager (fresh token in, same arena address as
