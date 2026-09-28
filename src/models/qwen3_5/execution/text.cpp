@@ -883,7 +883,6 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::sample_decode_rows(
             std::string path;
             std::vector<std::int32_t> ids;
             std::unordered_map<std::uint64_t, std::size_t> next;
-            bool load_warned = false;
         };
         static ForceState force_state;
         static std::mutex force_mu;
@@ -892,17 +891,24 @@ std::vector<std::pair<std::uint64_t, TokenId>> TextContext::sample_decode_rows(
             force_state.path = force_path;
             force_state.ids.clear();
             force_state.next.clear();
-            force_state.load_warned = false;
             if (std::ifstream force_in(force_path); force_in) {
                 std::int32_t force_id = 0;
                 while (force_in >> force_id) { force_state.ids.push_back(force_id); }
             }
-            if (force_state.ids.empty() && !force_state.load_warned) {
-                force_state.load_warned = true;
-                std::fprintf(stderr, "[force-tok] WARN cannot load ids from %s: forcing off\n",
+            // Fail-closed: a set but unloadable NINFER_FORCE_TOKENS used to
+            // warn and fall back to normal generation silently. Kill the
+            // process (non-zero) instead so no run can bless unforced data.
+            if (force_state.ids.empty()) {
+                std::fprintf(stderr,
+                             "[force-tok] FATAL cannot load ids from %s: "
+                             "refusing forced run (fail-closed)\n",
                              force_path);
                 std::fflush(stderr);
+                std::_Exit(1);
             }
+            std::fprintf(stderr, "FORCE: %zu tokens loaded from %s\n",
+                         force_state.ids.size(), force_path);
+            std::fflush(stderr);
         }
         if (!force_state.ids.empty()) {
             const std::size_t force_elems = static_cast<std::size_t>(vocab) * n_dec;

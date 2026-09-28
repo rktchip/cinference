@@ -9,7 +9,9 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -88,6 +90,23 @@ int main(int argc, char** argv) {
     if (options.help_requested) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
+    }
+
+    // Fail-closed forced-token boot check (adjudication harness): a set but
+    // unloadable NINFER_FORCE_TOKENS used to fall back to normal generation
+    // silently, wasting the run. Refuse to start instead (non-zero exit).
+    if (const char* force_path = std::getenv("NINFER_FORCE_TOKENS")) {
+        std::size_t force_n = 0;
+        if (std::ifstream force_in(force_path); force_in) {
+            long force_tok = 0;
+            while (force_in >> force_tok) { ++force_n; }
+        }
+        if (force_n == 0) {
+            std::cerr << "ninfer-serve: FATAL NINFER_FORCE_TOKENS=" << force_path
+                      << " unreadable or empty: refusing to start (fail-closed)\n";
+            return 1;
+        }
+        std::cerr << "FORCE: " << force_n << " tokens loaded from " << force_path << '\n';
     }
 
     ninfer::product::LoggingRuntime logging(

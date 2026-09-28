@@ -7,6 +7,15 @@
 #   s_gate_preflight.sh post --ref REF [--allow N] [--max-clock-drift PCT]
 #     # end-of-window stamp: VOID if nproc/PIDs differ from REF or SM clock
 #     # drifted more than PCT% (default 3). Compares against the START stamp.
+#   s_gate_preflight.sh wslpaths  # env path-carrier check only (any caller)
+# WSL path guard (2026-09-28): a C:/-style (or C:\) Windows path passed to
+# the Linux server (notably NINFER_FORCE_TOKENS) does not exist under WSL and
+# used to fail open silently. Policy is ABORT, not auto-convert: silent
+# rewriting (C: -> /mnt/c) can bless a different file than the operator meant
+# (custom automount roots, drive-letter case, backslash escaping through
+# wsl.exe/ssh layers). Fail-closed: pass a WSL-native path (/mnt/c/...).
+# `pre` runs this check on every launch; `wslpaths` lets any other script
+# (e.g. scripts/dump_force.sh callers) run it standalone.
 # An S-line without a matching START+END stamp pair is void by default.
 # The rule is retroactive: unstamped history (14.3, 22.6, conc gaps, TTFT
 # slopes, bucket tables, the eager-verify price) re-baselines in the first
@@ -121,6 +130,28 @@ pct_diff() {
   echo $(( d * 100 / $1 ))
 }
 
+check_wsl_paths() {
+  # $1 = verdict word ("REFUSE"/"ABORT"). Echoes the verdict line and
+  # returns 1 if any set path-carrier env var holds a Windows-style
+  # drive path ([A-Za-z]:/ or [A-Za-z]:\); silent on success (return 0).
+  BAD=""
+  for v in NINFER_FORCE_TOKENS NINFER_HOST_PIPE NINFER_LOGITS_DUMP_PATH MODEL_DIR MODEL_PATH; do
+    eval "val=\${$v:-}"
+    case "$val" in
+      [A-Za-z]:[/\\]*) BAD="${BAD:+$BAD }$v=$val";;
+    esac
+  done
+  if [ -n "$BAD" ]; then
+    echo "$1 Windows-style path under WSL (use /mnt/c/... instead, no auto-convert): $BAD"
+    return 1
+  fi
+  return 0
+}
+
+if [ "$MODE" = "wslpaths" ]; then
+  if check_wsl_paths ABORT; then echo "WSLPATHS-OK"; exit 0; else exit 1; fi
+fi
+
 # Live shared: at pre, all current ghosts are pre-existing by definition.
 LIVE=$(( SHARED - GHOST_KNOWN ))
 [ "$LIVE" -lt 0 ] && LIVE=0
@@ -133,7 +164,8 @@ if [ "$MODE" = "pre" ]; then
   echo "STAMP hash=$HASH head=$HEAD mode=start nproc=$NPROC ninfer=$NSERV pids=[$PIDS] idle_util=[$S1,$S2,$S3]% memutil=${MEMU}% temp=${TEMP}C sm=${SMCLK}MHz memclk=${MEMCLK}MHz vram=${MEMUSED}/${MEMTOTAL}MiB shared_live=${LIVE}MiB(ghosts=${GHOST_KNOWN}) srvrow=${SRVROW}MiB"
   [ -n "$OUT" ] && save_ref "$OUT"
   FAIL=""
-  [ "$NPORT" -gt 0 ] && FAIL="port_${PORT}_held=[${PORT_HOLDERS}]"
+  if ! WSLMSG="$(check_wsl_paths REFUSE)"; then FAIL="$WSLMSG"; fi
+  [ "$NPORT" -gt 0 ] && FAIL="${FAIL:+$FAIL }port_${PORT}_held=[${PORT_HOLDERS}]"
   [ "$NPROC" -gt "$ALLOW" ] && FAIL="${FAIL:+$FAIL }compute_procs=${NPROC}>${ALLOW}"
   { [ "$LIVE" -gt 512 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared_live=${LIVE}MiB>512MiB(spill)"
   for s in "$S1" "$S2" "$S3"; do
