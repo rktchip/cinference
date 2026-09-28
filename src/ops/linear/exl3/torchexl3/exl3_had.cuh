@@ -230,15 +230,18 @@ __device__ __forceinline__ void had128_warp(const half* __restrict__ in,
 // Split-k epilogue: read an fp32 partial-sum row, Hadamard it, apply svh, emit
 // fp16 -- and leave the accumulator zeroed again so the next call can atomically
 // accumulate into it without a separate memset.
+//
+// The arithmetic lives in had128_warp_acc_val (pure function of the 128 summed
+// partials); had128_warp_acc loads, zeroes, then delegates, so both spellings
+// execute the same operations in the same order. The deterministic split-k
+// reduce (NINFER_EXL3_DETERMINISTIC, see torchexl3/exl3_gemm.cu) sums per-split
+// planes in fixed order and reuses had128_warp_acc_val for the identical tail.
 template <typename OUT_T>
-__device__ __forceinline__ void had128_warp_acc(float* __restrict__ acc,
-                                                OUT_T* __restrict__ out,
-                                                const half* __restrict__ svh,
-                                                int lane)
+__device__ __forceinline__ void had128_warp_acc_val(float4 a,
+                                                    OUT_T* __restrict__ out,
+                                                    const half* __restrict__ svh,
+                                                    int lane)
 {
-    float4 a = ((float4*) acc)[lane];
-    ((float4*) acc)[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
-
     float v0 = a.x, v1 = a.y, v2 = a.z, v3 = a.w;
     float s0 = v0 + v1, d0 = v0 - v1;
     float s1 = v2 + v3, d1 = v2 - v3;
@@ -253,6 +256,18 @@ __device__ __forceinline__ void had128_warp_acc(float* __restrict__ acc,
     v.x = had_hybrid_mul2(v.x, s.x);
     v.y = had_hybrid_mul2(v.y, s.y);
     ActVec<OUT_T>::store(out, lane, v);
+}
+
+template <typename OUT_T>
+__device__ __forceinline__ void had128_warp_acc(float* __restrict__ acc,
+                                                OUT_T* __restrict__ out,
+                                                const half* __restrict__ svh,
+                                                int lane)
+{
+    float4 a = ((float4*) acc)[lane];
+    ((float4*) acc)[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
+
+    had128_warp_acc_val<OUT_T>(a, out, svh, lane);
 }
 
 

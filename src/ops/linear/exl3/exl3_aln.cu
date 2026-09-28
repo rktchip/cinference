@@ -27,6 +27,8 @@ void exl3_gemm_rows(const half* a, const uint16_t* bq, __nv_bfloat16* c,
                     const half* svh, int m, int k, int n, int ldc, float* acc,
                     int bits, int cb, const int* group_n, int groups,
                     cudaStream_t stream);
+int exl3_det_planes_row(int m, int k, int n, int bits);
+bool exl3_det_enabled();
 
 } // namespace cuda_exl3
 
@@ -37,10 +39,36 @@ std::size_t exl3_aln_ws_bytes(const Exl3AlnParams& p, std::int32_t groups,
                               std::int32_t m, bool* need_acc)
 {
     std::size_t ahad = (std::size_t) groups * m * p.k * 2;
-    bool split = cuda_exl3::exl3_pick_split_row(m, p.k, p.n, p.bits) > 1;
+    // Plane count: 0 = no split (no acc), 1 = historical single shared plane,
+    // S > 1 = deterministic per-split planes (default on; =0 opts out).
+    // Opted out this is exactly the old `split ? m*n*4 : 0`.
+    int planes = cuda_exl3::exl3_det_planes_row(m, p.k, p.n, p.bits);
+    bool split = planes > 0;
     if (need_acc)
         *need_acc = split;
-    return ahad + (split ? (std::size_t) m * p.n * 4ULL : 0);
+    return ahad + (split ? (std::size_t) planes * m * p.n * 4ULL : 0);
+}
+
+// Exact acc footprint for a dense row call (what the caller must memset).
+// Opted out (=0): m*n*4 when the shape splits, 0 otherwise -- identical to the
+// historical inline expression. Default on: S*m*n*4 planes.
+std::size_t exl3_aln_acc_bytes(const Exl3AlnParams& p, std::int32_t m)
+{
+    int planes = cuda_exl3::exl3_det_planes_row(m, p.k, p.n, p.bits);
+    if (planes <= 0) return 0;
+    return (std::size_t) planes * m * p.n * 4ULL;
+}
+
+// Plane count for reserve-time max-cover (see exl3_bind.cu).
+int exl3_aln_det_planes(const Exl3AlnParams& p, std::int32_t m)
+{
+    return cuda_exl3::exl3_det_planes_row(m, p.k, p.n, p.bits);
+}
+
+// Flag query for reserve-time sizing.
+bool exl3_aln_det_enabled()
+{
+    return cuda_exl3::exl3_det_enabled();
 }
 
 // Geometry gate: k/n in 128-multiples (kernel tiles), bits 1..8, groups 1..8

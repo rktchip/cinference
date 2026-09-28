@@ -560,6 +560,9 @@ void exl3_engine_load_dir(const std::string& dir, cudaStream_t stream, Exl3Engin
 // Reserves the process-lifetime v3 workspace for the worst group in `store`
 // at batch `m_max`, sized by the same exl3_aln_ws_bytes the dispatch carves
 // (acc counted only when split-k actually triggers for that shape).
+// Default on (NINFER_EXL3_DETERMINISTIC=0 opts out): acc covers S planes,
+// maxed over every servable batch <= m_max (the split factor varies with
+// runtime m). Opted out the size is exactly the historical single plane.
 // Reserves ONCE at load; throws on empty store, non-positive m_max, or CUDA
 // failure (ws is empty then).
 void exl3_engine_reserve_workspace(const Exl3EngineStore& store, std::int32_t m_max,

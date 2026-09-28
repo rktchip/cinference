@@ -110,7 +110,7 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         auto* base = static_cast<char*>(span.data);
         auto* ahad = reinterpret_cast<__half*>(base);
         float* acc = need_acc ? reinterpret_cast<float*>(base + (std::size_t) ew.groups * m * p.k * 2) : nullptr;
-        if (acc) cudaMemsetAsync(acc, 0, (std::size_t) m * p.n * 4, stream);
+        if (acc) cudaMemsetAsync(acc, 0, exl3::exl3_aln_acc_bytes(p, m), stream);
         if (!exl3::exl3_aln_rows_bf16(static_cast<const __nv_bfloat16*>(x.data),
                                       static_cast<__nv_bfloat16*>(out.data), p,
                                       ew.group_n, ew.groups, ahad, acc, m, stream))
@@ -148,7 +148,7 @@ void exl3_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy p
         auto* base = static_cast<char*>(span.data);
         auto* ahad = reinterpret_cast<__half*>(base);
         float* acc = need_acc ? reinterpret_cast<float*>(base + (std::size_t) m * p.k * 2) : nullptr;
-        if (acc) cudaMemsetAsync(acc, 0, (std::size_t) m * p.n * 4, stream);
+        if (acc) cudaMemsetAsync(acc, 0, exl3::exl3_aln_acc_bytes(p, m), stream);
         if (!exl3::exl3_aln_row_bf16(static_cast<const __nv_bfloat16*>(x.data),
                                      static_cast<__nv_bfloat16*>(out.data), p,
                                      ahad, acc, m, stream))

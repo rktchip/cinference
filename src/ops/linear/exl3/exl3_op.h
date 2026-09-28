@@ -26,6 +26,8 @@
 // Workspace (caller arena, sized by exl3_linear_workspace_capacity_bytes):
 //   v3 single/multi: ahad [groups*m, k] fp16 + acc [m, n] fp32 (acc memset
 //     every call the kernel splits; ~us, keeps the zero invariant trivially).
+//     Default on (NINFER_EXL3_DETERMINISTIC=0 opts out): acc is S planes of
+//     [m, n] fp32 (same memset-every-split-call rule, S times the bytes).
 //   legacy m=1:      x_fp16 [m, k] + A_h [m, k] + C16 [m, n] (all fp16).
 #pragma once
 

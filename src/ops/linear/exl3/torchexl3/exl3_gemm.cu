@@ -167,8 +167,16 @@ struct GemmCfg
 // (Qwen3.5's down_proj is only 40 blocks wide at BN=128) and small batches keep
 // all 188 SMs busy. Unlike shrinking BN it adds blocks without multiplying the
 // number of times A is re-read.
+//
+// DET (deterministic split-k, default on; NINFER_EXL3_DETERMINISTIC=0 opts out): instead of
+// atomicAdd into one shared plane, block (bx,by,s) plain-stores its partials
+// into plane s of an S-plane acc buffer (plane = m*ldc floats). Every plane
+// element has exactly one writer block, so completion order cannot affect
+// bits; a later ordered-reduce pass sums planes s=0..S-1 in fixed order.
+// Grid, occupancy, and the non-atomic math are unchanged; DET=false compiles
+// to the historical kernel bit-for-bit.
 template <int BITS, int CB, int BM, int BN, int BK, int NWARPS, int STAGES, bool SPLIT,
-          typename OUT_T, int WARP_N_, bool H_ACC>
+          typename OUT_T, int WARP_N_, bool H_ACC, bool DET = false>
 __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     const half* __restrict__ A,        // (groups, m, k), Hadamard-transformed
     const uint16_t* __restrict__ Bq,   // (k/16, n/16, 16*BITS) trellis
@@ -370,6 +378,76 @@ __global__ __launch_bounds__(NWARPS * 32) void exl3_gemm_m_kernel(
     {
         // Partial sums only: accumulate and let exl3_epilogue finish the row
         // once every split has landed.
+        if constexpr (DET)
+        {
+            // Deterministic plane write: this block is the sole writer of its
+            // (row, col) elements in plane blockIdx.z, so plain stores replace
+            // the atomics and block completion order drops out of the result.
+            // Out-of-range rows are skipped (never stored), exactly as the
+            // atomic path skips them: those plane tails keep the buffer's zero
+            // invariant, which the ordered reduce relies on. Same grid, same
+            // occupancy, same per-element values as the atomic path; only the
+            // cross-block summation order changes (fixed s=0..S-1 later).
+            float* dst = acc + (size_t) (int) blockIdx.z * ((size_t) m * ldc);
+            if constexpr (Cfg::SPLIT_STAGED)
+            {
+                __syncthreads();
+                float* sh_f = (float*) smem;
+#pragma unroll
+                for (int mb = 0; mb < Cfg::MBLK; ++mb)
+                {
+                    int r0 = warp_m * Cfg::WARP_M + mb * 16 + (lane >> 2);
+#pragma unroll
+                    for (int nb = 0; nb < Cfg::NBLK; ++nb)
+                    {
+                        int col = warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
+                        float* p0 = sh_f + r0 * Cfg::F_STRIDE + col;
+                        float* p1 = p0 + 8 * Cfg::F_STRIDE;
+                        p0[0] = A_::getf(frag_c[mb][nb], 0);
+                        p0[1] = A_::getf(frag_c[mb][nb], 1);
+                        p1[0] = A_::getf(frag_c[mb][nb], 2);
+                        p1[1] = A_::getf(frag_c[mb][nb], 3);
+                    }
+                }
+                __syncthreads();
+
+                // Consecutive threads hit consecutive addresses, so each warp's
+                // stores coalesce into whole cache lines.
+                for (int i = t; i < BM * BN; i += Cfg::NTHREADS)
+                {
+                    int r = i / BN;
+                    int c = i - r * BN;
+                    int gr = m0 + r;
+                    if (gr >= m) continue;
+                    dst[(size_t) gr * ldc + n_off + n0 + c] =
+                        sh_f[r * Cfg::F_STRIDE + c];
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (int mb = 0; mb < Cfg::MBLK; ++mb)
+                {
+                    int r0 = m0 + warp_m * Cfg::WARP_M + mb * 16 + (lane >> 2);
+#pragma unroll
+                    for (int nb = 0; nb < Cfg::NBLK; ++nb)
+                    {
+                        int col = n_off + n0 + warp_n * Cfg::WARP_N + nb * 8 + 2 * (lane & 3);
+                        if (r0 < m)
+                        {
+                            dst[(size_t) r0 * ldc + col] = A_::getf(frag_c[mb][nb], 0);
+                            dst[(size_t) r0 * ldc + col + 1] = A_::getf(frag_c[mb][nb], 1);
+                        }
+                        if (r0 + 8 < m)
+                        {
+                            dst[(size_t) (r0 + 8) * ldc + col] = A_::getf(frag_c[mb][nb], 2);
+                            dst[(size_t) (r0 + 8) * ldc + col + 1] = A_::getf(frag_c[mb][nb], 3);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if constexpr (Cfg::SPLIT_STAGED)
         {
             __syncthreads();
@@ -510,6 +588,73 @@ __global__ void exl3_epilogue_kernel(float* __restrict__ acc, OUT_T* __restrict_
     had128_warp_acc<OUT_T>(acc + off, C + off, svh + n_off + blk * HAD_N, threadIdx.x & 31);
 }
 
+// Deterministic split-k finish (default on; NINFER_EXL3_DETERMINISTIC=0 opts out): `acc` holds
+// `nsplit` planes of (m, ldc) fp32 partials, one per k-slab, each element
+// written by exactly one GEMM block with plain stores. This kernel sums the
+// planes in fixed slab order s=0..S-1 -- the same left fold on every run, so
+// fp non-associativity can no longer flip bits -- then runs the identical
+// Hadamard+svh tail via had128_warp_acc_val. Grid, warp mapping, and the
+// MoE retire predicate mirror exl3_epilogue_kernel; each plane element it
+// reads is re-zeroed, preserving the acc zero invariant (plane tails past m
+// are never written and never read, so they keep the pre-first-use zero).
+//
+// Deliberately NOT bit-matched to the atomic path: the summation order
+// differs (fixed slab order vs block-completion order), so expect ULP-level
+// differences vs flag-off. Within flag-on, identical inputs give bit-identical
+// outputs across runs: single-writer planes, stream-ordered reduce, fixed
+// fold order, no atomics on the accumulation path.
+template <typename OUT_T>
+__global__ void exl3_det_reduce_epilogue_kernel(float* __restrict__ acc, int nsplit,
+                                                OUT_T* __restrict__ C,
+                                                const half* __restrict__ svh, int m,
+                                                int ldc, int n_off, int n_size,
+                                                const int* __restrict__ expert_ids,
+                                                const int* __restrict__ n_rows,
+                                                int block_m,
+                                                int64_t svh_expert_stride)
+{
+    int blocks_per_row = n_size / HAD_N;
+    long long total = (long long) m * blocks_per_row;
+    int warps_per_block = blockDim.x / 32;
+    long long w = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    if (w >= total) return;
+
+    int row = (int) (w / blocks_per_row);
+    int blk = (int) (w % blocks_per_row);
+    int lane = threadIdx.x & 31;
+
+    // Same block-granular MoE predicate as the GEMM and the atomic epilogue.
+    if (expert_ids)
+    {
+        int blk_m = row / block_m;
+        if (n_rows && blk_m * block_m >= *n_rows) return;
+        int e = expert_ids[blk_m];
+        if (e < 0) return;
+        svh += (size_t) e * svh_expert_stride;
+    }
+
+    size_t plane = (size_t) m * ldc;
+    size_t off = (size_t) row * ldc + n_off + blk * HAD_N;
+
+    // Fixed-order left fold over slabs: ((p0 + p1) + p2) ... -- identical
+    // operation sequence on every run. No fast-math reassociation: nvcc does
+    // not reorder fp addition without --use_fast_math, same guarantee class
+    // as the in-register accumulation in the GEMM main loop.
+    float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int s = 0; s < nsplit; ++s)
+    {
+        float* p = acc + (size_t) s * plane + off;
+        float4 v = ((float4*) p)[lane];
+        ((float4*) p)[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
+        sum.x += v.x;
+        sum.y += v.y;
+        sum.z += v.z;
+        sum.w += v.w;
+    }
+
+    had128_warp_acc_val<OUT_T>(sum, C + off, svh + n_off + blk * HAD_N, lane);
+}
+
 }  // namespace cuda_exl3
 
 // ---------------------------------------------------------------------------
@@ -552,6 +697,21 @@ bool h_acc_enabled()
     static const bool v = [] {
         const char* e = exl3_env("CUDA_EXL3_FP16_ACC");
         return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+// NINFER_EXL3_DETERMINISTIC=0 opts out of the deterministic split-k path back
+// to the historical atomic-accumulate kernel. Default ON (unset, empty, or any
+// other value): same split factors and grid as the opt-out path (no occupancy
+// cliff), but per-split fp32 partial planes with plain stores plus a
+// fixed-order reduce instead of cross-block atomicAdd into one shared plane.
+// Opted out, every branch below compiles and runs exactly as before.
+inline bool det_split_k()
+{
+    static const bool v = [] {
+        const char* e = exl3_env("NINFER_EXL3_DETERMINISTIC");
+        return !(e && e[0] == '0' && e[1] == '\0');
     }();
     return v;
 }
@@ -648,7 +808,7 @@ int pick_split(int m, int k, int n, int bits, int bm, bool allowed, int weight_m
 }
 
 template <int BITS, int CB, int BM, bool SPLIT, typename OUT_T, int WARP_N_, int ST_,
-          bool H_ACC = false, int BK = BK_>
+          bool H_ACC = false, bool DET = false, int BK = BK_>
 void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m, int k,
             int n, int ldc, int n_off, int n_tiles_full, float* acc, int split,
             ShardMap smap, cudaStream_t stream, const int* expert_ids = nullptr,
@@ -659,7 +819,7 @@ void launch(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int m,
 {
     using Cfg = cuda_exl3::GemmCfg<BITS, CB, BM, BN_, BK, NW_, ST_, WARP_N_>;
     auto fn = cuda_exl3::exl3_gemm_m_kernel<BITS, CB, BM, BN_, BK, NW_, ST_, SPLIT, OUT_T,
-                                            WARP_N_, H_ACC>;
+                                            WARP_N_, H_ACC, DET>;
     raise_smem((const void*) fn, Cfg::SMEM);
     int kt_total = k / BK;
     int kt_per_split = (kt_total + split - 1) / split;
@@ -690,8 +850,13 @@ uint64_t tune_key(int bits, int64_t cb, int m, int k, int n, bool bf16, bool can
     // can_split belongs in the key: the cached choice carries a split factor,
     // and replaying a split entry when no accumulator was allocated (the
     // deterministic path) sends the kernel through a null pointer.
+    // det_split_k belongs here too: the flag-on tuner pins the split to the
+    // cost-model value (no x2/half exploration, so the split is a pure shape
+    // function and run-to-run stable), and a flag-off entry could carry a
+    // doubled split the deterministic plane buffer was not sized for.
     for (uint64_t v : {(uint64_t) bits, (uint64_t) cb, mb, (uint64_t) k, (uint64_t) n,
-                       (uint64_t) bf16, (uint64_t) can_split})
+                       (uint64_t) bf16, (uint64_t) can_split,
+                       (uint64_t) det_split_k()})
     {
         h ^= v;
         h *= 1099511628211ull;
@@ -765,7 +930,11 @@ int autotune_cfg(uint64_t key, int m, int k, int n, int bits, bool split_k,
         int base = split_for(bm);
         int sps[3] = {base, 0, 0};
         int nsp = 1;
-        if (!split_fixed && can_split)
+        // Deterministic mode pins the split to the cost-model value: timing
+        // noise must not pick a different split on different runs (each split
+        // is a different summation order, i.e. different bits). Flag off keeps
+        // the x2/half exploration exactly as before.
+        if (!split_fixed && can_split && !det_split_k())
         {
             if (base > 1) sps[nsp++] = base / 2;
             if (base * 2 <= cap) sps[nsp++] = base * 2;
@@ -821,9 +990,20 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
     // the biggest block tile uses one stage fewer to stay at 2 blocks/SM.
 #define VE3_ONE(BM_, WN_, ST, BKT)                                                     \
     if (split > 1)                                                                     \
-        launch<BITS, CB, BM_, true, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,      \
-                      k, n, ldc, n_off, n_tiles_full, acc, split, smap, stream,        \
-                      expert_ids, b_expert_stride, svh_expert_stride, n_rows);         \
+    {                                                                                  \
+        /* DET picks the plane-store kernel variant: same grid, same occupancy, \
+           no atomics. Flag off takes the historical instantiation. */          \
+        if (det_split_k())                                                             \
+            launch<BITS, CB, BM_, true, OUT_T, WN_, ST, false, true, BKT>(A, Bq, C,    \
+                          svh, m, k, n, ldc, n_off, n_tiles_full, acc, split, smap,    \
+                          stream, expert_ids, b_expert_stride, svh_expert_stride,      \
+                          n_rows);                                                     \
+        else                                                                           \
+            launch<BITS, CB, BM_, true, OUT_T, WN_, ST, false, false, BKT>(A, Bq, C,   \
+                          svh, m, k, n, ldc, n_off, n_tiles_full, acc, split, smap,    \
+                          stream, expert_ids, b_expert_stride, svh_expert_stride,      \
+                          n_rows);                                                     \
+    }                                                                                  \
     else                                                                               \
         /* n_rows is not optional here. Without it the unsplit kernel has no live-row \
            bound, and the surplus tail of expert_ids is not reliably -1: the alignment \
@@ -832,7 +1012,7 @@ void launch_bm(const half* A, const uint16_t* Bq, OUT_T* C, const half* svh, int
            owning the top of the range that is a real expert, so that rank runs a full \
            gemm over every surplus block: 206 of 540 at M=2048, 38% of the grid, and   \
            the step waits for it. Reported and diagnosed by @NNNtrance in #1. */       \
-        launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, BKT>(A, Bq, C, svh, m,     \
+        launch<BITS, CB, BM_, false, OUT_T, WN_, ST, false, false, BKT>(A, Bq, C, svh, m,     \
                       k, n, ldc, n_off, n_tiles_full, acc, 1, smap, stream,            \
                       expert_ids, b_expert_stride, svh_expert_stride, n_rows,          \
                       moe_sorted_ids, moe_weights, moe_top_k, moe_m_valid);
@@ -865,6 +1045,26 @@ void launch_epilogue(float* acc, OUT_T* C, const half* svh, int m, int ldc, int 
     long long blocks = (warps + threads / 32 - 1) / (threads / 32);
     cuda_exl3::exl3_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0, stream>>>(
         acc, C, svh, m, ldc, n_off, n_size, expert_ids, n_rows, block_m,
+        svh_expert_stride);
+}
+
+// Deterministic split-k finish: `acc` is `nsplit` planes of (m, ldc) fp32
+// partials (plane s = k-slab s, plain stores, one writer per element).
+// Same grid as launch_epilogue; the kernel folds planes in fixed order.
+template <typename OUT_T>
+void launch_det_reduce_epilogue(float* acc, int nsplit, OUT_T* C, const half* svh,
+                                int m, int ldc, int n_off, int n_size,
+                                cudaStream_t stream,
+                                const int* expert_ids = nullptr,
+                                const int* n_rows = nullptr, int block_m = 0,
+                                int64_t svh_expert_stride = 0)
+{
+    long long warps = (long long) m * (n_size / HAD_N);
+    const int threads = 256;
+    long long blocks = (warps + threads / 32 - 1) / (threads / 32);
+    cuda_exl3::exl3_det_reduce_epilogue_kernel<OUT_T><<<(unsigned) blocks, threads, 0,
+                                                         stream>>>(
+        acc, nsplit, C, svh, m, ldc, n_off, n_size, expert_ids, n_rows, block_m,
         svh_expert_stride);
 }
 
@@ -915,9 +1115,18 @@ void dispatch_gemm(int bits, int64_t cb, const half* A, const uint16_t* B, OUT_T
                                  n_rows, moe_sorted_ids, moe_weights, moe_top_k, \
                                  moe_m_valid);                                   \
                 if (sp_ > 1)                                                    \
-                    launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n, stream,  \
-                                           expert_ids, n_rows, bm_,              \
-                                           svh_expert_stride);                   \
+                {                                                               \
+                    /* DET finishes the S planes with the fixed-order reduce; \
+                       flag off keeps the atomic epilogue. */              \
+                    if (det_split_k())                                          \
+                        launch_det_reduce_epilogue<OUT_T>(acc, sp_, C, S, m,    \
+                                           ldc, n_off, n, stream, expert_ids,   \
+                                           n_rows, bm_, svh_expert_stride);     \
+                    else                                                        \
+                        launch_epilogue<OUT_T>(acc, C, S, m, ldc, n_off, n,     \
+                                           stream, expert_ids, n_rows, bm_,     \
+                                           svh_expert_stride);                  \
+                }                                                               \
             };                                                                  \
             /* MoE pins BM: the caller padded each expert's rows to that block, \
                so the grid's row tiling has to match it exactly. */             \
@@ -1038,6 +1247,24 @@ void exl3_gemm_rows(const half* A, const uint16_t* Bq, __nv_bfloat16* C,
 int exl3_pick_split_row(int m, int k, int n, int bits)
 {
     return pick_split(m, k, n, bits, 128, true);
+}
+
+// Deterministic split-k plane count for a dense row shape. Opted out (=0): 1 when
+// the shape splits (single shared plane, historical layout), 0 when it does
+// not. Flag on (default): the split factor S itself --
+// the acc buffer holds S planes of (m, n) fp32. Non-inline: workspace sizing
+// in exl3_aln.cu / exl3_bind.cu links against this from another TU.
+int exl3_det_planes_row(int m, int k, int n, int bits)
+{
+    int s = pick_split(m, k, n, bits, 128, true);
+    if (s <= 1) return 0;
+    return det_split_k() ? s : 1;
+}
+
+// Flag query for workspace sizing outside this TU.
+bool exl3_det_enabled()
+{
+    return det_split_k();
 }
 
 }  // namespace cuda_exl3

@@ -395,10 +395,28 @@ void exl3_engine_reserve_workspace(const Exl3EngineStore& store, std::int32_t m_
         const std::size_t h =
             (std::size_t) w.groups * (std::size_t) m_max * (std::size_t) w.k * 2;
         if (h > had) had = h;
+        std::size_t a = 0;
         if (need_acc) {
-            const std::size_t a = (std::size_t) m_max * (std::size_t) w.n * 4;
-            if (a > acc) acc = a;
+            a = (std::size_t) m_max * (std::size_t) w.n * 4;
         }
+        if (exl3_aln_det_enabled()) {
+            // Deterministic planes: the split factor is a function of the
+            // runtime batch, which can be smaller than m_max with a larger
+            // split, so cover every servable batch (powers of two plus m_max
+            // itself). planes(mm)*mm*n*4 is the exact plane footprint there;
+            // the kernel's per-candidate splits never exceed the bm=128 value
+            // this query returns, so the max covers tuning as well.
+            for (std::int32_t mm = m_max; mm >= 1; mm /= 2) {
+                int pl = exl3_aln_det_planes(p, mm);
+                if (pl > 0) {
+                    const std::size_t cand =
+                        (std::size_t) pl * (std::size_t) mm * (std::size_t) w.n * 4;
+                    if (cand > a) a = cand;
+                }
+                if (mm == 1) break;  // mm /= 2 would stick at 1 for signed ints
+            }
+        }
+        if (a > acc) acc = a;
     }
     Exl3EngineWorkspace fresh;
     check_cuda(cudaMalloc(&fresh.had, had), "engine workspace had alloc");

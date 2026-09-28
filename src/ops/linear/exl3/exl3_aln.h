@@ -21,6 +21,12 @@
 //          invariant holds again after a full row (inline split-k only; a
 //          truly-complete row clears everything). Reserving, zeroing, and
 //          self-maintaining are the engine's concern.
+//          Default on (NINFER_EXL3_DETERMINISTIC=0 opts out): acc is S planes
+//          of [m, n] fp32 (S = the split factor, one plane per k-slab, plain
+//          stores, fixed-order reduce). Same zero invariant, S times the
+//          bytes; sized by exl3_aln_ws_bytes / exl3_aln_acc_bytes, which are
+//          flag-aware. Opted out the layout is exactly the historical single
+//          plane.
 #pragma once
 
 #include "exl3_dispatch.h"
@@ -45,9 +51,20 @@ struct Exl3AlnParams {
 
 // Geometry probe. Returns the byte count the engine should hold for the
 // ahad + acc workspaces (acc counted only when split-k actually triggers for
-// that shape).
+// that shape). Flag-aware (default on, =0 opts out): acc is then S planes.
 std::size_t exl3_aln_ws_bytes(const Exl3AlnParams& p, std::int32_t groups, std::int32_t m,
                               bool* need_acc);
+
+// Exact acc footprint for the shape (0 when no split). Callers memset this
+// many bytes; flag-aware like ws_bytes.
+std::size_t exl3_aln_acc_bytes(const Exl3AlnParams& p, std::int32_t m);
+
+// Plane count for the shape: 0 = no acc, 1 = historical single plane,
+// S > 1 = deterministic planes (flag on only). Reserve-time helper.
+int exl3_aln_det_planes(const Exl3AlnParams& p, std::int32_t m);
+
+// Flag query (NINFER_EXL3_DETERMINISTIC) for reserve-time sizing.
+bool exl3_aln_det_enabled();
 
 // Single-shard row: x [m,k] -> C [m,n]. C dtype selects the overload. Returns
 // false only on geometry failure (k or n not a 128-multiple, bits outside
