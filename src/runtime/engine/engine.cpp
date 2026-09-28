@@ -2178,6 +2178,13 @@ public:
         graph_seen_lanes_.erase(
             std::remove(graph_seen_lanes_.begin(), graph_seen_lanes_.end(), lane),
             graph_seen_lanes_.end());
+        // Fresh admission re-arms a capture-parked lane: dead is a
+        // per-admission verdict (capture failed for the old sequence), not a
+        // permanent lane property. Without this, a lane parked dead stays
+        // eager for process lifetime even after the lane is recycled.
+        graph_dead_lanes_.erase(
+            std::remove(graph_dead_lanes_.begin(), graph_dead_lanes_.end(), lane),
+            graph_dead_lanes_.end());
     }
 
     void graph_mark_dead(int lane) {
