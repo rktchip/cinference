@@ -180,7 +180,12 @@ if [ "$MODE" = "pre" ]; then
   # VRAM is enumeration-independent: at pre the port is free (no server),
   # desktop idles ~1.4GiB, so >6GiB means a foreign model/process holds
   # VRAM (~15GB upstream venv sailed through once; only post drift caught
-  # it). Refuse regardless of NPROC.
+  # it). Refuse regardless of NPROC. Threshold policy (2026-09-28): if a
+  # clean pre ever refuses here, IDENTIFY the holder first (previous server
+  # not yet released? lingering context? real co-tenant?) — never raise the
+  # number to accommodate an unknown resident; that reopens this exact hole.
+  # Set it at measured idle baseline + margin, with the baseline's source
+  # recorded in the commit message.
   case "$MEMUSED" in ''|*[!0-9]*) ;; *) [ "$MEMUSED" -gt 6144 ] && FAIL="${FAIL:+$FAIL }memused_live=${MEMUSED}MiB>6144MiB(co-tenant VRAM)";; esac
   for s in "$S1" "$S2" "$S3"; do
     case "$s" in ''|*[!0-9]*) continue;; esac
