@@ -23,6 +23,13 @@
 # back in one session at the same thermal state; stamps record drift that
 # interleaving does not cancel (m16 is math-bound and moves with SM clock).
 # POSIX sh. Runs under WSL (nvidia-smi present). No GPU work itself.
+# Evidence standard (2026-09-28): the printed verdict words (GO / REFUSE /
+# SEALED / VOID / PORT-FREE / LAUNCH-REFUSED) in captured log text are ground
+# truth. Wrapper-reported exit codes are NOT: inline `$?` after a wsl.exe
+# one-liner has been observed reading a bogus 0 for a script that provably
+# ran `exit 1` (-x trace + file check agree). Any verdict that needs a return
+# code must capture it file-based: `cmd >log 2>&1; echo $? >log.rc`, then
+# read the .rc file back. Never cite a wrapper `$?` as seal evidence.
 set -u
 
 MODE="${1:-stamp}"
