@@ -6,6 +6,9 @@ export CUDA_EXL3_AUTOTUNE=0
 export SPLIT_TARGET=0
 unset NINFER_EXL3_DETERMINISTIC
 ulimit -c unlimited
+# Self-gate (2026-09-28): never launch without a preflight GO (port/VRAM/idle/paths).
+_GATE="$(bash "$(dirname "$0")/s_gate_preflight.sh" pre 2>&1 | tail -n 1)"
+[ "$_GATE" = "GO" ] || { echo "LAUNCH-REFUSED (no preflight GO): $_GATE" >&2; exit 1; }
 exec nsys profile -t cuda,nvtx --cuda-graph-trace=node \
   -o /root/slotsmtp_node -f true \
   /root/ninfer-serve-detsplitk-528b29e \
