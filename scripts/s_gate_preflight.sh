@@ -168,6 +168,13 @@ if [ "$MODE" = "pre" ]; then
   [ "$NPORT" -gt 0 ] && FAIL="${FAIL:+$FAIL }port_${PORT}_held=[${PORT_HOLDERS}]"
   [ "$NPROC" -gt "$ALLOW" ] && FAIL="${FAIL:+$FAIL }compute_procs=${NPROC}>${ALLOW}"
   { [ "$LIVE" -gt 512 ]; } 2>/dev/null && FAIL="${FAIL:+$FAIL }shared_live=${LIVE}MiB>512MiB(spill)"
+  # Co-tenant VRAM rule (2026-09-28): WSL nvidia-smi cannot enumerate PIDs
+  # reliably, so a process-based count can miss a holder. Total dedicated
+  # VRAM is enumeration-independent: at pre the port is free (no server),
+  # desktop idles ~1.4GiB, so >6GiB means a foreign model/process holds
+  # VRAM (~15GB upstream venv sailed through once; only post drift caught
+  # it). Refuse regardless of NPROC.
+  case "$MEMUSED" in ''|*[!0-9]*) ;; *) [ "$MEMUSED" -gt 6144 ] && FAIL="${FAIL:+$FAIL }memused_live=${MEMUSED}MiB>6144MiB(co-tenant VRAM)";; esac
   for s in "$S1" "$S2" "$S3"; do
     case "$s" in ''|*[!0-9]*) continue;; esac
     [ "$s" -gt "$MAXIDLE" ] && FAIL="${FAIL:+$FAIL }idle_util=${s}>${MAXIDLE}"
