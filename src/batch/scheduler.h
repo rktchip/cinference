@@ -21,6 +21,12 @@
 // (runtime::Scheduler::set_prefill_lane, which throws on a second staged
 // prefill). Admission here is strict FIFO; backfill past a blocked head stays
 // with the upstream admission bridge (batch/cinference_hooks.h).
+//
+// NINFER_FAIR_PREFILL=1 (default unset = legacy behavior exactly) enables the
+// fair policy: (a) the per-step prefill budget is shared fair-share across
+// waiting prefill sequences instead of head-eats-all, (b) any decode row
+// present halves the prefill cap so decodes never starve, (c) a blocked
+// admission head is skipped past up to 4 admittable followers per step.
 namespace ninfer::batch {
 
 struct PrefillSlice {

@@ -1,9 +1,25 @@
 #include "batch/scheduler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 namespace ninfer::batch {
+
+namespace {
+
+// NINFER_FAIR_PREFILL=1 enables the fair prefill/admission policy; unset (or
+// any other value) keeps the legacy strict-FIFO / head-eats-budget behavior
+// exactly. Read per call (cheap getenv) so tests can toggle via setenv.
+bool fair_prefill_enabled() {
+    const char* v = std::getenv("NINFER_FAIR_PREFILL");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+// Bound on followers admitted past a blocked head per admit_waiting() call.
+constexpr std::uint32_t kFairSkipAdmitCap = 4;
+
+} // namespace
 
 RequestScheduler::RequestScheduler(std::uint32_t max_running_seqs, std::uint32_t total_pages,
                                    std::uint32_t max_blocks_per_seq, std::uint32_t chunk_tokens)
@@ -156,6 +172,32 @@ bool RequestScheduler::admit_one(Request& request) {
 }
 
 void RequestScheduler::admit_waiting() {
+    if (fair_prefill_enabled()) {
+        // Fair admission: the head is retried first every call, but a blocked
+        // head no longer holds the queue — up to kFairSkipAdmitCap admittable
+        // followers are admitted past it per call, in order. Safe subset:
+        // admit_one() is atomic (rolls back rows/blocks on failure), so
+        // probing followers cannot leak pool state, and the head keeps
+        // front-of-queue priority on the next call, bounding its delay.
+        std::uint32_t skipped_admits = 0;
+        bool head_blocked             = false;
+        for (auto it = waiting_.begin(); it != waiting_.end();) {
+            if (it->done()) {
+                it = waiting_.erase(it);
+                continue;
+            }
+            if (running_.size() >= max_running_) { break; }
+            if (!admit_one(*it)) {
+                head_blocked = true;
+                ++it;
+                continue;
+            }
+            running_.push_back(std::move(*it));
+            it = waiting_.erase(it);
+            if (head_blocked && ++skipped_admits >= kFairSkipAdmitCap) { break; }
+        }
+        return;
+    }
     for (auto it = waiting_.begin(); it != waiting_.end();) {
         if (it->done()) {
             it = waiting_.erase(it);
@@ -171,6 +213,64 @@ StepPlan RequestScheduler::schedule_step() {
     evict_done();
     admit_waiting();
     StepPlan plan;
+    if (fair_prefill_enabled()) {
+        // Fair prefill: (b) any decode row present halves the per-step
+        // prefill cap so a full prefill budget can never starve decodes
+        // (every decode row still emits its one token); (a) the capped
+        // budget is shared fair-share ceil(cap/n_prefill) per prefill
+        // sequence in queue order — the head can no longer eat the whole
+        // budget — with leftover dealt a second round-robin pass in order.
+        bool has_decode               = false;
+        std::uint32_t prefill_seqs    = 0;
+        for (auto& req : running_) {
+            if (req.done()) { continue; }
+            for (auto& seq : req.seqs) {
+                if (seq.phase() == Phase::Decode) {
+                    has_decode = true;
+                    plan.decode_seq_ids.push_back(seq.seq_id);
+                } else {
+                    ++prefill_seqs;
+                }
+            }
+        }
+        if (prefill_seqs == 0) { return plan; }
+        std::uint32_t prefill_cap = chunk_tokens_;
+        if (has_decode) { prefill_cap = std::max<std::uint32_t>(1, chunk_tokens_ / 2); }
+        const std::uint32_t share = (prefill_cap + prefill_seqs - 1) / prefill_seqs;
+        struct Alloc {
+            Sequence* seq;
+            std::uint32_t take;
+        };
+        std::vector<Alloc> allocs;
+        for (auto& req : running_) {
+            if (req.done()) { continue; }
+            for (auto& seq : req.seqs) {
+                if (seq.phase() != Phase::Prefill) { continue; }
+                allocs.push_back(
+                    Alloc{&seq, static_cast<std::uint32_t>(
+                                    std::min<std::size_t>(seq.remaining_prefill(), share))});
+            }
+        }
+        std::uint32_t spent = 0;
+        for (const auto& a : allocs) { spent += a.take; }
+        for (auto& a : allocs) {
+            if (spent >= prefill_cap) { break; }
+            const std::uint32_t rest =
+                static_cast<std::uint32_t>(a.seq->remaining_prefill() - a.take);
+            const std::uint32_t extra = std::min(rest, prefill_cap - spent);
+            a.take += extra;
+            spent += extra;
+        }
+        for (const auto& a : allocs) {
+            if (a.take == 0) { continue; }
+            plan.prefill.push_back(
+                PrefillSlice{.seq_id = a.seq->seq_id,
+                             .offset  = static_cast<std::uint32_t>(a.seq->computed_len),
+                             .count   = a.take});
+            plan.prefill_tokens += a.take;
+        }
+        return plan;
+    }
     std::uint32_t budget = chunk_tokens_;
     for (auto& req : running_) {
         if (req.done()) { continue; }
