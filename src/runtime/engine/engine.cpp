@@ -264,6 +264,10 @@ public:
         // max_context_ (clamped to 4K rows/lane so a huge context does not
         // balloon device memory; longer gaps fail closed to the ordinary
         // path). Gaps beyond the cap keep today's sticky-off behavior.
+        // KNOWN LIMIT (2026-09-28): a request decoding >4096 tokens while
+        // bypassed stays sticky-off for life; only long concurrent
+        // stretches hit it. A rolling catch-up (resync mid-bypass, slide
+        // the window) could lift it later if agentic sessions need it.
         catchup_cap_ = 0;
         if (mtp_enabled_) {
             std::uint64_t bypass_cap =
