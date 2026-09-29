@@ -376,8 +376,14 @@ public:
                 static_cast<std::size_t>(mtp_extra_pool_slots_) * gdn_slot_bytes;
             const std::size_t mtp_coltab_bytes =
                 static_cast<std::size_t>(max_seqs_) * 4U * 4U;
+            const std::size_t mtp_catchup_bytes =
+                (mtp_enabled_ && catchup_cap_ > 0)
+                    ? static_cast<std::size_t>(hidden_) * catchup_cap_ *
+                          max_seqs_ * 2U
+                    : 0U;
             const std::size_t mtp_residency_bytes =
-                mtp_kv_bytes + mtp_pool_bytes + mtp_coltab_bytes;
+                mtp_kv_bytes + mtp_pool_bytes + mtp_coltab_bytes +
+                mtp_catchup_bytes;
             std::uint64_t budget_mib = 0;
             if (const char* budget_env = std::getenv("NINFER_MTP_BUDGET_MIB")) {
                 budget_mib = std::strtoull(budget_env, nullptr, 10);
@@ -388,15 +394,17 @@ public:
                     "serve forward MTP residency " + std::to_string(mtp_residency_bytes) +
                     "B (kv=" + std::to_string(mtp_kv_bytes) + " pool=" +
                     std::to_string(mtp_pool_bytes) + " coltab=" +
-                    std::to_string(mtp_coltab_bytes) + ") exceeds NINFER_MTP_BUDGET_MIB=" +
+                    std::to_string(mtp_coltab_bytes) + " catchup=" +
+                    std::to_string(mtp_catchup_bytes) + ") exceeds NINFER_MTP_BUDGET_MIB=" +
                     std::to_string(budget_mib) + " (refused, never spilled)");
             }
             std::fprintf(stderr,
                          "[mtp-budget] lanes=%u colgroups=%u oracle=%d extraslots=%u "
-                         "pool=%zuB kv=%zuB coltab=%zuB total=%zuB budget=%lluMiB\n",
+                         "pool=%zuB kv=%zuB coltab=%zuB catchup=%zuB cap=%u total=%zuB budget=%lluMiB\n",
                          max_seqs_, mtp_column_groups_, mtp_oracle_on_ ? 1 : 0,
                          mtp_extra_pool_slots_, mtp_pool_bytes, mtp_kv_bytes,
-                         mtp_coltab_bytes, mtp_residency_bytes,
+                         mtp_coltab_bytes, mtp_catchup_bytes, catchup_cap_,
+                         mtp_residency_bytes,
                          static_cast<unsigned long long>(budget_mib));
         }
         if (mtp_enabled_) {
