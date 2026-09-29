@@ -615,6 +615,13 @@ public:
             if (graph_dry_) {
                 graph_verbose_ = true;
             }
+            // Fault injection: NINFER_GRAPH_FAIL_ONCE=1 arms a single forced
+            // capture failure (first capture attempt after boot). Default off:
+            // getenv-null short-circuits, so unset costs nothing and changes
+            // no behavior; the hot path below sees only one bool branch.
+            if (const char* fail_once = std::getenv("NINFER_GRAPH_FAIL_ONCE")) {
+                graph_fail_once_armed_ = (fail_once[0] == '1' && fail_once[1] == '\0');
+            }
         }
         {
             // Explicit T=0 sampling config: temperature 0 resolves to greedy.
@@ -2108,6 +2115,10 @@ private:
     bool graphs_enabled_ = true;
     bool graph_verbose_  = false;
     bool graph_dry_      = false;
+    // Fault injection (NINFER_GRAPH_FAIL_ONCE=1): armed at construction,
+    // consumed exactly once at the decode-capture site below. Thread-confined
+    // here — no cross-request state beyond the single bool.
+    bool graph_fail_once_armed_ = false;
     // Step 12 (slots-only): one frozen ver/M=4 exec for the column-table
     // overload. All baked addresses are lane-independent except the
     // vcoltab slice address (lane*16, lane-keyed); lane-varying data
@@ -2307,7 +2318,22 @@ public:
                 return out;
             }
             cudaGraph_t graph = nullptr;
-            const cudaError_t begin = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            // Fault injection (NINFER_GRAPH_FAIL_ONCE=1): fail the next
+            // capture exactly once. Consumed here at the capture site only
+            // (after the dry early-return above), so warmup/dry steps never
+            // disarm it and there is no cross-request bleed. The faked begin
+            // failure skips the capture block and falls into the SAME
+            // fail-closed recompute-eager path below (graph_mark_dead +
+            // forward_serve_decode_layers), not a separate fallback.
+            bool inject_fail = graph_fail_once_armed_;
+            if (inject_fail) {
+                graph_fail_once_armed_ = false;
+                std::fprintf(stderr,
+                             "[graph-fault] injected capture failure, falling back to eager\n");
+            }
+            const cudaError_t begin =
+                inject_fail ? cudaErrorStreamCaptureUnsupported
+                            : cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
             if (begin == cudaSuccess) {
                 try {
                     card_->forward_serve_decode_layers(plan, batch, view,
