@@ -658,6 +658,12 @@ public:
             if (const char* fail_once = std::getenv("NINFER_GRAPH_FAIL_ONCE")) {
                 graph_fail_once_armed_ = (fail_once[0] == '1' && fail_once[1] == '\0');
             }
+            // Batched decode graphs: NINFER_BATCHED_GRAPHS=1 arms width-keyed
+            // capture for decode-only B=2/4/8. Default off: unset (or any
+            // value but "1") leaves today's eager path byte-for-byte.
+            if (const char* bgrp = std::getenv("NINFER_BATCHED_GRAPHS")) {
+                batched_graphs_enabled_ = (bgrp[0] == '1' && bgrp[1] == '\0');
+            }
         }
         {
             // Explicit T=0 sampling config: temperature 0 resolves to greedy.
@@ -2215,6 +2221,59 @@ private:
     cudaGraphExec_t commit_exec_ = nullptr;
     bool commit_seen_            = false;
     bool commit_dead_            = false;
+    // Batched decode graphs (NINFER_BATCHED_GRAPHS=1, default off): one exec
+    // per distinct decode width W in {2,4,8}. Capture key = W only (NOT lane,
+    // NOT seq ids). Design notes:
+    //  - Baked host values are invariant per width: decode-only steps always
+    //    carry ragged offsets {0..W}, so every host-side slice baked into the
+    //    capture (attn per-row q/k/v slices, GDN xd, hidden columns) lands on
+    //    identical device addresses every replay. row_slots is (void) on this
+    //    path; per-row state rides device bindings.
+    //  - Every per-step varying input (ids, cache/rope positions, block
+    //    tables, kv rows, GDN src/dst slots) arrives as device-buffer
+    //    contents refreshed by the eager H2D uploads in step() before each
+    //    replay. The captured region itself performs zero H2D: all graph
+    //    inputs are device-resident. Lane reassignment across steps is data,
+    //    not shape, so no lane keying (and no forget-lane invalidation) is
+    //    needed. Kernel launch geometry derives from T==W only, and the
+    //    fused/per-row attn branch is taken identically per width.
+    //  - The alternative (one W=8 exec with column masking for narrower
+    //    widths) would add masking kernels the eager path never runs. One
+    //    exec per width replays the exact eager kernel sequence, which is
+    //    what makes replay bit-exact vs eager (same kernels, same order, no
+    //    re-tuning: NINFER_FUSED_ATTN and friends are process-constant).
+    //  - Mixed prefill+decode steps are excluded explicitly (n_pref==0 gate):
+    //    prefill spans vary per step, so offsets would not be
+    //    width-invariant. MTP-on steps that fall through to the ordinary
+    //    path (conc-N decode, bypass staging) are eligible: MTP rows/slots
+    //    are untouched here and the staging copies run after, outside the
+    //    graph. MTP spec steps never reach here (step() dispatches them to
+    //    step_mtp_decode first).
+    //  - Fail-closed per width (6aa64b5 recompute pattern): a capture failure
+    //    parks the width dead and recomputes the step eager; captured work
+    //    never executes (WSL record-only rule), so the eager recompute
+    //    applies state exactly once.
+    struct BatchedDecodeGraph {
+        bool live = false;
+        bool seen = false;
+        bool dead = false;
+        cudaGraphExec_t exec = nullptr;
+    };
+    BatchedDecodeGraph batched_graphs_[3]; // index 0/1/2 <-> W 2/4/8
+    bool batched_graphs_enabled_ = false;
+
+    static int batched_width_index(std::size_t n_dec) noexcept {
+        if (n_dec == 2) return 0;
+        if (n_dec == 4) return 1;
+        if (n_dec == 8) return 2;
+        return -1;
+    }
+
+    BatchedDecodeGraph* batched_for_width(std::size_t n_dec) {
+        const int idx = batched_width_index(n_dec);
+        if (idx < 0 || batched_graphs_[idx].dead) { return nullptr; }
+        return &batched_graphs_[idx];
+    }
 
 public:
     ~ServeForwardContext() {
@@ -2232,6 +2291,13 @@ public:
         if (commit_exec_ != nullptr) {
             cudaGraphExecDestroy(commit_exec_);
             commit_exec_ = nullptr;
+        }
+        for (auto& slot : batched_graphs_) {
+            if (slot.exec != nullptr) {
+                cudaGraphExecDestroy(slot.exec);
+                slot.exec = nullptr;
+                slot.live = false;
+            }
         }
     }
 
@@ -2307,6 +2373,95 @@ public:
         slot->exec = exec;
     }
 
+    runtime::StepDecodedPairs step_decode_layers_batched(
+        const batch::StepPlan& plan, const batch::RaggedBatch& batch,
+        const batch::DeviceRaggedBatch& view,
+        models::qwen3_5::execution::TextContext::ServeStepTensors& tensors,
+        const std::vector<std::int32_t>& row_slot, std::size_t n_dec,
+        BatchedDecodeGraph* slot) {
+        cudaStream_t stream = device_.stream;
+        const int W         = static_cast<int>(n_dec);
+        auto blog = [&](const char* act) {
+            if (!graph_verbose_) { return; }
+            std::fprintf(stderr, "[bgraph] width=%d action=%s\n", W, act);
+        };
+        if (!slot->seen) {
+            // Warmup: the first step at this width runs the full eager
+            // forward (settles lazy state, exactly today's behavior);
+            // capture starts on the 2nd+ step at this width.
+            slot->seen = true;
+            blog("eager-first");
+            return card_->forward_serve_step(plan, batch, view, batch.seq_offsets.data(),
+                                             row_slot.data(), tensors, envelope_);
+        }
+        if (slot->live && slot->exec != nullptr) {
+            // Replay: embed stays eager (fresh tokens in, same arena address
+            // as the capture run), then relaunch the recorded layers.
+            blog("replay");
+            Tensor x = card_->embed_serve_input(tensors);
+            (void)x; // consumed by the graph at its baked arena address
+            CUDA_CHECK(cudaGraphLaunch(slot->exec, stream));
+            return card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+        }
+        // Capture: embed runs eager first (outside the capture); uploads
+        // already ran in step(). Capture failure parks the width dead and
+        // recomputes the step eager (6aa64b5 pattern): work launched under
+        // capture records but never executes, so no state was applied and
+        // the layers call is safe to re-invoke eagerly.
+        Tensor x = card_->embed_serve_input(tensors);
+        cudaGraph_t graph = nullptr;
+        // Fault injection (NINFER_GRAPH_FAIL_ONCE=1) is shared with the
+        // single-row site: whichever capture site runs first consumes the
+        // single armed failure, so "fail next capture exactly once" holds
+        // with batched graphs armed too.
+        bool inject_fail = graph_fail_once_armed_;
+        if (inject_fail) {
+            graph_fail_once_armed_ = false;
+            std::fprintf(stderr,
+                         "[graph-fault] injected capture failure, falling back to eager\n");
+        }
+        const cudaError_t begin =
+            inject_fail ? cudaErrorStreamCaptureUnsupported
+                        : cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (begin == cudaSuccess) {
+            try {
+                card_->forward_serve_decode_layers(plan, batch, view,
+                                                   batch.seq_offsets.data(), row_slot.data(),
+                                                   tensors, x, envelope_);
+            } catch (...) {
+                cudaStreamEndCapture(stream, &graph);
+                if (graph != nullptr) cudaGraphDestroy(graph);
+                slot->dead = true;
+                slot->live = false;
+                throw;
+            }
+            if (cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph != nullptr) {
+                cudaGraphExec_t exec = nullptr;
+                if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess &&
+                    exec != nullptr) {
+                    cudaGraphDestroy(graph);
+                    slot->exec = exec;
+                    slot->live = true;
+                    // WSL record-only rule (see single-row site): the capture
+                    // step's outputs must come from an immediate replay.
+                    CUDA_CHECK(cudaGraphLaunch(exec, stream));
+                    blog("capture");
+                    return card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+                }
+                if (exec != nullptr) cudaGraphExecDestroy(exec);
+                cudaGraphDestroy(graph);
+            } else if (graph != nullptr) {
+                cudaGraphDestroy(graph);
+            }
+        }
+        slot->dead = true;
+        slot->live = false;
+        card_->forward_serve_decode_layers(plan, batch, view, batch.seq_offsets.data(),
+                                           row_slot.data(), tensors, x, envelope_);
+        blog("capture-fail-eager");
+        return card_->sample_decode_rows(tensors.hidden, plan, batch, stream);
+    }
+
     runtime::StepDecodedPairs step_decode_layers(const batch::StepPlan& plan,
                                                  const batch::RaggedBatch& batch,
                                                  const batch::DeviceRaggedBatch& view,
@@ -2361,6 +2516,23 @@ public:
             std::fprintf(stderr, "[gptr] lane=%d action=%s x=%p hidden=%p ids=%p\n", lane, act,
                          x.data, tensors.hidden.data, tensors.ids.data);
         };
+        // Batched decode graphs: decode-only B=2/4/8 with one token per row
+        // (T == n_dec) and no prefill (mixed steps stay eager explicitly).
+        // Eligible on both the MTP-off ordinary path and the MTP-on
+        // eager-bypass fall-through (conc-N decode): MTP spec steps never
+        // reach here. Under the NINFER_SERVE_GRAPH master switch, armed only
+        // by NINFER_BATCHED_GRAPHS=1; otherwise bslot is null and the step
+        // falls through to today's path exactly.
+        const bool bshape_ok = (n_pref == 0 && T == n_dec && batch.num_seqs() == n_dec &&
+                                (n_dec == 2 || n_dec == 4 || n_dec == 8));
+        BatchedDecodeGraph* bslot =
+            (graphs_enabled_ && batched_graphs_enabled_ && !graph_dry_ && bshape_ok)
+                ? batched_for_width(n_dec)
+                : nullptr;
+        if (bslot != nullptr) {
+            return step_decode_layers_batched(plan, batch, view, tensors, row_slot, n_dec,
+                                              bslot);
+        }
         if (!shape_ok || !seen) {
             if (graph_verbose_) {
                 std::fprintf(stderr,
