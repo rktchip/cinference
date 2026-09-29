@@ -249,6 +249,28 @@ public:
                 if (v > 0) { toggle_off_ = static_cast<std::uint32_t>(v); }
             }
         }
+        // Bypass catch-up (task 8, DEFAULT ON): the ordinary decode path
+        // stages each decoded token's target hidden so a lane that sat out
+        // MTP during a conc overlap can resync via mtp_resume_catchup when it
+        // goes solo again. NINFER_MTP_BYPASS_STAGE=0 opts out (restores the
+        // sticky-off behavior for bypassed lanes; the armed toggle path is
+        // unaffected).
+        bypass_stage_ = true;
+        if (const char* b = std::getenv("NINFER_MTP_BYPASS_STAGE")) {
+            if (std::string(b) == "0") { bypass_stage_ = false; }
+        }
+        // Unified staging capacity: the armed window needs toggle_off_ rows
+        // per lane; bypass gaps need up to the overlap length, bounded by
+        // max_context_ (clamped to 4K rows/lane so a huge context does not
+        // balloon device memory; longer gaps fail closed to the ordinary
+        // path). Gaps beyond the cap keep today's sticky-off behavior.
+        catchup_cap_ = 0;
+        if (mtp_enabled_) {
+            std::uint64_t bypass_cap =
+                bypass_stage_ ? std::min<std::uint64_t>(max_context_, 4096) : 0;
+            std::uint64_t cap = std::max<std::uint64_t>(toggle_off_, bypass_cap);
+            catchup_cap_      = static_cast<std::uint32_t>(cap);
+        }
         text_vocab_ = text_config.vocab_size;
         if (mtp_enabled_ && text_vocab_ == 0) {
             throw std::logic_error("serve forward MTP needs a vocabulary");
@@ -533,13 +555,15 @@ public:
             DeviceBuffer(static_cast<std::size_t>(hidden_) * max_seqs_ * 2U);
         anchor_logits_ =
             DeviceBuffer(static_cast<std::size_t>(text_vocab_) * max_seqs_ * 2U);
-        // Row-23 conc resume (task 8): per-lane staging for the forced-off
-        // window's target-hidden columns (OFF steps x H per lane). Zero bytes
-        // unless the toggle is armed; decode steps never touch the rung-2
-        // batch regions while staging here, and the fill never touches this.
-        if (mtp_enabled_ && toggle_off_ > 0) {
+        // Row-23 conc resume (task 8): per-lane staging for skipped target-
+        // hidden columns (bypass gaps + the armed forced-off window:
+        // catchup_cap_ rows x H per lane). Zero bytes unless MTP staging is
+        // live (armed toggle or default-on bypass); decode steps never touch
+        // the rung-2 batch regions while staging here, and the fill never
+        // touches this.
+        if (mtp_enabled_ && catchup_cap_ > 0) {
             catchup_store_ = DeviceBuffer(static_cast<std::size_t>(hidden_) *
-                                          toggle_off_ * max_seqs_ * 2U);
+                                          catchup_cap_ * max_seqs_ * 2U);
         }
         // Row 20b layout A: static column-slot tables, init-filled
         // once: t[c] = column block, 4 consecutive slots per group. The
@@ -834,14 +858,17 @@ public:
                     max_context_) {
                 return step_mtp_decode(batch, row_slot);
             }
-            if (!window && armed && mslot.next_pos >= 1 && mslot.mtp_valid_pos < frontier &&
+            if (!window && mslot.next_pos >= 1 && mslot.mtp_valid_pos < frontier &&
+                (armed || bypass_stage_) &&
                 frontier + models::qwen3_5::execution::kMtpSpecDecodeDrafts + 1 <=
                     max_context_) {
-                // Resume after the forced-off window (or any staged gap): the
-                // staged history exactly covers [mtp_valid_pos, frontier), so
-                // rebuild the MTP KV prefix + anchor stash with one batched
-                // fill and run the MTP step. Coverage mismatch fails closed
-                // to the ordinary path below (today's behavior).
+                // Resume after a skipped span (armed forced-off window or a
+                // default-path conc overlap): the staged history exactly
+                // covers [mtp_valid_pos, frontier), so rebuild the MTP KV
+                // prefix + anchor stash with one batched fill and run the MTP
+                // step. Coverage mismatch fails closed to the ordinary path
+                // below (today's behavior). Unified: the bypass gap uses the
+                // same mtp_resume_catchup as the armed window.
                 if (mtp_resume_catchup(
                         mtp_lane, batch.tokens[batch.seq_offsets[0]], frontier)) {
                     return step_mtp_decode(batch, row_slot);
@@ -961,10 +988,14 @@ public:
             }
         }
         decoded = step_decode_layers(plan, batch, view, tensors, row_slot, n_pref, n_dec);
-        if (armed && n_pref == 0 && n_dec > 0) {
-            // Forced-off window steps leave MTP KV behind but keep the true
-            // target hidden live in tensors.hidden: stage each in-window
-            // lane's column for the batched resume fill.
+        if ((armed || bypass_stage_) && mtp_enabled_ && n_pref == 0 && n_dec > 0) {
+            // Skipped-span staging: the ordinary forward's target hidden is
+            // live in tensors.hidden. The armed window stages for its resume;
+            // default-on bypass staging records every ordinary decode row so
+            // a conc-overlapped lane can resync when it goes solo. Column
+            // copies are D2D (~H bfloat16 per token); a copy failure throws
+            // (fail closed, never corrupt) and coverage gaps mark the lane so
+            // resume falls back to the ordinary path.
             mtp_stage_decode_hidden(batch, row_slot, n_pref, n_dec, pos, tensors.hidden);
         }
         if (mtp_enabled_ && n_pref > 0) {
@@ -974,12 +1005,16 @@ public:
             // stays warm for later decode-only MTP steps. tensors.hidden
             // still holds every prefill row's target hidden (rung-1 input).
             mtp_prefill_fill(plan, batch, row_slot, pos, tensors.hidden);
-            if (armed) {
+            {
                 // The fill rewarmed every prefill lane (mtp_valid_pos held at
                 // next_pos, fresh anchor): staged window history for those
                 // lanes is stale, drop it. Decode rows riding a mixed step
                 // advanced without staging: their coverage is unrecoverable,
                 // fail those lanes closed (resume falls back to ordinary).
+                // Applies to bypass staging as well as the armed window
+                // (mixed-ride decode rows are never staged, by design: their
+                // hidden columns share the mixed forward and are unproven as
+                // resume inputs, so riders keep today's sticky-off behavior).
                 for (std::size_t r = 0; r < plan.prefill.size(); ++r) {
                     ServeSlot& pslot = slots_[static_cast<std::size_t>(row_slot[r])];
                     pslot.staged_n        = 0;
@@ -1602,6 +1637,15 @@ public:
         slot.anchor_valid      = true;
         slot.next_pos          = F + commit_len;
         slot.mtp_valid_pos     = slot.next_pos;
+        // The commit rewarmed the lane to the frontier: any staged span is
+        // consumed/stale, reset it so a later gap anchors cleanly (bypass
+        // lanes re-anchor lazily at the next staged step; armed lanes via
+        // the tick). Stale overflow must not poison future resumes.
+        slot.staged_n        = 0;
+        slot.staged_overflow = false;
+        slot.staged_ids.clear();
+        slot.staged_pos.clear();
+        slot.stage_start = slot.mtp_valid_pos;
         // S1 workload check: per-step accepts + tokens alongside ms/tok.
         // Gated on NINFER_MTP_DEBUG (stderr only, no GPU effect).
         if (mtp_dbg) {
@@ -1821,33 +1865,49 @@ public:
         }
     }
 
-    // Stage one in-window lane column per decode row: the ordinary forward's
+    // Stage one skipped lane column per decode row: the ordinary forward's
     // target hidden (device D2D into the lane's catchup_store_ block) plus
     // the row's (token, pos) on host. Positions must extend the staged span
-    // contiguously; anything else (overflow, non-unit rows, out-of-window)
-    // marks the lane so resume fails closed to the ordinary path.
+    // contiguously; anything else (overflow, non-unit rows, out-of-window
+    // when bypass staging is off) marks the lane so resume fails closed to
+    // the ordinary path. Rows stage when bypass staging is on (default) or
+    // when the lane is inside the armed window; with both off this is a
+    // no-op and the lane keeps today's sticky-off behavior.
     void mtp_stage_decode_hidden(const batch::RaggedBatch& batch,
                                  const std::vector<std::int32_t>& row_slot, std::size_t n_pref,
                                  std::size_t n_dec, const std::vector<std::int32_t>& pos,
                                  const Tensor& hidden) {
+        if (catchup_cap_ == 0) { return; }
         cudaStream_t stream = device_.stream;
         char* cbase         = static_cast<char*>(catchup_store_.p);
         for (std::size_t i = 0; i < n_dec; ++i) {
             const std::size_t s    = n_pref + i;
             const std::int32_t lane = row_slot[s];
             ServeSlot& slot         = slots_[static_cast<std::size_t>(lane)];
-            if (!in_toggle_window(slot.mtp_toggle_seen) || slot.staged_overflow) { continue; }
+            if ((!bypass_stage_ && !in_toggle_window(slot.mtp_toggle_seen)) ||
+                slot.staged_overflow) {
+                continue;
+            }
+            if (slot.staged_n == 0 && slot.stage_start != slot.mtp_valid_pos) {
+                // Bypass lanes never ran toggle_tick_lane: anchor the span
+                // at the current MTP frontier. (Armed lanes arrive anchored
+                // by the tick; a no-op for them.) A lane entering with a
+                // pre-existing unstaged hole anchors here as well, and its
+                // first row then fails the contiguity check below, so the
+                // lane fails closed at resume.
+                slot.stage_start = slot.mtp_valid_pos;
+            }
             const std::uint32_t flat  = batch.seq_offsets[s];
             const std::uint32_t width = batch.seq_offsets[s + 1] - flat;
             const std::int32_t p      = pos[flat];
-            if (width != 1 || slot.staged_n >= toggle_off_ ||
+            if (width != 1 || slot.staged_n >= catchup_cap_ ||
                 p != static_cast<std::int32_t>(slot.stage_start + slot.staged_n)) {
                 slot.staged_overflow = true;
                 continue;
             }
             CUDA_CHECK(cudaMemcpyAsync(
                 cbase +
-                    (static_cast<std::size_t>(lane) * toggle_off_ + slot.staged_n) * hidden_ *
+                    (static_cast<std::size_t>(lane) * catchup_cap_ + slot.staged_n) * hidden_ *
                         2U,
                 static_cast<const char*>(hidden.data) +
                     static_cast<std::size_t>(flat) * hidden_ * 2U,
@@ -1898,7 +1958,7 @@ public:
             const Tensor pos_b(mbase + mtp_batch_pos_, DType::I32, {T});
             const Tensor hid_b(
                 const_cast<char*>(cbase) +
-                    (static_cast<std::size_t>(lane) * toggle_off_ + base) * hidden_ * 2U,
+                    (static_cast<std::size_t>(lane) * catchup_cap_ + base) * hidden_ * 2U,
                 DType::BF16, {H, T});
             Tensor out_b(mbase + mtp_batch_out_, DType::BF16, {H, T});
             const std::uint32_t p_first =
@@ -1929,7 +1989,7 @@ public:
             CUDA_CHECK(cudaMemcpyAsync(
                 mh1.data,
                 cbase +
-                    (static_cast<std::size_t>(lane) * toggle_off_ + slot.staged_n - 1) *
+                    (static_cast<std::size_t>(lane) * catchup_cap_ + slot.staged_n - 1) *
                         hidden_ * 2U,
                 static_cast<std::size_t>(hidden_) * 2U, cudaMemcpyDeviceToDevice, stream));
             const std::int32_t atok = static_cast<std::int32_t>(anchor_tok);
@@ -1976,11 +2036,13 @@ private:
         std::uint32_t mtp_valid_pos = 0;
         TokenId anchor_token        = 0;
         bool anchor_valid           = false;
-        // Row-23 conc resume (task 8, default off): mid-request spec toggle
-        // bookkeeping. mtp_toggle_seen counts pure-decode steps on this lane
-        // while armed; stage_* records the forced-off window's (token, pos)
-        // plus staged target-hidden columns in catchup_store_ for the batched
-        // resume fill. All zero/unused unless NINFER_MTP_TOGGLE_OFF is set.
+        // Row-23 conc resume (task 8): skipped-span staging bookkeeping.
+        // mtp_toggle_seen counts pure-decode steps on this lane while armed;
+        // stage_* records skipped (token, pos) plus staged target-hidden
+        // columns in catchup_store_ for the batched resume fill. Armed lanes
+        // anchor stage_start via the tick; bypass lanes (default on) anchor
+        // lazily at the first staged step. Zero/unused unless MTP staging is
+        // live (armed toggle or default-on bypass).
         std::uint32_t mtp_toggle_seen = 0;
         std::uint32_t stage_start     = 0;
         std::uint32_t staged_n        = 0;
@@ -2071,8 +2133,13 @@ private:
     std::size_t mtp_batch_out_ = 0;
     std::uint32_t warm_chunk_  = 0;
     // Row-23 conc resume (task 8): toggle window + catch-up staging store.
+    // catchup_cap_ is the unified per-lane staging capacity
+    // (max(armed window, bypass bound)); bypass_stage_ is the default-on
+    // ordinary-path staging switch (NINFER_MTP_BYPASS_STAGE=0 opts out).
     std::uint32_t toggle_after_ = 0;
     std::uint32_t toggle_off_   = 0;
+    std::uint32_t catchup_cap_  = 0;
+    bool bypass_stage_          = true;
     DeviceBuffer catchup_store_;
     DeviceBuffer pool_store_;
     DeviceBuffer round_store_;
